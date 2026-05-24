@@ -5,15 +5,22 @@ Active backend chosen at import time by config.OBJECT_STORE_URL:
   * unset / empty  → blobstore.local (filesystem, upstream default)
   * s3:// URL      → blobstore.s3 (S3-compatible, opt-in)
 
-Buckets currently in use:
+Holds **final composite posters** — the fully-rendered, watermarked /poster
+output. Each unique render-param combination is a separate entry. With S3
++ a CDN public URL (OBJECT_STORE_PUBLIC_URL), /poster redirects clients
+straight to the CDN on a cache hit and the app pod isn't on the read path
+at all.
 
-  * ``tmdb-posters`` — base poster images fetched from TMDB (JPEG)
-  * ``tmdb-logos``   — title logos fetched from TMDB (PNG)
+Not held here:
 
-Composite poster JPEGs remain in the relational backend (the final_poster_cache
-table). They could move here in a future phase but the table is bounded by
-COMPOSITE_MAX_ENTRIES and TTL so the trade-off is less compelling than for
-the upstream TMDB blobs.
+  * TMDB poster/logo bytes — those land on the pod's local filesystem
+    under TMDB_POSTER_CACHE_DIR / TMDB_LOGO_CACHE_DIR. They're a per-pod
+    latency-optimisation cache in front of TMDB's own CDN; sharing them
+    across replicas via S3 buys very little (TMDB's CDN is already fast)
+    while complicating the data path. Pod restarts re-warm them in the
+    first few minutes of traffic.
+  * Rating / quality / metadata / digital-release / trending — small
+    JSON-ish data, stays in the relational backend.
 """
 import logging
 
@@ -28,6 +35,7 @@ _PUBLIC_API = (
     "ping",
     "get",
     "put",
+    "delete",
     "url_for",
 )
 
@@ -58,6 +66,9 @@ BACKEND_KIND: str = "s3" if _backend.__name__.endswith(".s3") else "local"
 __all__ = list(_PUBLIC_API) + ["BACKEND_KIND"]
 
 
-# Bucket constants — single source of truth so a typo can't fork the keyspace.
-BUCKET_TMDB_POSTERS: str = "tmdb-posters"
-BUCKET_TMDB_LOGOS: str   = "tmdb-logos"
+# Bucket constants — single source of truth.
+#
+# Today only the composite-poster bytes live here. Earlier Phase 3 also
+# proxied TMDB poster/logo through this layer; Phase 10 reverted those
+# to direct filesystem access (per-pod ephemeral cache).
+BUCKET_COMPOSITES: str = "composites"

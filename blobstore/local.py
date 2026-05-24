@@ -1,13 +1,11 @@
-"""Local-filesystem blob store (upstream default).
+"""Local-filesystem blob store (default).
 
-Bytes for the TMDB poster cache and TMDB logo cache land under
-``/app/cache/<bucket>/<key>`` (matching upstream's two existing directories).
-Behaviour mirrors upstream's previous cache.py functions exactly — TTL via
-filesystem mtime, lazy stale-eviction on read.
+Bytes for the composite-poster cache land under
+``/app/cache/composites/<key>.jpg``. Behaviour matches the S3 backend's
+signature so the public selector can swap them transparently.
 
-I/O is wrapped in ``asyncio.to_thread`` so the event loop isn't blocked by
-disk reads on a slow volume. Same call shape as the S3 backend so the public
-selector can swap them transparently.
+I/O is wrapped in ``asyncio.to_thread`` so the event loop isn't blocked
+by disk reads on a slow volume.
 """
 import asyncio
 import logging
@@ -16,13 +14,12 @@ import time
 
 logger = logging.getLogger(__name__)
 
-from config import TMDB_POSTER_CACHE_DIR, TMDB_LOGO_CACHE_DIR
+from config import COMPOSITE_BLOB_DIR
 
 
 # Bucket → on-disk base directory.
 _BUCKETS: dict[str, str] = {
-    "tmdb-posters": TMDB_POSTER_CACHE_DIR,
-    "tmdb-logos":   TMDB_LOGO_CACHE_DIR,
+    "composites": COMPOSITE_BLOB_DIR,
 }
 
 
@@ -34,24 +31,11 @@ def _base_for(bucket: str) -> str:
 
 
 def _safe_path(base_dir: str, filename: str) -> str:
-    """Defensive: resolve symlinks and ensure the result stays inside base_dir.
-    Upstream's check verbatim."""
+    """Defensive: resolve symlinks and ensure the result stays inside base_dir."""
     path = os.path.realpath(os.path.join(base_dir, filename))
     if not path.startswith(os.path.realpath(base_dir)):
         raise ValueError(f"Path traversal attempt: {filename!r}")
     return path
-
-
-def _remove_if_dir(path: str) -> bool:
-    """Remove *path* if it is a directory (stale artefact from a previous bug)."""
-    if os.path.isdir(path):
-        try:
-            os.rmdir(path)
-            logger.info(f"Removed stale cache directory at {path}")
-        except OSError:
-            pass
-        return True
-    return False
 
 
 async def init() -> None:
@@ -71,8 +55,6 @@ def _get_sync(bucket: str, key: str, max_age_seconds: int) -> bytes | None:
     base = _base_for(bucket)
     path = _safe_path(base, key)
 
-    if _remove_if_dir(path):
-        return None
     if not os.path.exists(path):
         return None
 
@@ -97,12 +79,25 @@ def _put_sync(bucket: str, key: str, data: bytes) -> None:
     base = _base_for(bucket)
     path = _safe_path(base, key)
     try:
-        _remove_if_dir(path)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "wb") as f:
+        os.makedirs(os.path.dirname(path) or base, exist_ok=True)
+        # Atomic write: temp file in same dir, then rename.
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "wb") as f:
             f.write(data)
+        os.replace(tmp_path, path)
     except Exception as exc:
         logger.error(f"Blob cache write error for {bucket}:{key}: {exc}")
+
+
+def _delete_sync(bucket: str, key: str) -> None:
+    base = _base_for(bucket)
+    path = _safe_path(base, key)
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.warning(f"Blob cache delete error for {bucket}:{key}: {exc}")
 
 
 async def get(bucket: str, key: str, max_age_seconds: int) -> bytes | None:
@@ -113,6 +108,10 @@ async def put(bucket: str, key: str, data: bytes, content_type: str | None = Non
     # content_type is irrelevant for the FS backend but accepted so the
     # signature matches the S3 backend.
     await asyncio.to_thread(_put_sync, bucket, key, data)
+
+
+async def delete(bucket: str, key: str) -> None:
+    await asyncio.to_thread(_delete_sync, bucket, key)
 
 
 def url_for(bucket: str, key: str) -> str | None:

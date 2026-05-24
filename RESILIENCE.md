@@ -419,6 +419,83 @@ Highlights:
 
 ---
 
+## Phase 10 — Composite bytes to object storage; TMDB cache back to filesystem
+
+**Branch:** `phase-10-composite-blobstore`
+**Status:** implementation complete, codex review pending
+
+**Motivation:** Phase 3 put TMDB poster/logo bytes behind the blobstore abstraction and left composite (rendered) bytes in the relational backend as BYTEA. That was the wrong way round:
+
+- TMDB's own CDN (`image.tmdb.org`) is the source of truth for poster/logo bytes — mirroring it across replicas via S3 buys very little.
+- Composite renders are the unique work product. They scale with `unique(imdb_id × type × params_hash)` and are the bigger driver of DB storage cost.
+- A CDN in front of the composite-cache S3 bucket means clients pull bytes directly from the CDN — the app pod isn't on the read path at all.
+
+**Architecture after Phase 10:**
+
+```text
+TMDB CDN (image.tmdb.org)
+   │
+   ▼
+[ per-pod emptyDir cache ]   ← TMDB poster/logo bytes; ephemeral, re-warms on pod restart
+   │
+   ▼
+[ render pipeline ]
+   │  (writes once)
+   ▼
+[ S3 / B2 bucket ]   ← composite-poster JPEGs; the unique work product
+   │
+   ▼  (Bandwidth Alliance: B2→Cloudflare free)
+[ Cloudflare custom domain ]   ← posters.postersplus.elfhosted.com
+   │
+   ▼
+[ Stremio client ]   ← 302'd here from /poster on cache hit
+```
+
+**Code changes:**
+
+- `blobstore/__init__.py` — drops `BUCKET_TMDB_POSTERS` / `BUCKET_TMDB_LOGOS`; adds `BUCKET_COMPOSITES`. Adds `delete()` to the public API for evictions.
+- `blobstore/local.py` — atomic write via temp+rename; single bucket (`composites`) under `COMPOSITE_BLOB_DIR`.
+- `blobstore/s3.py` — adds `delete()`; everything else unchanged.
+- `storage/sqlite_backend.py` + `storage/postgres_backend.py`:
+  - `get_cached_tmdb_poster` / `get_cached_tmdb_logo` — reverted to upstream-style sync filesystem ops (per-pod cache).
+  - `get_cached_final_poster` — async; reads metadata row, then bytes via `blobstore.get(BUCKET_COMPOSITES, …)`.
+  - `set_cached_final_poster` — async; writes blob first (so the metadata row is never present without a backing blob), then upserts the row.
+  - `get_cached_final_poster_url()` — new sync function returning the public CDN URL when configured.
+  - Schema migration: `final_poster_cache` loses the `jpeg_bytes` BLOB/BYTEA column. SQLite uses `ALTER TABLE … DROP COLUMN` (3.35+) with a table-rebuild fallback for older versions; Postgres uses `ALTER TABLE … DROP COLUMN IF EXISTS`. Existing rows are preserved but bytes are lost — cache refills via TTL.
+- `cache.py` — async wrappers for composite; sync wrappers for TMDB; new `get_cached_final_poster_url` re-export.
+- `tmdb.py` — drops `await` from the 4 TMDB poster/logo callsites (back to sync).
+- `main.py` — composite-cache-hit path: if `get_cached_final_poster_url(key)` returns a URL, emit a `302` with `Location: <cdn-url>` (+ optional `Cache-Control` from `CDN_CACHE_TTL`). Otherwise stream bytes inline (private/local deployments). `await` added to the two composite cache callsites.
+- `config.py` — adds `COMPOSITE_BLOB_DIR=/app/cache/composites`.
+
+**Infra changes:**
+
+- `infra/postersplus/configmap-postersplus-env.yaml` — `OBJECT_STORE_URL` points at the B2 bucket (`s3://postersplus-composites?endpoint=https://s3.us-west-002.backblazeb2.com&region=us-west-002`); `OBJECT_STORE_PUBLIC_URL=https://posters.postersplus.elfhosted.com`.
+- TMDB cache: `/app/cache` emptyDir mount (already configured in the HelmRelease) is enough — per-pod ephemeral storage.
+
+**Verified end-to-end:**
+
+- SQLite + local blobstore: composite write+read round-trip; `url_for()` returns `None` (no public URL); TMDB sync FS round-trip preserved.
+- Migration from legacy schema: pre-existing SQLite DB with `jpeg_bytes BLOB` column → init_db drops the column, keeps rows. Same for Postgres via `ALTER TABLE DROP COLUMN IF EXISTS`.
+- Postgres + S3 (MinIO): write composite → metadata row in Postgres + bytes in S3 at `composites/<key>`; `url_for()` returns `https://posters.example.com/composites/<key>` matching configured public URL.
+- Container image (uid 568 + read-only + tmpfs): boots; `/live` 200; `/ready` 200.
+
+**Net data-layer change:**
+
+- Postgres `final_poster_cache` table goes from ~150 KB/row average → ~50 bytes/row (cache_key + cached_at). At 1M rows that's 150 GB → 50 MB.
+- Composite bytes live in B2 (free CF egress) with per-object cost; pruned by `COMPOSITE_CACHE_TTL` (TTL-based deletion on read) + the existing `COMPOSITE_MAX_ENTRIES` LRU cap.
+
+**Codex review (2026-05-23):** two P2 findings, both fixed:
+
+- **[P2]** The CDN-redirect path still fetched bytes from S3 before 302'ing — `get_cached_final_poster` (which does a `blobstore.get`) was called before checking if a CDN URL was available. Defeated the whole point of CDN offload. **Fixed:** added `is_cached_final_poster_fresh(cache_key)` — a lightweight metadata-row+TTL probe with no blob I/O. `/poster` now branches *first* on `OBJECT_STORE_PUBLIC_URL`: if set, freshness-probe + 302; if not, fall through to the inline-bytes path.
+- **[P2]** `prune_caches()` deleted expired metadata rows but left the blobstore objects orphaned forever. **Fixed:** `prune_caches` is now async; it captures the expiring `cache_key`s before the DELETE, then `await blobstore.delete()`s each one after commit. Same pattern in both SQLite and Postgres backends.
+
+**Known follow-ups:**
+
+- B2 lifecycle rule could enforce TTL server-side as a defence-in-depth in case the prune loop ever misses a cycle. Adding a `Lifecycle` rule that auto-deletes objects older than `COMPOSITE_CACHE_TTL` is a one-line bucket setting.
+- Could expose `postersplus_composite_cdn_hits_total` metric (incremented on every 302) so dashboards can see the CDN-vs-inline split.
+
+---
+
 ## Codex review log
 
 Per-phase second opinion via `~/.claude/bin/codex-review`. Findings recorded inline below.

@@ -171,6 +171,8 @@ from cache import (
     get_cached_quality,
     get_cached_rating,
     get_cached_final_poster,
+    get_cached_final_poster_url,
+    is_cached_final_poster_fresh,
     set_cached_final_poster,
     init_db,
     is_digital_release,
@@ -713,7 +715,11 @@ async def _cache_prune_loop() -> None:
 
             if lease_token is not None:
                 logger.info("Running scheduled cache prune (leader)")
-                await asyncio.get_running_loop().run_in_executor(None, prune_caches)
+                # Phase 10: prune_caches is async (blobstore deletes for
+                # evicted composite rows). The DB-side work inside it still
+                # runs sync, but a 6h-cadence call to a sync sqlite path
+                # via the event loop is fine.
+                await prune_caches()
                 # Coordinator-managed state (rating backoff, bg-fetch claims).
                 # On the in-process backend this evicts expired entries from
                 # per-worker dicts; Redis backend is a no-op (server expires).
@@ -1076,10 +1082,26 @@ async def get_poster(
             "&".join(f"{k}={v}" for k, v in sorted(raw_params.items())).encode()
         ).hexdigest()[:8]
         final_cache_key = f"{imdb_id}:{type}:{_params_hash}"
-        cached_jpeg = get_cached_final_poster(final_cache_key)
-        if cached_jpeg is not None:
-            logger.info(f"Final poster cache hit for {final_cache_key}")
-            return Response(content=cached_jpeg, media_type="image/jpeg")
+        # Phase 10: when the blobstore has a public CDN URL configured
+        # (OBJECT_STORE_PUBLIC_URL), the freshness probe alone is enough
+        # to authorise a 302 — we never pull the bytes back through the
+        # app on a cache hit. With Cloudflare in front of a B2 bucket
+        # that's free egress + zero app CPU per hit.
+        cdn_url = get_cached_final_poster_url(final_cache_key)
+        if cdn_url is not None:
+            if await is_cached_final_poster_fresh(final_cache_key):
+                logger.info(f"Final poster cache hit (CDN redirect) for {final_cache_key}")
+                resp = Response(status_code=302)
+                resp.headers["Location"] = cdn_url
+                if _cfg.CDN_CACHE_TTL > 0:
+                    resp.headers["Cache-Control"] = f"public, max-age={_cfg.CDN_CACHE_TTL}"
+                return resp
+        else:
+            # Local / no-CDN deployment: fall back to inline serving.
+            cached_jpeg = await get_cached_final_poster(final_cache_key)
+            if cached_jpeg is not None:
+                logger.info(f"Final poster cache hit (inline) for {final_cache_key}")
+                return Response(content=cached_jpeg, media_type="image/jpeg")
     else:
         final_cache_key = None
 
@@ -1437,7 +1459,7 @@ async def get_poster(
         # cached composite would be missing badges.  The next request will find
         # quality cached and store a proper composite then.
         if final_cache_key is not None and not quality_pending:
-            set_cached_final_poster(final_cache_key, img_bytes)
+            await set_cached_final_poster(final_cache_key, img_bytes)
             logger.info(f"Final poster cached for {final_cache_key}")
 
         if _render_fut is not None:

@@ -15,6 +15,11 @@ DB_PATH               = "/app/cache/cache.db"
 BADGE_DIR             = "/app/badges"
 TMDB_POSTER_CACHE_DIR = "/app/cache/tmdb_posters" # base posters from TMDB
 TMDB_LOGO_CACHE_DIR   = "/app/cache/tmdb_logos" # base logos from TMDB
+# Composite blob cache (Phase 10) — local backend uses this dir, S3
+# backend ignores it. Composite bytes used to live in the relational DB
+# as BYTEA; now they live here (filesystem) or in an S3 bucket when
+# OBJECT_STORE_URL is set.
+COMPOSITE_BLOB_DIR    = "/app/cache/composites"
 
 # Environment
 

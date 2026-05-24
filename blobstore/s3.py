@@ -3,21 +3,17 @@
 URL format::
 
     s3://<bucket>?endpoint=<https://...>&region=<region>&prefix=<prefix>
-    s3://<bucket>?endpoint=https://s3.us-east-005.backblazeb2.com
+    s3://postersplus-composites?endpoint=https://s3.us-west-002.backblazeb2.com&region=us-west-002
 
 Credentials come from the standard AWS env vars (AWS_ACCESS_KEY_ID,
 AWS_SECRET_ACCESS_KEY) or the IAM role the pod is running under.
 
-Bytes are stored at ``<bucket>/<prefix>/<bucket-name>/<key>`` so a single S3
-bucket can hold multiple PostersPlus buckets (tmdb-posters, tmdb-logos)
-without colliding. The prefix is also useful when several tenants share a
-bucket — `?prefix=tenant-a` keeps their keyspaces separate.
-
-TTL is enforced server-side via S3 lifecycle rules, not by this code — set
-the bucket to expire objects under each prefix at the rate that matches
-TMDB_POSTER_CACHE_DURATION / TMDB_LOGO_CACHE_DURATION. The ``get`` path
-honours the in-flight max-age check so a misconfigured bucket can't serve
-stale data either.
+Holds the composite-poster bytes. With ``OBJECT_STORE_PUBLIC_URL`` set
+(e.g. ``https://posters.postersplus.elfhosted.com`` — a Cloudflare custom
+domain in front of the same B2 bucket), the /poster endpoint can return
+a 302 to that URL on a cache hit and the app pod isn't on the read path
+at all. With Cloudflare's Bandwidth Alliance, B2→Cloudflare egress is
+free; Cloudflare→user is standard CF bandwidth.
 
 I/O uses boto3 (sync) wrapped in ``asyncio.to_thread`` so the event loop
 stays responsive on cache misses.
@@ -131,9 +127,9 @@ def _get_sync(bucket: str, key: str, max_age_seconds: int) -> bytes | None:
         if last_modified is not None:
             age = time.time() - last_modified.timestamp()
             if age > max_age_seconds:
-                # Stale — delete (best-effort) and miss. Close the body first
-                # so the underlying HTTP connection returns to the pool rather
-                # than leaking until GC.
+                # Stale — delete (best-effort) and miss. Close the body
+                # first so the underlying HTTP connection returns to the
+                # pool rather than leaking until GC.
                 try:
                     _client.delete_object(Bucket=_bucket_name, Key=obj_key)
                 except ClientError:
@@ -155,6 +151,14 @@ def _put_sync(bucket: str, key: str, data: bytes, content_type: str | None) -> N
         logger.warning(f"S3 PUT error for {obj_key}: {exc}")
 
 
+def _delete_sync(bucket: str, key: str) -> None:
+    obj_key = _object_key(bucket, key)
+    try:
+        _client.delete_object(Bucket=_bucket_name, Key=obj_key)
+    except ClientError as exc:
+        logger.warning(f"S3 DELETE error for {obj_key}: {exc}")
+
+
 async def get(bucket: str, key: str, max_age_seconds: int) -> bytes | None:
     if _client is None:
         return None
@@ -167,13 +171,19 @@ async def put(bucket: str, key: str, data: bytes, content_type: str | None = Non
     await asyncio.to_thread(_put_sync, bucket, key, data, content_type)
 
 
+async def delete(bucket: str, key: str) -> None:
+    if _client is None:
+        return
+    await asyncio.to_thread(_delete_sync, bucket, key)
+
+
 def url_for(bucket: str, key: str) -> str | None:
     """Return a public CDN URL when OBJECT_STORE_PUBLIC_URL is configured.
 
-    Used by the storage backends to optionally serve poster bytes by 302
-    redirect rather than proxying them through the app. Returns None if no
-    public URL is configured — caller should fall back to fetching the bytes
-    inline.
+    Used by the /poster endpoint to optionally serve composite bytes by
+    302 redirect rather than proxying them through the app. Returns None
+    if no public URL is configured — caller falls back to fetching the
+    bytes inline.
     """
     if not _public_url:
         return None
