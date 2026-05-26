@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.3-elf.1](https://github.com/elfhosted/PostersPlus/compare/v1.0.3...v1.0.3-elf.1) (2026-05-26)
+
+
+### Bug Fixes
+
+* fall back to TMDB-derived genre when MDBlist is unreachable ([#24](https://github.com/elfhosted/PostersPlus/issues/24)) ([e735b94](https://github.com/elfhosted/PostersPlus/commit/e735b94c6a00e245170a5ae4ecd09a6a7581aa5d))
+
 ## [1.0.1](https://github.com/elfhosted/PostersPlus/compare/v1.0.0...v1.0.1) (2026-05-26)
 
 
