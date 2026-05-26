@@ -21,6 +21,33 @@ class _FetchFailed:
 FETCH_FAILED = _FetchFailed()
 
 
+class _RateLimited:
+    """Sentinel returned when MDBlist responds with HTTP 429.
+
+    Carries the parsed Retry-After (seconds) when the server provided one,
+    so callers can honour the upstream's stated cooldown instead of guessing.
+    Distinct from FETCH_FAILED because rate-limit handling must NOT retry
+    (would burn another quota slot) and triggers a global cooldown that
+    suspends all MDBlist traffic, not just this title's.
+
+    ``suppressed=True`` marks the case where we never actually called
+    MDBlist — the pre-call gate inside _fetch_rating_throttled saw an
+    active global cooldown and short-circuited. The caller should treat
+    these titles as "skipped by cooldown" rather than "rate-limited",
+    i.e. don't apply a long per-title back-off (the title itself was
+    fine, it was just collateral damage from a peer's 429).
+    """
+    __slots__ = ("retry_after", "suppressed")
+    def __init__(self, retry_after: float | None = None, suppressed: bool = False):
+        self.retry_after = retry_after
+        self.suppressed = suppressed
+    def __repr__(self) -> str:
+        return (
+            f"_RateLimited(retry_after={self.retry_after!r}, "
+            f"suppressed={self.suppressed!r})"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Emmy winners — hardcoded TMDB IDs
 # Drama, Comedy and Limited Series winners only.

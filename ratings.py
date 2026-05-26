@@ -6,7 +6,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-from awards import FETCH_FAILED, _FetchFailed
+from awards import FETCH_FAILED, _FetchFailed, _RateLimited
 from config import (
     MOVIE_WEIGHTS,
     TV_WEIGHTS,
@@ -32,10 +32,11 @@ async def fetch_rating(
     *,
     movie_weights: dict | None = None,
     tv_weights: dict | None = None,
-) -> "tuple[dict | str, str, str | None, list[dict], int | None] | _FetchFailed":
+) -> "tuple[dict | str, str, str | None, list[dict], int | None] | _FetchFailed | _RateLimited":
     """
     Returns ``(ratings_dict, genre, release_date, keywords, age_rating)`` on
-    success, or ``FETCH_FAILED`` on a network / API error.
+    success, ``FETCH_FAILED`` on a network / API / 5xx error, or
+    ``_RateLimited(retry_after)`` on HTTP 429.
     """
 
     genre = "Unknown"
@@ -65,8 +66,20 @@ async def fetch_rating(
         return FETCH_FAILED
 
     if resp.status_code == 429:
-        logger.warning(f"MDblist rate-limited for {imdb_id}")
-        return FETCH_FAILED
+        retry_after: float | None = None
+        raw = resp.headers.get("retry-after")
+        if raw:
+            try:
+                retry_after = float(raw.strip())
+            except ValueError:
+                # MDBlist sends integer-seconds in practice; we don't decode
+                # the HTTP-date form. Leave None and the caller falls back
+                # to its 1h default.
+                retry_after = None
+        logger.warning(
+            f"MDblist rate-limited for {imdb_id} (retry-after={retry_after})"
+        )
+        return _RateLimited(retry_after)
 
     if resp.status_code == 404:
         logger.info(f"MDblist 404 for {imdb_id} — title not found, returning empty result")

@@ -65,6 +65,11 @@ __all__ = list(_PUBLIC_API) + ["BACKEND_KIND"]
 # create a parallel keyspace. Add new entries here.
 NS_RATING_BACKOFF: str = "rating-backoff"
 NS_QUALITY_BG: str     = "quality-bg-inflight"
+# Single-key namespace for the MDBlist-wide cooldown. Set after any 429,
+# checked before every MDBlist call so one rate-limited replica throttles
+# the whole fleet rather than letting each queued title trip its own 429.
+NS_MDBLIST_GLOBAL_COOLDOWN: str = "mdblist-global"
+MDBLIST_GLOBAL_KEY: str = "all"
 
 # Lease names for the periodic background tasks. Phase 5 leader-elects each
 # of these so multi-replica hosted deployments only run them on one replica

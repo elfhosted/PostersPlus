@@ -221,7 +221,7 @@ async def _background_quality_fetch(
 
 # Local imports
 from age_badge import draw_quality_age_badge, draw_tier_bar
-from awards import FETCH_FAILED, draw_award_sash, parse_mdblist_awards
+from awards import FETCH_FAILED, _RateLimited, draw_award_sash, parse_mdblist_awards
 from cache import (
     get_cached_quality,
     get_cached_rating,
@@ -512,7 +512,12 @@ async def _resolved(value):
 
 
 async def _with_retry(coro_fn, *args, **kwargs):
-    """Call coro_fn(*args, **kwargs) and retry once if FETCH_FAILED is returned."""
+    """Call coro_fn(*args, **kwargs) and retry once if FETCH_FAILED is returned.
+
+    Does NOT retry on _RateLimited — a 429 means the upstream is asking us to
+    stand down, and immediately calling again would just burn another quota
+    slot and confirm the rate-limited state.
+    """
     result = await coro_fn(*args, **kwargs)
     if result is FETCH_FAILED:
         result = await coro_fn(*args, **kwargs)
@@ -524,14 +529,61 @@ async def _fetch_rating_throttled(*args, **kwargs):
     uncached posters can't trip MDBlist's per-key connection limit
     (manifests as ReadTimeout under load). When MDBLIST_CONCURRENCY=0 the
     semaphore is bypassed entirely — preserves upstream behaviour for
-    self-hosters who don't want the gate."""
+    self-hosters who don't want the gate.
+
+    Rate-limit handling lives here (not just in get_poster) so the global
+    cooldown is established at the earliest possible moment after a 429:
+
+    - Pre-call gate: if another concurrent caller already set the global
+      cooldown, short-circuit to _RateLimited(None) without touching MDBlist.
+    - Post-call set: on a fresh 429, write the global cooldown *before*
+      releasing the semaphore. Queued callers waiting in the semaphore
+      will re-check on acquire and short-circuit. If we deferred the
+      cooldown set to get_poster's result-handler instead, it wouldn't
+      land until asyncio.gather() completed every parallel fetch
+      (image + logo + rating + trending) — long enough for the semaphore
+      to drain the entire queue into MDBlist and stack up one 429 per
+      title.
+
+    Per-title back-off and the per-imdb_id warning logs stay in
+    get_poster — they need title context that lives in that scope.
+    """
     global _mdblist_semaphore
+    async def _go():
+        if await coord.is_backoff_active(
+            coord.NS_MDBLIST_GLOBAL_COOLDOWN, coord.MDBLIST_GLOBAL_KEY
+        ):
+            # suppressed=True so the caller doesn't apply a 1h per-title
+            # back-off to titles that were never themselves rate-limited
+            # (only a peer was).
+            return _RateLimited(retry_after=None, suppressed=True)
+        result = await fetch_rating(*args, **kwargs)
+        if isinstance(result, _RateLimited):
+            if result.retry_after:
+                backoff_secs = min(float(result.retry_after), 3600.0)
+            else:
+                backoff_secs = 3600.0
+            # Cap global window at 120s so a multi-hour Retry-After can't
+            # freeze the whole service. Per-title back-off (set in
+            # get_poster) still protects the offending title for the full
+            # cooldown after the global window lifts.
+            global_window = min(backoff_secs, 120.0)
+            await coord.set_backoff(
+                coord.NS_MDBLIST_GLOBAL_COOLDOWN,
+                coord.MDBLIST_GLOBAL_KEY,
+                ttl_seconds=global_window,
+            )
+            logger.warning(
+                f"MDBlist global cooldown activated: {global_window:.0f}s "
+                "(all MDBlist requests paused)"
+            )
+        return result
     if _cfg.MDBLIST_CONCURRENCY <= 0:
-        return await fetch_rating(*args, **kwargs)
+        return await _go()
     if _mdblist_semaphore is None:
         _mdblist_semaphore = asyncio.Semaphore(_cfg.MDBLIST_CONCURRENCY)
     async with _mdblist_semaphore:
-        return await fetch_rating(*args, **kwargs)
+        return await _go()
 
 
 def _text_center(
@@ -1575,7 +1627,19 @@ async def get_poster(
     _rating_event_to_set: asyncio.Event | None = None
 
     if not rating_already_cached and effective_mdblist_key:
-        if await coord.is_backoff_active(coord.NS_RATING_BACKOFF, imdb_id):
+        # Global cooldown wins over per-title back-off: a 429 anywhere in
+        # the fleet means every MDBlist call stands down until the window
+        # expires. Without this, every uncached title in flight at the
+        # moment we get rate-limited will each hit its own 429 and pile up
+        # individual per-title cooldowns. Set on any 429 below.
+        if await coord.is_backoff_active(
+            coord.NS_MDBLIST_GLOBAL_COOLDOWN, coord.MDBLIST_GLOBAL_KEY
+        ):
+            logger.debug(
+                f"Rating fetch for {imdb_id} skipped (MDBlist global cooldown active)"
+            )
+            effective_mdblist_key = None
+        elif await coord.is_backoff_active(coord.NS_RATING_BACKOFF, imdb_id):
             logger.debug(f"Rating fetch for {imdb_id} skipped (MDBlist back-off active)")
             effective_mdblist_key = None   # treat as no-key; serve without rating
 
@@ -1721,16 +1785,51 @@ async def get_poster(
         # ------------------------------------------------------------------
         # Unpack results
         # ------------------------------------------------------------------
+        rate_limited = isinstance(rating_result, _RateLimited)
         rating_failed = (
             not rating_already_cached
             and effective_mdblist_key
-            and (rating_result is FETCH_FAILED)
+            and (rating_result is FETCH_FAILED or rate_limited)
         )
 
         if rating_failed:
-            logger.warning(f"Rating fetch failed for {imdb_id} after retry — skipping rating cache")
-            await coord.set_backoff(coord.NS_RATING_BACKOFF, imdb_id, ttl_seconds=3600.0)
-            logger.info(f"MDBlist back-off set for {imdb_id} (1 hour)")
+            if rate_limited and rating_result.suppressed:
+                # This title's MDBlist call was suppressed by the global
+                # cooldown (a peer hit 429 while we were waiting in the
+                # throttled wrapper). The title itself wasn't rate-limited,
+                # so skip the per-title back-off — once the global window
+                # lifts, this title gets a clean re-attempt. Render with
+                # the TMDB-derived genre fallback like any other "no rating
+                # available" case.
+                logger.debug(
+                    f"Rating fetch for {imdb_id} suppressed by MDBlist global cooldown"
+                )
+            elif rate_limited:
+                # HTTP 429 directly on this title — honour Retry-After if
+                # MDBlist provided it, otherwise fall back to a 1h default.
+                # Cap at 1h so a misbehaving upstream advertising a multi-
+                # hour cooldown can't park this title indefinitely.
+                # (The global cooldown was already set inside
+                # _fetch_rating_throttled — we only handle per-title
+                # back-off + logging here, where imdb_id is in scope.)
+                if rating_result.retry_after:
+                    backoff_secs = min(float(rating_result.retry_after), 3600.0)
+                    logger.warning(
+                        f"MDblist rate-limited {imdb_id} — honouring Retry-After "
+                        f"({backoff_secs:.0f}s)"
+                    )
+                else:
+                    backoff_secs = 3600.0
+                    logger.warning(
+                        f"MDblist rate-limited {imdb_id} — using 1h default back-off"
+                    )
+                await coord.set_backoff(
+                    coord.NS_RATING_BACKOFF, imdb_id, ttl_seconds=backoff_secs
+                )
+            else:
+                logger.warning(f"Rating fetch failed for {imdb_id} after retry — skipping rating cache")
+                await coord.set_backoff(coord.NS_RATING_BACKOFF, imdb_id, ttl_seconds=3600.0)
+                logger.info(f"MDBlist back-off set for {imdb_id} (1 hour)")
             ratings_dict   = {}
             genre          = cached_genre or _tmdb_genre
             rel            = cached_release_date
@@ -1758,7 +1857,12 @@ async def get_poster(
                 )
                 score = calculate_weighted_score(ratings_dict, weights)
             else:
-                score = ratings_dict
+                # ratings_dict is None when there's no cached rating AND no
+                # live fetch ran (no MDBlist key, per-title back-off active,
+                # or global cooldown active). Match the "N/A" placeholder
+                # the rating_failed branch uses so the renderer's
+                # f"{genre} ★ {score}" label doesn't show literal "None".
+                score = ratings_dict if ratings_dict is not None else "N/A"
 
             if rating_already_cached:
                 award_wins     = cached_award_wins
