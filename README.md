@@ -32,6 +32,7 @@ Selecting a backend is purely an env-var change — see [.env](.env) for the ful
 - **This fork:** maintained by ElfHosted to support our hosted offering.
 - **Sync direction:** we periodically pull from upstream and rebase our hosting-specific changes on top. Where our changes are generally useful, we'll upstream them as PRs.
 - **Cherry-pickability:** changes are kept in narrow, self-contained commits where possible, with new functionality gated behind feature flags / env vars rather than woven into existing code paths.
+- **Versioning:** this fork's tags mirror upstream's. When we cherry-pick upstream's `vX.Y.Z`, we tag our equivalent commit `vX.Y.Z`. Fork-only patches that ship between upstream releases get a `-elf.N` pre-release suffix (e.g. `v1.0.3-elf.1`) so they sort *before* the next upstream tag and we can never get ahead of upstream's numbering. Mechanically this is enforced by writing `Release-As: <version>` in every release-tracking commit footer.
 
 ## Hosting-mode quickstart (target — see status above)
 
