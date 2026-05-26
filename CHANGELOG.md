@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.3-elf.2](https://github.com/elfhosted/PostersPlus/compare/v1.0.3-elf.1...v1.0.3-elf.2) (2026-05-26)
+
+
+### Bug Fixes
+
+* honour MDBlist Retry-After + add fleet-wide 429 cooldown ([#26](https://github.com/elfhosted/PostersPlus/issues/26)) ([6fee7a8](https://github.com/elfhosted/PostersPlus/commit/6fee7a8ea2f531c7d3d96ecae203244048e7f4bc))
+
 ## [1.0.3-elf.1](https://github.com/elfhosted/PostersPlus/compare/v1.0.3...v1.0.3-elf.1) (2026-05-26)
 
 
