@@ -2296,6 +2296,21 @@ async def get_preset_poster(
             await fetch_poster_metadata(client, tmdb_id, effective_tmdb_key, type)
         )
 
+        # TMDB-derived genre fallback. The preset path deliberately never
+        # calls MDBlist, so for any title that hasn't been warmed by a
+        # paid /poster call cached_genre is None (or absent entirely) and
+        # `genre` was set to literal "Unknown" above. Derive a label from
+        # TMDB's genre_ids — same logic /poster uses — so preset posters
+        # don't render with "Unknown" for the common "never-warmed" case.
+        if genre == "Unknown" and genre_ids:
+            _gid_set = set(genre_ids)
+            for _gid in _cfg.GENRE_PRIORITY:
+                if _gid in _gid_set:
+                    _candidate = _cfg.GENRE_MAP.get(_gid, "")
+                    if _candidate:
+                        genre = _candidate
+                        break
+
         # No-poster fallback ladder (same as /poster):
         #   1. poster_path  → textless or default poster
         #   2. backdrop_path → landscape backdrop centre-cropped to portrait
