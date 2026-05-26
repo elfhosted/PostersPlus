@@ -2122,7 +2122,17 @@ function _unlockScroll() {
   window.scrollTo(0, _scrollY);
 }
 
+// The "expanded" preview panel only renders visibly on mobile — the desktop
+// layout has the live preview always-visible in the right column.  Skipping
+// expand entirely on desktop avoids a hard-to-discover scroll lock that
+// fires invisibly when users click anywhere in the right column (a real
+// problem on instances that embed the configurator below a banner / nav
+// where the page actually needs to scroll).
+const _MOBILE_MQ = window.matchMedia('(max-width: 960px)');
+function _isMobileViewport() { return _MOBILE_MQ.matches; }
+
 function expandPreview() {
+  if (!_isMobileViewport()) return;
   previewPanel.classList.add('expanded');
   _lockScroll();
   history.pushState({ previewExpanded: true }, '');
@@ -2140,6 +2150,17 @@ function collapsePreview() {
 // Back gesture / button: collapse the panel instead of leaving the page.
 window.addEventListener('popstate', () => {
   if (previewPanel.classList.contains('expanded')) {
+    previewPanel.classList.remove('expanded');
+    _unlockScroll();
+  }
+});
+
+// If the viewport crosses into desktop while the panel is expanded (e.g.
+// device rotated to landscape past 960px, or browser window resized), the
+// "expanded" CSS becomes a no-op but the body scroll lock would persist.
+// Collapse + unlock on the transition so the user is never stranded.
+_MOBILE_MQ.addEventListener('change', (ev) => {
+  if (!ev.matches && previewPanel.classList.contains('expanded')) {
     previewPanel.classList.remove('expanded');
     _unlockScroll();
   }
