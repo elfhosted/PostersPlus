@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.3-elf.3](https://github.com/elfhosted/PostersPlus/compare/v1.0.3-elf.2...v1.0.3-elf.3) (2026-05-26)
+
+
+### Bug Fixes
+
+* derive preset genre from TMDB when rating is uncached ([#28](https://github.com/elfhosted/PostersPlus/issues/28)) ([9d1b242](https://github.com/elfhosted/PostersPlus/commit/9d1b24291e35e9bddfb4db2946a85115e575c6c4))
+
 ## [1.0.3-elf.2](https://github.com/elfhosted/PostersPlus/compare/v1.0.3-elf.1...v1.0.3-elf.2) (2026-05-26)
 
 
