@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.3-elf.4](https://github.com/elfhosted/PostersPlus/compare/v1.0.3-elf.3...v1.0.3-elf.4) (2026-05-27)
+
+
+### Features
+
+* PRESET_MDBLIST_FETCH — opt-in MDBlist fallback for /p endpoint ([#30](https://github.com/elfhosted/PostersPlus/issues/30)) ([55469b7](https://github.com/elfhosted/PostersPlus/commit/55469b77c90096260e32c1a91f8db71dd93fa682))
+
 ## [1.0.3-elf.3](https://github.com/elfhosted/PostersPlus/compare/v1.0.3-elf.2...v1.0.3-elf.3) (2026-05-26)
 
 
