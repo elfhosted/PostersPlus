@@ -115,6 +115,24 @@ JPEG_QUALITY          = max(70, min(95, int(os.environ.get("JPEG_QUALITY", "85")
 PRESET_ENABLED        = os.environ.get("PRESET_ENABLED", "").strip().lower() in ("1", "true", "yes")
 PRESET_CDN_CACHE_TTL  = int(os.environ.get("PRESET_CDN_CACHE_TTL", "86400"))
 
+# When true, /p/ falls through to a live MDBlist fetch for any imdb_id
+# that doesn't have a cached rating row. Originally /p/ never called
+# MDBlist (the comment in main.py:get_preset_poster spells out the
+# original rationale: anonymous traffic must not burn the operator's
+# MDBlist quota). That made the preset path stuck-N/A on instances
+# where /poster is gated (PRESET_ENABLED + no ACCESS_KEY → /poster
+# is 403 → rating cache never warms → every /p render shows "N/A").
+#
+# Safe to enable now because elf.2 added the fleet-wide global cooldown
+# inside _fetch_rating_throttled — a runaway burst on /p can no longer
+# fan out into hundreds of 429s. Worst case is 120s of paused MDBlist
+# traffic, during which queued /p requests render without rating and
+# fall through to N/A (the original behaviour).
+#
+# Defaults to false to preserve existing-deployment behaviour;
+# public-tier instances should set this to "true" via configmap.
+PRESET_MDBLIST_FETCH  = os.environ.get("PRESET_MDBLIST_FETCH", "").strip().lower() in ("1", "true", "yes")
+
 # Floor on anonymous /search and /resolve-imdb requests. These endpoints
 # became anonymous in the Phase 11 follow-up so the public preset flow
 # can use the title picker. RATE_LIMIT_RPS (default 0 = disabled) only

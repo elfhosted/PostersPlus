@@ -2122,11 +2122,17 @@ async def get_poster(
 # background fetch, no per-tenant rate limit (operator-wide RATE_LIMIT_RPS
 # still applies via the "preset" tenant bucket).
 #
-# Rating data is used only when already cached. An uncached title renders
-# without rating on first hit and is served with a short cache-control so
-# the next request can pick up freshly-warmed rating data (warmed by the
-# next paid /poster call or a sister /p hit after PRESET_CDN_CACHE_TTL).
-# This deliberately avoids letting anonymous /p traffic burn MDBlist quota.
+# Rating data, by default, is used only when already cached. An uncached
+# title renders without rating on first hit and is served with a short
+# cache-control so the next request can pick up freshly-warmed rating
+# data (warmed by the next paid /poster call or a sister /p hit after
+# PRESET_CDN_CACHE_TTL). This avoids letting anonymous /p traffic burn
+# MDBlist quota on instances where /poster traffic naturally warms the
+# cache. On preset-only instances where /poster is gated (no
+# ACCESS_KEY), nothing ever warms the cache and every render is
+# permanent-N/A, so PRESET_MDBLIST_FETCH=true opts in to a live fetch
+# on cache miss — safe because elf.2's fleet-wide cooldown caps the
+# worst-case quota burn.
 
 _PRESET_ROUTE_VALID_TYPES = frozenset({"movie", "tv"})
 
@@ -2259,6 +2265,14 @@ async def get_preset_poster(
         )
         _render_inflight[final_cache_key] = _render_fut
 
+    effective_movie_weights = rcfg.movie_weights or _cfg.MOVIE_WEIGHTS
+    effective_tv_weights    = rcfg.tv_weights    or _cfg.TV_WEIGHTS
+
+    # Held by the PRESET_MDBLIST_FETCH path when this request becomes the
+    # leader for an imdb_id. Signal + cleanup happens in the outer finally
+    # so coalesced followers always unblock, even on exception paths.
+    _rating_event_to_set: asyncio.Event | None = None
+
     if cached_rating is not None:
         (
             ratings_dict, cached_genre, _cached_release_date,
@@ -2266,8 +2280,6 @@ async def get_preset_poster(
             festival_label, age_rating,
             is_cult, is_true_story, is_metacritic,
         ) = cached_rating
-        effective_movie_weights = rcfg.movie_weights or _cfg.MOVIE_WEIGHTS
-        effective_tv_weights    = rcfg.tv_weights    or _cfg.TV_WEIGHTS
         if isinstance(ratings_dict, dict):
             weights = (
                 effective_tv_weights if type in ("tv", "series")
@@ -2296,12 +2308,16 @@ async def get_preset_poster(
             await fetch_poster_metadata(client, tmdb_id, effective_tmdb_key, type)
         )
 
-        # TMDB-derived genre fallback. The preset path deliberately never
-        # calls MDBlist, so for any title that hasn't been warmed by a
-        # paid /poster call cached_genre is None (or absent entirely) and
-        # `genre` was set to literal "Unknown" above. Derive a label from
-        # TMDB's genre_ids — same logic /poster uses — so preset posters
-        # don't render with "Unknown" for the common "never-warmed" case.
+        # TMDB-derived genre fallback. The preset path historically never
+        # called MDBlist (PRESET_MDBLIST_FETCH below loosens this), so
+        # for any title that hadn't been warmed by a paid /poster call
+        # cached_genre was None (or absent entirely) and `genre` was set
+        # to literal "Unknown" above. Derive a label from TMDB's
+        # genre_ids — same logic /poster uses — so preset posters don't
+        # render with "Unknown" for the never-warmed case. Still useful
+        # when PRESET_MDBLIST_FETCH is off, when SERVER_MDBLIST_KEY is
+        # unset, or when the fetch path below short-circuits because of
+        # an active back-off / cooldown.
         if genre == "Unknown" and genre_ids:
             _gid_set = set(genre_ids)
             for _gid in _cfg.GENRE_PRIORITY:
@@ -2310,6 +2326,104 @@ async def get_preset_poster(
                     if _candidate:
                         genre = _candidate
                         break
+
+        # Opt-in MDBlist fallback for /p: when PRESET_MDBLIST_FETCH=true
+        # and there's no cached rating for this imdb_id, fan out into
+        # MDBlist *if* the global cooldown and per-title back-off are
+        # both clear. The fetch joins the gather alongside the existing
+        # image/logo/trending coroutines so the added wall-time is
+        # bounded by max() not sum(). Originally /p never did this to
+        # protect the operator's MDBlist quota from anonymous traffic;
+        # elf.2's fleet-wide cooldown caps the worst-case quota burn
+        # (≤120s of paused traffic per 429), so it's safe to opt in.
+        #
+        # Coalescing: shares _rating_fetch_inflight with /poster so a
+        # burst of concurrent /p requests for the same imdb_id fans out
+        # into exactly one MDBlist call. Without this the
+        # MDBLIST_CONCURRENCY semaphore would still cap things at 3
+        # concurrent calls per imdb_id, but with coalescing every
+        # follower piggybacks on the leader's cache write.
+        _preset_fetch_key: str | None = None
+        if (
+            cached_rating is None
+            and _cfg.PRESET_MDBLIST_FETCH
+            and _cfg.SERVER_MDBLIST_KEY
+        ):
+            if await coord.is_backoff_active(
+                coord.NS_MDBLIST_GLOBAL_COOLDOWN, coord.MDBLIST_GLOBAL_KEY
+            ):
+                logger.debug(
+                    f"Preset rating fetch for {imdb_id} skipped (MDBlist global cooldown)"
+                )
+            elif await coord.is_backoff_active(coord.NS_RATING_BACKOFF, imdb_id):
+                logger.debug(
+                    f"Preset rating fetch for {imdb_id} skipped (MDBlist per-title back-off)"
+                )
+            else:
+                _inflight_event = _rating_fetch_inflight.get(imdb_id)
+                if _inflight_event is not None:
+                    # Another coroutine (this worker, any endpoint) is
+                    # already fetching for this imdb_id — wait for it
+                    # and reuse the cache it writes.
+                    logger.info(
+                        f"Preset rating fetch coalesced for {imdb_id} — awaiting in-flight fetch"
+                    )
+                    await _inflight_event.wait()
+                    _refreshed = get_cached_rating(imdb_id)
+                    if _refreshed is not None:
+                        # Leader succeeded — adopt their cached row,
+                        # overwriting the N/A defaults set earlier so
+                        # the rest of this handler renders as if we'd
+                        # found cache on the first read.
+                        (
+                            ratings_dict, cached_genre, _cached_release_date,
+                            award_wins, award_noms, _awards_fetched,
+                            festival_label, age_rating,
+                            is_cult, is_true_story, is_metacritic,
+                        ) = _refreshed
+                        if isinstance(ratings_dict, dict):
+                            weights = (
+                                effective_tv_weights if type in ("tv", "series")
+                                else effective_movie_weights
+                            )
+                            score = calculate_weighted_score(ratings_dict, weights)
+                        if cached_genre:
+                            genre = cached_genre
+                        rel = _cached_release_date
+                        cached_rating = _refreshed
+                        # Flip will_persist so the composite gets the
+                        # long preset TTL, same as the original cached
+                        # path's behaviour.
+                        if not quality_missing:
+                            will_persist = True
+                    else:
+                        # Leader's fetch failed — re-check per-title
+                        # back-off in case they set one, then render
+                        # without rating. Never fire our own retry
+                        # while the back-off window is fresh.
+                        if await coord.is_backoff_active(
+                            coord.NS_RATING_BACKOFF, imdb_id
+                        ):
+                            logger.debug(
+                                f"Preset rating fetch for {imdb_id} suppressed after coalescence (back-off active)"
+                            )
+                else:
+                    # First request for this imdb_id — claim the slot
+                    # so concurrent followers coalesce instead of
+                    # duplicating the MDBlist call.
+                    _rating_event_to_set = asyncio.Event()
+                    _rating_fetch_inflight[imdb_id] = _rating_event_to_set
+                    _preset_fetch_key = _cfg.SERVER_MDBLIST_KEY
+
+        if _preset_fetch_key:
+            rating_coro = _with_retry(
+                _fetch_rating_throttled,
+                client, imdb_id, _preset_fetch_key, genre_ids, type,
+                movie_weights=effective_movie_weights,
+                tv_weights=effective_tv_weights,
+            )
+        else:
+            rating_coro = _resolved(None)
 
         # No-poster fallback ladder (same as /poster):
         #   1. poster_path  → textless or default poster
@@ -2324,11 +2438,111 @@ async def get_preset_poster(
         else:
             image_coro = fetch_poster_image(client, tmdb_id, type, poster_path)
 
-        image, logo, trending_rank = await asyncio.gather(
+        image, logo, trending_rank, rating_result = await asyncio.gather(
             image_coro,
             fetch_logo(client, logos, rcfg.logo_language) if (is_textless and not is_no_poster and not rcfg.textless) else _resolved(None),
             fetch_trending_rank(client, tmdb_id, effective_tmdb_key, type),
+            rating_coro,
         )
+
+        # Process the optional MDBlist fetch result. Four outcomes:
+        #   * None         — no fetch was attempted; keep N/A defaults.
+        #   * tuple        — success; populate score/genre/awards + cache.
+        #   * _RateLimited — 429 or suppressed-by-cooldown; render with
+        #                    N/A. Set per-title back-off only on a real
+        #                    429 (the global cooldown was already set
+        #                    inside _fetch_rating_throttled).
+        #   * FETCH_FAILED — network / timeout / 5xx; render with N/A,
+        #                    no per-title back-off (transient).
+        if isinstance(rating_result, _RateLimited):
+            if not rating_result.suppressed:
+                if rating_result.retry_after:
+                    backoff_secs = min(float(rating_result.retry_after), 3600.0)
+                    logger.warning(
+                        f"MDblist rate-limited {imdb_id} (preset) — honouring Retry-After "
+                        f"({backoff_secs:.0f}s)"
+                    )
+                else:
+                    backoff_secs = 3600.0
+                    logger.warning(
+                        f"MDblist rate-limited {imdb_id} (preset) — using 1h default back-off"
+                    )
+                await coord.set_backoff(
+                    coord.NS_RATING_BACKOFF, imdb_id, ttl_seconds=backoff_secs
+                )
+        elif rating_result is FETCH_FAILED:
+            # Network / timeout / 5xx — same as /poster, set a 1h
+            # per-title back-off so concurrent followers (and a re-hit
+            # within the hour) stand down instead of repeating the
+            # failing fetch.
+            logger.warning(
+                f"Preset rating fetch for {imdb_id} failed — setting 1h back-off, rendering without rating data"
+            )
+            await coord.set_backoff(
+                coord.NS_RATING_BACKOFF, imdb_id, ttl_seconds=3600.0
+            )
+        elif rating_result is not None:
+            # Success — unpack and use. fetch_rating's genre is also
+            # TMDB-derived so it can only equal or improve on `genre`;
+            # keep our existing value to avoid double-resolution.
+            _ratings_dict, _mdb_genre, _rel, _keywords, _age_rating = rating_result
+            if isinstance(_ratings_dict, dict):
+                ratings_dict = _ratings_dict
+                weights = (
+                    effective_tv_weights if type in ("tv", "series")
+                    else effective_movie_weights
+                )
+                score = calculate_weighted_score(ratings_dict, weights)
+            rel = _rel
+            if _age_rating is not None:
+                age_rating = _age_rating
+            # Parse awards / festival / cult / true-story / metacritic
+            # signals from the keywords payload (matches /poster's
+            # behaviour at the rating-success path).
+            award_wins, award_noms = parse_mdblist_awards(
+                _keywords, tmdb_id=tmdb_id,
+            )
+            kw_names = {(kw.get("name") or "").lower().strip() for kw in _keywords}
+            festival_label = next(
+                (label for kw, label in FESTIVAL_KEYWORDS.items() if kw in kw_names),
+                None,
+            )
+            is_cult       = bool({"cult-classic", "cult-film"} & kw_names)
+            is_true_story = "based-on-true-story" in kw_names
+            is_metacritic = "metacritic-must-see" in kw_names
+            # Cache for subsequent /p hits (and any /poster hits if the
+            # instance ever flips to that mode). Use the TMDB-derived
+            # genre we already resolved above so the cached row matches
+            # what we just rendered.
+            set_cached_rating(
+                imdb_id,
+                ratings_dict,
+                genre,
+                rel,
+                award_wins,
+                award_noms,
+                awards_fetched=True,
+                festival_label=festival_label,
+                age_rating=age_rating,
+                is_cult=is_cult,
+                is_true_story=is_true_story,
+                is_metacritic=is_metacritic,
+            )
+            logger.info(
+                f"Preset rating cached for {imdb_id}: score={score} genre={genre} "
+                f"wins={award_wins} noms={award_noms}"
+            )
+            # Now that the rating inputs are complete, this render is
+            # safe to persist with the long preset TTL. Without this
+            # flip, the first /p hit on an uncached title would always
+            # get the short 5-min Cache-Control even after a successful
+            # fetch — wasting an extra full render on the next request
+            # (which would re-hit because Cloudflare wouldn't have
+            # cached it for long either). Subsequent /p requests for
+            # this title see cached_rating populated and follow the
+            # normal cached-path.
+            if not quality_missing:
+                will_persist = True
 
         discovery_meta = extract_discovery_meta(
             tmdb_data=tmdb_data,
@@ -2455,3 +2669,11 @@ async def get_preset_poster(
         raise HTTPException(status_code=500, detail="Failed to build poster")
     finally:
         _render_inflight.pop(final_cache_key, None)
+        # Unblock any coalesced followers waiting on our rating fetch
+        # regardless of how this request ended (success, HTTPException,
+        # crash). Without this on a hard failure path, followers would
+        # wait until the event-loop's GC reclaims the Event — i.e.
+        # effectively forever — and look like a thread hang.
+        if _rating_event_to_set is not None:
+            _rating_event_to_set.set()
+            _rating_fetch_inflight.pop(imdb_id, None)
