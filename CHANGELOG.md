@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.1.0-elf.1](https://github.com/elfhosted/PostersPlus/compare/v1.0.3-elf.2...v1.1.0-elf.1) (2026-06-10)
+
+
+### Features
+
+* add fake textless review report ([446dbb7](https://github.com/elfhosted/PostersPlus/commit/446dbb7105b9f7b70dfd193079cfa0ffc297540f))
+* fleet-wide MDBList 429 cooldown over upstream key rotation ([7fac294](https://github.com/elfhosted/PostersPlus/commit/7fac2941537e6960c8603eae8d78099e62e69706))
+* observability, render limits, rate limiting, leader-elected jobs ([2a968bc](https://github.com/elfhosted/PostersPlus/commit/2a968bc091f34e467266e7de68b0b1ade57763fc))
+* pluggable storage/coordination/blobstore backends on v1.1.0 ([b040a1d](https://github.com/elfhosted/PostersPlus/commit/b040a1d408c9b6fffbf66a08160fde1c139e56c4))
+* PRESET_MDBLIST_FETCH — opt-in MDBlist fallback for /p endpoint ([#30](https://github.com/elfhosted/PostersPlus/issues/30)) ([55469b7](https://github.com/elfhosted/PostersPlus/commit/55469b77c90096260e32c1a91f8db71dd93fa682))
+* public-tier lock UI, ElfHosted branding, SEO on tabbed configurator ([4f0e04b](https://github.com/elfhosted/PostersPlus/commit/4f0e04b1d28430df3ddbe136409e6372842b5823))
+* static-preset overload moat — anonymous /p route on v1.1.0 ([5170828](https://github.com/elfhosted/PostersPlus/commit/5170828c717edb057062146b1de81ce02af08755))
+
+
+### Bug Fixes
+
+* address codex pre-merge review (CDN 302 on /poster, compose volume) ([f5c233b](https://github.com/elfhosted/PostersPlus/commit/f5c233bc7b398a6738faec9797f30606fd29a463))
+* derive preset genre from TMDB when rating is uncached ([#28](https://github.com/elfhosted/PostersPlus/issues/28)) ([9d1b242](https://github.com/elfhosted/PostersPlus/commit/9d1b24291e35e9bddfb4db2946a85115e575c6c4))
+
+
+### Miscellaneous Chores
+
+* align fork release line to upstream v1.1.0 ([a31bfeb](https://github.com/elfhosted/PostersPlus/commit/a31bfeb1fdf8df47d1efd4a6e5f2ad7186299352))
+
 ## v1.1.0 - 2026-06-09
 
 This release is compared with the original `v1.0.0` release. It also includes
