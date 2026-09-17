@@ -255,7 +255,7 @@ Both loops release the lease in a `try/finally` so graceful shutdown hands it of
 
 **`/metrics` endpoint:**
 
-- Unauthenticated by default. Set `METRICS_ACCESS_KEY` to require `?access_key=…` (constant-time compared, same pattern as the main access key).
+- Unauthenticated by default. Set `METRICS_ACCESS_KEY` to require the key, as either `Authorization: Bearer …` (preferred: lets a scraper read it from a Secret) or `?access_key=…`; constant-time compared, same pattern as the main access key.
 - No separate metrics port — operators wanting strict isolation should bind the app behind an ingress that restricts `/metrics`.
 
 **Structured JSON logs:**
