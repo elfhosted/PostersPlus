@@ -103,12 +103,14 @@ async def get_cached_final_poster_entry(cache_key):
     return r
 
 
-async def is_cached_final_poster_fresh(cache_key) -> bool:
+async def is_cached_final_poster_fresh(cache_key) -> int | None:
     """Lightweight freshness probe — metadata row + TTL only, no blob fetch.
-    Lets /poster and /p 302 straight to the CDN when a public URL exists."""
-    fresh = await _raw_is_final_fresh(cache_key)
-    _record("final_poster", fresh)
-    return fresh
+    Lets /poster and /p 302 straight to the CDN when a public URL exists.
+    Returns the composite's expires_at when fresh, else None (truthy/falsy, so
+    boolean call sites are unaffected)."""
+    expires_at = await _raw_is_final_fresh(cache_key)
+    _record("final_poster", expires_at is not None)
+    return expires_at
 
 
 async def set_cached_final_poster(

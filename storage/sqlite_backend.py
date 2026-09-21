@@ -545,20 +545,28 @@ def _peek_final_poster(cache_key: str) -> int | None:
     return int(expires_at)
 
 
-async def is_cached_final_poster_fresh(cache_key: str) -> bool:
+async def is_cached_final_poster_fresh(cache_key: str) -> int | None:
     """Lightweight freshness probe — checks L1, then the metadata row + TTL,
     never pulls the bytes. Lets /poster and /p 302 straight to the CDN when a
-    public URL is configured. Deletes the orphaned blob on expiry."""
+    public URL is configured. Deletes the orphaned blob on expiry.
+
+    Returns the composite's expires_at when fresh, else None. Callers may keep
+    treating it as a boolean — a unix timestamp is always truthy — but the
+    redirect path needs the deadline to set an honest max-age, because with
+    CDN_CACHE_TTL=auto there is no flat TTL to fall back on.
+    """
     try:
-        if _l1_get(cache_key, time.time()) is not None:
-            return True
-        if _peek_final_poster(cache_key) is not None:
-            return True
+        hit = _l1_get(cache_key, time.time())
+        if hit is not None:
+            return hit[1]
+        expires_at = _peek_final_poster(cache_key)
+        if expires_at is not None:
+            return expires_at
         await blobstore.delete(blobstore.BUCKET_COMPOSITES, cache_key)
-        return False
+        return None
     except Exception as exc:
         logger.error(f"Final poster freshness probe error: {exc}")
-        return False
+        return None
 
 
 async def get_cached_final_poster(cache_key: str) -> bytes | None:

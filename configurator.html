@@ -4174,9 +4174,9 @@ async function fetchServerCaps() {
   if (versionEl && serverCaps.version) {
     versionEl.textContent = '· v' + serverCaps.version;
   }
-  // Upstream's "What's New" chip is hardcoded to a vX.Y-dev placeholder in the
-  // markup; surface the real fork build version there too so the header doesn't
-  // read "dev" on a released build.
+  // Upstream hardcodes the "What's New" chip to its own release in the markup
+  // (v1.2.0). Surface the real build version there instead, so a fork build
+  // reads 1.2.0-elf.N rather than claiming to be stock upstream.
   const whatsNewEl = document.getElementById('whatsnew-version');
   if (whatsNewEl && serverCaps.version) {
     whatsNewEl.textContent = 'v' + serverCaps.version;
