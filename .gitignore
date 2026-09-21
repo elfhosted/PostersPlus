@@ -33,3 +33,9 @@ Thumbs.db
 
 # Cached Wikipedia/Wikidata responses for tools/audit_festival_winners.py
 tools/.audit-cache/
+
+# ElfHosted fork: local runtime artifacts (caches, prometheus multiproc, sqlite)
+.local-cache/
+postersplus-prom/
+*.db
+cache.db*

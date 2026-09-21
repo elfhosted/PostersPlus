@@ -366,6 +366,71 @@ This release is compared with `v1.1.0`.
   `Palme d'Or` through `Tribeca AA`. Previously these rendered in English on an
   otherwise translated poster.
 
+## [1.1.0-elf.6](https://github.com/elfhosted/PostersPlus/compare/v1.1.0-elf.5...v1.1.0-elf.6) (2026-06-11)
+
+
+### Bug Fixes
+
+* align public lock banner width with layout (v1.1.0-elf.6) ([7695ba6](https://github.com/elfhosted/PostersPlus/commit/7695ba6c2d2f4e4da7a550e320d5b779cf37bd22))
+* align public lock banner width with the layout ([0d8e87d](https://github.com/elfhosted/PostersPlus/commit/0d8e87d0ddb7fb6a2860ab261c741953b0e5f3ff))
+
+## [1.1.0-elf.5](https://github.com/elfhosted/PostersPlus/compare/v1.1.0-elf.4...v1.1.0-elf.5) (2026-06-10)
+
+
+### Features
+
+* read-only showcase for public lock view (v1.1.0-elf.5) ([986d05b](https://github.com/elfhosted/PostersPlus/commit/986d05b086ccadffafd13f5e55555009a6dac22a))
+* read-only showcase for the public lock view ([d38de4f](https://github.com/elfhosted/PostersPlus/commit/d38de4ff14c44797d08479e7094f39ad4f97b5c4))
+
+## [1.1.0-elf.4](https://github.com/elfhosted/PostersPlus/compare/v1.1.0-elf.3...v1.1.0-elf.4) (2026-06-10)
+
+
+### Bug Fixes
+
+* clean preset-only public lock view ([edfc9a4](https://github.com/elfhosted/PostersPlus/commit/edfc9a43609164d2d51f3918a7710c96c3b3c494))
+* clean preset-only public lock view (v1.1.0-elf.4) ([942ecaf](https://github.com/elfhosted/PostersPlus/commit/942ecaf045c02773d268b6777ebb1aa922d5a37b))
+
+## [1.1.0-elf.3](https://github.com/elfhosted/PostersPlus/compare/v1.1.0-elf.2...v1.1.0-elf.3) (2026-06-10)
+
+
+### Bug Fixes
+
+* real version in header What's-New chip (v1.1.0-elf.3) ([a02eb7a](https://github.com/elfhosted/PostersPlus/commit/a02eb7aa9a64ff3f3e34ccab4014de2eea0e0312))
+* show real version in the header What's-New chip ([66bbbcf](https://github.com/elfhosted/PostersPlus/commit/66bbbcf8e9b92d8268896bd4624b7350bde28c25))
+
+## [1.1.0-elf.2](https://github.com/elfhosted/PostersPlus/compare/v1.1.0-elf.1...v1.1.0-elf.2) (2026-06-10)
+
+
+### Bug Fixes
+
+* discoverable preset picker in public lock mode ([b353080](https://github.com/elfhosted/PostersPlus/commit/b353080ac129932b9db75979bf67cd05e08f05fe))
+* public-tier version footer + discoverable preset picker (v1.1.0-elf.2) ([6262990](https://github.com/elfhosted/PostersPlus/commit/6262990f450b86c9f189003e9d41fdafde635d44))
+* surface app version in /server-caps for the build footer ([45797ba](https://github.com/elfhosted/PostersPlus/commit/45797ba231010961aee9502fdbe838f378147834))
+
+## [1.1.0-elf.1](https://github.com/elfhosted/PostersPlus/compare/v1.0.3-elf.2...v1.1.0-elf.1) (2026-06-10)
+
+
+### Features
+
+* add fake textless review report ([446dbb7](https://github.com/elfhosted/PostersPlus/commit/446dbb7105b9f7b70dfd193079cfa0ffc297540f))
+* fleet-wide MDBList 429 cooldown over upstream key rotation ([7fac294](https://github.com/elfhosted/PostersPlus/commit/7fac2941537e6960c8603eae8d78099e62e69706))
+* observability, render limits, rate limiting, leader-elected jobs ([2a968bc](https://github.com/elfhosted/PostersPlus/commit/2a968bc091f34e467266e7de68b0b1ade57763fc))
+* pluggable storage/coordination/blobstore backends on v1.1.0 ([b040a1d](https://github.com/elfhosted/PostersPlus/commit/b040a1d408c9b6fffbf66a08160fde1c139e56c4))
+* PRESET_MDBLIST_FETCH — opt-in MDBlist fallback for /p endpoint ([#30](https://github.com/elfhosted/PostersPlus/issues/30)) ([55469b7](https://github.com/elfhosted/PostersPlus/commit/55469b77c90096260e32c1a91f8db71dd93fa682))
+* public-tier lock UI, ElfHosted branding, SEO on tabbed configurator ([4f0e04b](https://github.com/elfhosted/PostersPlus/commit/4f0e04b1d28430df3ddbe136409e6372842b5823))
+* static-preset overload moat — anonymous /p route on v1.1.0 ([5170828](https://github.com/elfhosted/PostersPlus/commit/5170828c717edb057062146b1de81ce02af08755))
+
+
+### Bug Fixes
+
+* address codex pre-merge review (CDN 302 on /poster, compose volume) ([f5c233b](https://github.com/elfhosted/PostersPlus/commit/f5c233bc7b398a6738faec9797f30606fd29a463))
+* derive preset genre from TMDB when rating is uncached ([#28](https://github.com/elfhosted/PostersPlus/issues/28)) ([9d1b242](https://github.com/elfhosted/PostersPlus/commit/9d1b24291e35e9bddfb4db2946a85115e575c6c4))
+
+
+### Miscellaneous Chores
+
+* align fork release line to upstream v1.1.0 ([a31bfeb](https://github.com/elfhosted/PostersPlus/commit/a31bfeb1fdf8df47d1efd4a6e5f2ad7186299352))
+
 ## v1.1.0 - 2026-06-09
 
 This release is compared with the original `v1.0.0` release. It also includes

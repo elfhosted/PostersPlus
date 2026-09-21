@@ -1,0 +1,30 @@
+name: Release Please
+
+on:
+  push:
+    branches:
+      - main
+  # Manual trigger from the Actions tab or `gh workflow run release.yml`.
+  # Useful when re-running release-please after a config change or to
+  # force-evaluate the current branch state without an extra commit.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write # release-please uses these for the autorelease:tagged labels
+
+jobs:
+  release-please:
+    name: Release Please
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          # GITHUB_TOKEN works because the permissions block above
+          # grants contents:write + pull-requests:write. No PAT needed.
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
