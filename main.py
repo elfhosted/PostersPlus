@@ -575,6 +575,27 @@ def _mark_mdblist_rate_limit(
     return backoff_secs, _next_mdblist_server_key(key, now)
 
 
+async def _publish_fleet_mdblist_cooldown(backoff_secs: float) -> None:
+    """ElfHosted fork: raise a fleet-wide MDBList cooldown.
+
+    _mark_mdblist_rate_limit records the 429 in this process's dicts, which is
+    all a single-instance deploy needs. Across replicas sharing the same keys,
+    every replica would otherwise have to discover the same 429 for itself —
+    one wasted MDBList call each, against a key that has already asked us to
+    stop. Publishing it means the first replica to be refused backs the rest
+    off too.
+
+    A no-op beyond the per-process cooldown on the in-process coordinator, and
+    never fatal: failing to publish a cooldown must not fail the request that
+    was merely unlucky enough to hit the 429.
+    """
+    with suppress(Exception):
+        await coord.set_backoff(
+            coord.NS_MDBLIST_GLOBAL_COOLDOWN, coord.MDBLIST_GLOBAL_KEY,
+            ttl_seconds=backoff_secs,
+        )
+
+
 def _warm_mdblist_key_with_quota(current_key: str, now: float, reserve: int) -> str | None:
     """
     Pick a configured key the cache warmer may still spend: not cooling down,
@@ -3953,6 +3974,11 @@ async def _run_cache_warm_cycle(client: httpx.AsyncClient) -> None:
                 f"Cache warm: MDBList rate-limited on {warm_canonical_id}; "
                 f"key cooling down for {backoff_secs:.0f}s"
             )
+            # The warmer runs on one replica but spends the key every replica
+            # shares, so its 429 has to reach them too — otherwise the other
+            # replicas keep issuing live requests against a key that is done
+            # for the day.
+            await _publish_fleet_mdblist_cooldown(backoff_secs)
             if replacement:
                 effective_mdblist_key = replacement
             else:
@@ -6064,6 +6090,21 @@ async def get_poster(
     if not rating_already_cached and effective_mdblist_key:
         _loop_now = asyncio.get_running_loop().time()
 
+        # ElfHosted fork: fleet-wide MDBList cooldown. When any replica has been
+        # 429'd recently, every replica backs off — cross-worker via the
+        # coordination layer (Redis), or per-process on the in-process default
+        # (where it overlaps the per-key cooldown below). Suppresses the fetch
+        # and the composite persist so an N/A score isn't locked in.
+        if await coord.is_backoff_active(
+            coord.NS_MDBLIST_GLOBAL_COOLDOWN, coord.MDBLIST_GLOBAL_KEY
+        ):
+            logger.debug(
+                f"Rating fetch for {canonical_id} skipped (fleet-wide MDBList cooldown)"
+            )
+            effective_mdblist_key = None
+            _rating_backoff_active = True
+            _mdblist_unavailable_reason = "fleet-wide MDBList cooldown active"
+
         # Per-key cooldown: configured server keys may rotate; request-supplied
         # keys remain isolated and simply wait for their own cooldown to expire.
         if effective_mdblist_key and _loop_now < _mdblist_key_cooldown.get(effective_mdblist_key, 0.0):
@@ -6907,6 +6948,7 @@ async def get_poster(
                 f"MDBList {_mdblist_server_key_label(_failed_key)} rate-limited "
                 f"for {canonical_id}; cooling down for {_backoff_secs:.0f}s"
             )
+            await _publish_fleet_mdblist_cooldown(_backoff_secs)
             if _rescue_key is not None:
                 effective_mdblist_key = _rescue_key
                 logger.warning(
@@ -6981,6 +7023,7 @@ async def get_poster(
                         f"MDBList rate-limited {canonical_id}; key cooling down for "
                         f"{backoff_secs:.0f}s"
                     )
+                    await _publish_fleet_mdblist_cooldown(backoff_secs)
             else:
                 # Network / timeout failure — escalating back-off so a transient
                 # hiccup retries quickly while a sustained outage backs off further.
