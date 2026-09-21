@@ -1,13 +1,15 @@
 #!/bin/sh
 set -e
 
-# Fix ownership of the cache volume mount so appuser can read/write it.
-# This runs as root before we drop privileges — necessary because Docker
-# creates the host-side directory as root when the volume is first mounted.
-mkdir -p /app/cache/tmdb_posters /app/cache/tmdb_logos
-chown -R appuser:appuser /app/cache
+# ElfHosted fork: enable prometheus_client multiprocess mode so /metrics
+# aggregates counters/histograms across all uvicorn worker processes. The
+# directory must exist, be writable by the runtime uid (568), and be empty at
+# startup — stale *.db files from a previous run would survive a restart and
+# inflate counters.
+export PROMETHEUS_MULTIPROC_DIR="${PROMETHEUS_MULTIPROC_DIR:-/tmp/postersplus-prom}"
+mkdir -p "$PROMETHEUS_MULTIPROC_DIR"
+rm -f "$PROMETHEUS_MULTIPROC_DIR"/*.db
 
-# Drop from root to appuser and exec uvicorn.
-# gosu correctly transfers signals (SIGTERM etc.) to the child process,
-# unlike 'su -c' which leaves an extra shell in the process tree.
-exec gosu appuser uvicorn main:app --host 0.0.0.0 --port 8000 --workers "${WORKERS:-1}"
+# No gosu / privilege drop — the image already runs as uid 568 (see dockerfile;
+# on Kubernetes the deployment SecurityContext owns user + volume policy).
+exec uvicorn main:app --host 0.0.0.0 --port 8000 --workers "${WORKERS:-1}"

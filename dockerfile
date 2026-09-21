@@ -19,11 +19,12 @@ RUN find /wheels -type f -name 'opencv_python-*.whl' -delete
 FROM python:3.11-slim
 WORKDIR /app
 
-# libcairo2 (runtime only — no -dev headers needed) for pycairo;
-# gosu for privilege drop in entrypoint.sh;
+# libcairo2 (runtime only — no -dev headers needed) for pycairo/cairosvg;
 # tini as PID 1 so orphaned processes get reaped (see CMD below).
+# ElfHosted fork: no gosu — the container runs as a fixed non-root uid (see
+# below); on Kubernetes the deployment SecurityContext (runAsNonRoot/fsGroup)
+# owns user + volume-permission policy, so there's no root-startup drop dance.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gosu \
     libcairo2 \
     tini \
     && rm -rf /var/lib/apt/lists/*
@@ -57,16 +58,24 @@ RUN if [ "$BAKE_PPOCR_MODEL" = "true" ]; then \
       apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/* ; \
     fi
 
-RUN adduser --disabled-password --gecos '' appuser
+# ElfHosted fork: explicit numeric uid/gid 568 so Kubernetes runAsNonRoot
+# validation succeeds without resolving /etc/passwd, matching ElfHosted's
+# per-app convention (helmrelease securityContext).
+RUN groupadd --gid 568 appuser \
+    && useradd --uid 568 --gid 568 --shell /bin/sh --create-home appuser
 
-# Copy app files and set ownership on everything except the cache dir,
-# which is a runtime volume mount — permissions are fixed by entrypoint.sh.
+# Copy app files and create the cache + Prometheus multiproc dirs while still
+# root, then hand ownership to 568. The cache dir is a runtime volume mount;
+# on k8s fsGroup fixes its permissions, on compose chown the host dir before
+# first `up` (see compose.yaml).
 COPY . .
-RUN chown -R appuser:appuser /app
+RUN mkdir -p /app/cache/tmdb_posters /app/cache/tmdb_logos /app/cache/composites \
+             /tmp/postersplus-prom \
+    && chown -R 568:568 /app /tmp/postersplus-prom
 
-# Run as root so entrypoint.sh can fix cache volume permissions at startup,
-# then it drops to appuser via gosu before exec-ing uvicorn.
-#
+# Numeric so kubelet can verify runAsNonRoot without /etc/passwd.
+USER 568
+
 # Exec form on purpose: the shell form ran `sh -c "python3 ... || exit 1"`, and
 # when the probe overran its timeout Docker SIGKILLed only the sh it exec'd.
 # The python3 child survived, was reparented to PID 1, and sat there as a
@@ -84,5 +93,6 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
   CMD ["python3", "-c", "import http.client; c = http.client.HTTPConnection('localhost', 8000, timeout=8); c.request('GET', '/health'); r = c.getresponse(); raise SystemExit(0 if r.status == 200 else 1)"]
 # tini as PID 1: reaps any orphan that lands on it and forwards signals, so a
 # process Docker leaves behind (an exec'd shell's child, a killed probe) can
-# never accumulate as a zombie. entrypoint.sh still execs into uvicorn.
+# never accumulate as a zombie. entrypoint.sh still execs into uvicorn — in
+# this fork already as uid 568, with no gosu drop.
 CMD ["/usr/bin/tini", "--", "/bin/sh", "entrypoint.sh"]

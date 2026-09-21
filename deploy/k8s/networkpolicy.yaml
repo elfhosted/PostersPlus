@@ -1,0 +1,59 @@
+## Egress allowlist: PostersPlus only needs to reach:
+##   * TMDB (api.themoviedb.org, image.tmdb.org)
+##   * MDBList (api.mdblist.com)
+##   * AIOStreams (operator-configured host)
+##   * Arctic Shift Reddit archive (arctic-shift.photon-reddit.com)
+##   * S3 endpoint (when OBJECT_STORE_URL is set)
+##   * Postgres + Redis services in the same namespace
+##   * DNS (kube-dns / coredns)
+##
+## NetworkPolicy by itself can't match FQDN — most CNIs (Calico, Cilium)
+## support FQDN policies via their own CRDs. This file restricts to in-
+## cluster targets + a permissive egress-to-internet (port 443). For
+## strict FQDN allowlisting, replace with a Cilium CiliumNetworkPolicy.
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postersplus
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: postersplus
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - port: 8000
+          protocol: TCP
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # In-namespace Postgres + Redis
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - port: 5432
+          protocol: TCP
+        - port: 6379
+          protocol: TCP
+    # External HTTPS — TMDB / MDBList / AIOStreams / S3 / Arctic Shift.
+    # Tighten with a CNI-specific FQDN policy in production.
+    - ports:
+        - port: 443
+          protocol: TCP

@@ -16,3 +16,14 @@ cairosvg>=2.7,<3
 opencv-python-headless>=4.8,<5
 onnxruntime>=1.17,<2
 rapidocr>=3.8,<4
+
+# --- ElfHosted fork: hosted-mode backends ---------------------------------
+# All optional at runtime — the backend modules are only imported when their
+# selector env var is set (DATABASE_URL / REDIS_URL / OBJECT_STORE_URL), so a
+# vanilla SQLite/local/in-process deploy never touches them. Installed
+# unconditionally so one image supports both private and hosted modes.
+psycopg[binary,pool]>=3.1,<4      # Postgres backend (DATABASE_URL)
+redis>=5.0,<7                     # Redis coordination backend (REDIS_URL)
+boto3>=1.34,<2                    # S3 blob store backend (OBJECT_STORE_URL)
+prometheus-client>=0.20,<1        # /metrics endpoint (always on)
+python-json-logger>=2.0,<4        # optional JSON logging (LOG_FORMAT=json)

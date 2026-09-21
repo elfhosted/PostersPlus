@@ -13,7 +13,14 @@ services:
       - "8000:8000"
     restart: unless-stopped
     volumes:
-      - ./postersplus-cache:/app/cache  # cache DB, TMDB posters/logos, discovery_overrides.json
+      # Named volume (not a host bind) so a fresh `compose up` works with the
+      # non-root uid 568 the image runs as: Docker seeds a new named volume's
+      # ownership from the image's /app/cache (owned by 568), whereas a fresh
+      # host bind dir is created root-owned and would be unwritable. Holds the
+      # cache DB, TMDB posters/logos, and composites.
+      # To supply discovery_overrides.json, copy it in after first start:
+      #   docker compose cp ./discovery_overrides.json postersplus:/app/cache/
+      - postersplus-cache:/app/cache
     env_file:
       - .env # see this file for an explanation of what each flag does
     environment: 
@@ -37,6 +44,25 @@ services:
       - COMPOSITE_CACHE_TTL=${COMPOSITE_CACHE_TTL:-604800}
       - COMPOSITE_MAX_ENTRIES=${COMPOSITE_MAX_ENTRIES:-0}
       - DEFAULT_LOGO_LANGUAGE=${DEFAULT_LOGO_LANGUAGE:-en}
+      # --- ElfHosted fork: hosted-mode backends (all opt-in; unset = upstream) ---
+      # Postgres / Redis / S3 backends. Leave unset for SQLite + in-process +
+      # local FS. See .env / .env.example for the commented postgres/redis/minio
+      # sidecar recipes and full descriptions.
+      - DATABASE_URL=${DATABASE_URL:-}
+      - REDIS_URL=${REDIS_URL:-}
+      - OBJECT_STORE_URL=${OBJECT_STORE_URL:-}
+      - OBJECT_STORE_PUBLIC_URL=${OBJECT_STORE_PUBLIC_URL:-}
+      # Static-preset moat + observability + limits.
+      - PRESET_ENABLED=${PRESET_ENABLED:-}
+      - PRESET_CDN_CACHE_TTL=${PRESET_CDN_CACHE_TTL:-86400}
+      - ANONYMOUS_TMDB_RPS=${ANONYMOUS_TMDB_RPS:-5}
+      - RATE_LIMIT_RPS=${RATE_LIMIT_RPS:-0}
+      - RENDER_CONCURRENCY=${RENDER_CONCURRENCY:-0}
+      - RENDER_QUEUE_TIMEOUT=${RENDER_QUEUE_TIMEOUT:-30}
+      - METRICS_ACCESS_KEY=${METRICS_ACCESS_KEY:-}
+      - LOG_FORMAT=${LOG_FORMAT:-text}
+    # The image runs as the non-root uid 568; the named volume below is seeded
+    # writable for it automatically (see the volumes: note).
     healthcheck:
       # Exec form (no shell) so a probe that overruns is killed outright rather
       # than leaving an orphaned python3 behind; see the HEALTHCHECK note in
@@ -46,3 +72,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 15s
+
+volumes:
+  postersplus-cache:

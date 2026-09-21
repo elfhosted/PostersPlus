@@ -1,0 +1,11 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: postersplus
+spec:
+  # Keeps at least 1 replica available during voluntary disruptions
+  # (node drains, rolling updates). Paired with the HPA's minReplicas: 2.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postersplus

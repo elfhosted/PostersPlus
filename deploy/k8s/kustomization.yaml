@@ -1,0 +1,25 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: postersplus
+
+# NB: do NOT use `commonLabels` here. It injects labels into every selector
+# field in every resource, including NetworkPolicy egress peer selectors —
+# which would rewrite the DNS / Postgres / Redis peers to also require the
+# postersplus app label and match nothing. The labels we want on the app's
+# own pods are declared directly on each resource's metadata.labels.
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - secret.yaml
+  - deployment.yaml
+  - service.yaml
+  - hpa.yaml
+  - pdb.yaml
+  - networkpolicy.yaml
+
+images:
+  - name: postersplus
+    newName: ghcr.io/elfhosted/postersplus
+    newTag: latest
