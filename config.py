@@ -53,6 +53,10 @@ DB_PATH               = "/app/cache/cache.db"
 BADGE_DIR             = "/app/badges"
 TMDB_POSTER_CACHE_DIR = "/app/cache/tmdb_posters" # base posters from TMDB
 TMDB_LOGO_CACHE_DIR   = "/app/cache/tmdb_logos" # base logos from TMDB
+# Composite blob cache (ElfHosted fork) — the local blobstore backend uses
+# this dir; the S3 backend ignores it. Composite JPEG bytes live here (or in
+# an S3 bucket when OBJECT_STORE_URL is set) instead of in the relational DB.
+COMPOSITE_BLOB_DIR    = "/app/cache/composites"
 
 # Environment
 
@@ -152,6 +156,70 @@ KITSU_API_BASE        = os.environ.get("KITSU_API_BASE", "https://kitsu.io/api/e
 # Ordered list of all configured server-side MDBList keys (primary first).
 # Used by the key-rotation logic in main.py to fall back when a key is exhausted.
 SERVER_MDBLIST_KEYS: list[str] = [k for k in [SERVER_MDBLIST_KEY, SERVER_MDBLIST_KEY_2] if k]
+
+# --- Hosted-mode pluggable backends (ElfHosted fork) ----------------------
+# All opt-in: unset, every selector falls back to the upstream-equivalent
+# default (SQLite / in-process / local filesystem), so a vanilla deploy is
+# byte-for-byte upstream behaviour.
+
+# Storage backend. A postgresql:// URL switches the cache layer from SQLite
+# to PostgreSQL. See storage/__init__.py.
+DATABASE_URL          = os.environ.get("DATABASE_URL", "").strip()
+DB_POOL_MIN_SIZE      = int(os.environ.get("DB_POOL_MIN_SIZE", "1"))
+DB_POOL_MAX_SIZE      = int(os.environ.get("DB_POOL_MAX_SIZE", "10"))
+
+# Coordination backend. When REDIS_URL is set, MDBList rate-limit backoff,
+# the fleet-wide 429 cooldown, background-quality claims, leader-election
+# leases, and per-tenant rate limits are stored in Redis so replicas share
+# state. Unset keeps per-process state. See coordination/__init__.py.
+REDIS_URL             = os.environ.get("REDIS_URL", "").strip()
+REDIS_KEY_PREFIX      = os.environ.get("REDIS_KEY_PREFIX", "postersplus").strip() or "postersplus"
+
+# Blob store for composite poster bytes. When OBJECT_STORE_URL is set, bytes
+# go to an S3-compatible object store instead of COMPOSITE_BLOB_DIR.
+# URL format: s3://<bucket>?endpoint=<https://...>&region=<region>&prefix=<prefix>
+OBJECT_STORE_URL        = os.environ.get("OBJECT_STORE_URL", "").strip()
+# Optional CDN public URL — when set, the /poster and /p paths can 302 to the
+# CDN for composite bytes instead of proxying them through the app pod.
+OBJECT_STORE_PUBLIC_URL = os.environ.get("OBJECT_STORE_PUBLIC_URL", "").strip()
+
+# --- Hosted-mode resource ceilings (ElfHosted fork) -----------------------
+# RENDER_CONCURRENCY caps Pillow renders in flight at once. Each render pins a
+# CPU core + ~10MB transient RAM; a burst of unique-param requests would
+# otherwise saturate every core and stall the event loop. Default = cpu_count
+# so single-tenant deploys behave like upstream (no artificial cap).
+RENDER_CONCURRENCY      = int(os.environ.get("RENDER_CONCURRENCY", "0")) or (os.cpu_count() or 2)
+# How long /poster waits for a render slot before returning 503. 0 = wait
+# forever; default 30s gives saturated clients a clear back-off signal.
+RENDER_QUEUE_TIMEOUT    = float(os.environ.get("RENDER_QUEUE_TIMEOUT", "30"))
+
+# --- Hosted-mode observability (ElfHosted fork) ---------------------------
+# Optional shared secret guarding /metrics. Unset leaves it open (gate at the
+# ingress). LOG_FORMAT=json emits structured JSON log lines (Loki/ES);
+# default "text" is upstream behaviour.
+METRICS_ACCESS_KEY      = os.environ.get("METRICS_ACCESS_KEY", "").strip()
+LOG_FORMAT              = os.environ.get("LOG_FORMAT", "text").strip().lower()
+
+# --- Per-tenant rate limit (ElfHosted fork) -------------------------------
+# Max /poster (and /p) requests per tenant per second. 0 disables (upstream
+# behaviour). Tenant identity = sha256(user-key)[:16] when users bring their
+# own TMDB/MDBList key; otherwise "operator" (/poster) or "preset" (/p).
+RATE_LIMIT_RPS          = int(os.environ.get("RATE_LIMIT_RPS", "0"))
+
+# --- Static-preset moat (ElfHosted fork) ----------------------------------
+# When PRESET_ENABLED, anonymous requests can hit a small set of named visual
+# presets via /p/{preset}/{type}/{imdb_id}.jpg without supplying any key — the
+# operator's server keys are used, rating/quality/text-detection are read from
+# cache only (never fetched), and PRESET_CDN_CACHE_TTL sets the Cache-Control
+# max-age on cached preset responses (deterministic per preset+title, so a far
+# longer TTL than CDN_CACHE_TTL is safe).
+PRESET_ENABLED        = os.environ.get("PRESET_ENABLED", "").strip().lower() in ("1", "true", "yes")
+PRESET_CDN_CACHE_TTL  = int(os.environ.get("PRESET_CDN_CACHE_TTL", "86400"))
+# Floor on anonymous /search and /resolve-imdb (the public preset flow needs
+# the title picker). RATE_LIMIT_RPS only gates /poster + /p; without this
+# independent floor an operator who left RATE_LIMIT_RPS=0 would leave the TMDB
+# proxy endpoints unthrottled. 0 disables (fully private deploys).
+ANONYMOUS_TMDB_RPS    = int(os.environ.get("ANONYMOUS_TMDB_RPS", "5"))
 
 # Workers
 # CDN cache TTL. When > 0, poster responses include a Cache-Control: public

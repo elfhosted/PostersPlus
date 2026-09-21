@@ -640,7 +640,10 @@ from cache import (
     get_cache_stats,
     get_app_state,
     set_app_state,
-    get_db,
+    # ElfHosted fork: upstream reaches for cache.get_db() here and runs the
+    # composite request_params SELECT inline, which only works against SQLite.
+    # The query lives behind a backend function so it works on Postgres too.
+    list_composite_request_params,
 )
 from digital_release import digital_release_poll_loop
 import imdb_dataset
@@ -3553,7 +3556,12 @@ async def _cache_prune_loop() -> None:
     await asyncio.sleep(300)
     while True:
         logger.info("Running scheduled cache prune")
-        await asyncio.get_running_loop().run_in_executor(None, prune_caches)
+        # ElfHosted fork: prune_caches is a coroutine (it deletes composite
+        # blobs from the blobstore alongside the metadata rows), so it is
+        # awaited rather than handed to the executor — run_in_executor would
+        # build the coroutine in a worker thread and never run it. The DB-side
+        # work inside is still sync, which is fine at this cadence.
+        await prune_caches()
 
         expired, orphans = prune_rating_state(asyncio.get_running_loop().time())
         if expired or orphans:
@@ -4002,12 +4010,7 @@ async def _run_trending_fetch_cycle(client: httpx.AsyncClient) -> None:
     if not trending_pairs:
         return
 
-    db = get_db()
-    try:
-        rows = db.execute("SELECT cache_key, request_params FROM final_poster_cache WHERE request_params IS NOT NULL").fetchall()
-    except Exception as exc:
-        logger.error(f"Trending fetch: failed to query cache: {exc}")
-        return
+    rows = list_composite_request_params()
 
     # Use a test client to regenerate posters through the API
     regenerated_count = 0
@@ -5300,7 +5303,12 @@ async def get_poster(
             if is_anime
             else f"{canonical_id}:{tmdb_id}:{type}:{_params_hash}"
         )
-        _cached_entry = None if _force_refresh else get_cached_final_poster_entry(final_cache_key)
+        # ElfHosted fork: composite bytes live in the blobstore, so the read
+        # and the write are awaited (see cache.py).
+        _cached_entry = (
+            None if _force_refresh
+            else await get_cached_final_poster_entry(final_cache_key)
+        )
         if _force_refresh:
             logger.info(f"Force refresh (nocache) for {final_cache_key} — bypassing cache read")
         if _cached_entry is not None:
@@ -6729,7 +6737,7 @@ async def get_poster(
                     else min(_ttl_override, _status_ttl)
                 )
 
-            _composite_expires_at = set_cached_final_poster(
+            _composite_expires_at = await set_cached_final_poster(
                 final_cache_key,
                 img_bytes,
                 request_params=_sanitize_request_params(request.url.query),
