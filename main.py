@@ -648,7 +648,10 @@ from i18n import load_languages, translate_genre, translate_sash
 from cache import (
     get_cached_quality,
     get_cached_rating,
+    get_cached_final_poster,
     get_cached_final_poster_entry,
+    get_cached_final_poster_url,
+    is_cached_final_poster_fresh,
     set_cached_final_poster,
     delete_cached_final_poster,
     get_cached_tmdb_poster,
@@ -695,6 +698,7 @@ from quality import (
     quality_source_configured,
     render_badges_left,
 )
+from presets import get_preset, preset_names, preset_catalog
 from ratings import (
     CustomScorePalette,
     MDBLIST_QUOTA,
@@ -711,7 +715,7 @@ from ratings import (
     _score_color_alt,
     _score_color_metal,
 )
-from tmdb import composite_logo, logo_centre_y, fetch_logo, image_language_order, fetch_poster_metadata, fetch_poster_image, fetch_backdrop_image, fetch_landscape_image, fetch_trending_rank, fetch_trending_candidates, fetch_popular_candidates, fetch_supplemental_candidates, fetch_catalog_candidates, fetch_release_status, fetch_upcoming_movie_release, fetch_recent_movie_digital_release_date, svg_logo_supported, tmdb_metadata_cache_key, _CROP_VERSION, _fetch_metahub_logo, LOGO_ABS_MAX_H, TEXT_FORWARD_PRIORITIES as _TEXT_FORWARD_LOGO_PRIORITIES
+from tmdb import composite_logo, logo_centre_y, fetch_logo, image_language_order, fetch_poster_metadata, resolve_imdb_to_tmdb, fetch_poster_image, fetch_backdrop_image, fetch_landscape_image, fetch_trending_rank, fetch_trending_candidates, fetch_popular_candidates, fetch_supplemental_candidates, fetch_catalog_candidates, fetch_release_status, fetch_upcoming_movie_release, fetch_recent_movie_digital_release_date, svg_logo_supported, tmdb_metadata_cache_key, _CROP_VERSION, _fetch_metahub_logo, LOGO_ABS_MAX_H, TEXT_FORWARD_PRIORITIES as _TEXT_FORWARD_LOGO_PRIORITIES
 
 # Logo priorities that consult the secondary preferred language ("custom").
 # Elsewhere the secondary language is inert and must be kept out of the image
@@ -4570,7 +4574,17 @@ def _render_param_defaults() -> dict:
 
 @app.get("/server-caps")
 async def server_caps(access_key: str = ""):
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
+    # ElfHosted fork: access_key_valid is the escape-hatch signal for the
+    # configurator lock — true only when an ACCESS_KEY is configured AND the
+    # caller supplied it.
+    access_key_valid = bool(
+        _cfg.ACCESS_KEY and access_key
+        and hmac.compare_digest(access_key, _cfg.ACCESS_KEY)
+    )
+    # On a public-tier instance (PRESET_ENABLED) /server-caps is anonymous so
+    # the locked configurator can discover the preset catalogue. Otherwise the
+    # original access_key gate stays.
+    if _cfg.ACCESS_KEY and not _cfg.PRESET_ENABLED and not access_key_valid:
         raise HTTPException(status_code=403, detail="Unauthorized")
     next_refresh_hours = None
     if _cfg.TRENDING_FETCH_TIME:
@@ -4610,6 +4624,10 @@ async def server_caps(access_key: str = ""):
         "sash_priority_diff_seed": _SASH_DIFF_SEED,
         "imdb_dataset_enabled":  imdb_dataset.is_enabled(),
         "imdb_dataset_titles":   imdb_dataset.row_count(),
+        # ElfHosted fork — static-preset moat / public-tier lock signals.
+        "preset_enabled":        _cfg.PRESET_ENABLED,
+        "presets":               preset_catalog() if _cfg.PRESET_ENABLED else [],
+        "access_key_valid":      access_key_valid,
     }
 
 
@@ -4677,6 +4695,80 @@ def _server_render_signature() -> str:
         f"stretch={int(_cfg.LOGO_STRETCH_DISABLED)}:{_cfg.LOGO_STRETCH_FACTOR:g}",
         f"assets={_render_assets_signature}",
     ))
+
+
+def _composite_cache_key(
+    canonical_id: str,
+    tmdb_id: str,
+    media_type: str,
+    raw_params: dict,
+    fallback_to_imdb: bool,
+    *,
+    anime_key: str | None = None,
+    imdb_id: str = "",
+) -> str:
+    """Build the composite cache key.
+
+    ElfHosted fork: extracted from /poster so the anonymous /p preset route can
+    call it too — an equivalent preset render and /poster render then share one
+    composite instead of storing the same bytes twice.
+
+    Server-side settings that change the output but are not URL params
+    (detection thresholds, poster-selection policy, rating policy, the IMDb
+    dataset, the render signature) are folded into the hash, so changing any of
+    them auto-busts stale composites and leaves keys unchanged when the feature
+    is off.
+    """
+    if _cfg.TEXTLESS_TEXT_DETECTION:
+        from text_detect import DETECT_RES_SIG
+        _detect_sig = (
+            f"|td={_cfg.PPOCR_BOX_THRESHOLD}:{_cfg.TEXTLESS_DETECTION_MAX_VOTES}:{DETECT_RES_SIG}"
+        )
+    else:
+        _detect_sig = ""
+    _poster_selection_sig = (
+        f"|ps={_cfg.TMDB_POSTER_MIN_VOTES}:"
+        f"{_cfg.TMDB_POSTER_MAX_SCORE_DROP:g}"
+    )
+    _rating_policy_sig = (
+        f"|rp={_cfg.RATING_MIN_VOTES}:"
+        f"{int(fallback_to_imdb)}"
+    )
+    # The IMDb dataset changes the rendered score exactly the way
+    # RATING_MIN_VOTES does, so flipping IMDB_DATASET_ENABLED has to bust
+    # composites the same way. Appended only when the feature is on, so
+    # instances that never enable it keep every existing cache entry.
+    #
+    # is_ready() rather than is_enabled(): on the first-ever start the feature
+    # is on but the table is empty until the download lands, and posters
+    # rendered in that window would otherwise be cached at "N/A" for the full
+    # composite TTL.
+    _dataset_sig = (
+        f"|imdbds={int(imdb_dataset.is_ready())}:{_cfg.IMDB_DATASET_MIN_VOTES}"
+        if imdb_dataset.is_enabled()
+        else ""
+    )
+    _server_sig = "|server=" + _server_render_signature()
+    _params_hash = hashlib.sha256(
+        (
+            "&".join(f"{k}={v}" for k, v in sorted(raw_params.items()))
+            + _detect_sig
+            + _poster_selection_sig
+            + _rating_policy_sig
+            + _dataset_sig
+            + _server_sig
+        ).encode()
+    ).hexdigest()[:16]
+    # The anime key has to be part of this: the same imdb/tmdb pair renders
+    # different art depending on whether an anime id came with it, so the two
+    # must not share a composite cache entry.
+    # Non-anime uses canonical_id rather than the raw imdb_id so a TMDB-only
+    # title gets "tmdb:1698026:…" instead of a leading empty segment. For a
+    # title that has an IMDb id the two are the same string, so existing cache
+    # entries stay valid.
+    if anime_key:
+        return f"{anime_key}:{imdb_id}:{tmdb_id}:{media_type}:{_params_hash}"
+    return f"{canonical_id}:{tmdb_id}:{media_type}:{_params_hash}"
 
 
 def _load_configurator_html() -> str:
@@ -4968,14 +5060,62 @@ async def get_configurator(request: Request, access_key: str = "", reload: str =
 # Search endpoint
 # ---------------------------------------------------------------------------
 
+def _gate_anonymous_tmdb_proxy(access_key: str) -> None:
+    """ElfHosted fork: when ACCESS_KEY is configured, /search and /resolve-imdb
+    are anonymous ONLY if PRESET_ENABLED (the public preset flow needs the title
+    picker). On instances without presets, the original access_key gate stays so
+    the server TMDB key isn't exposed to unthrottled public traffic against a
+    backend with no anonymous user-facing endpoint."""
+    if not _cfg.ACCESS_KEY:
+        return                                       # nothing gated
+    if _cfg.PRESET_ENABLED:
+        return                                       # public preset flow: anonymous OK
+    if access_key and hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
+        return                                       # authenticated tenant
+    raise HTTPException(status_code=403, detail="Unauthorized")
+
+
+async def _anonymous_tmdb_rate_limit(tmdb_key: str, access_key: str) -> None:
+    """ElfHosted fork: throttle the TMDB-proxy endpoints, which become anonymous
+    when PRESET_ENABLED. Three buckets, in priority order:
+      * caller tmdb_key → per-key bucket (RATE_LIMIT_RPS; their own quota is the
+        real backstop, so skipped when RATE_LIMIT_RPS=0),
+      * valid access_key → per-tenant bucket (RATE_LIMIT_RPS),
+      * anonymous → shared "anonymous" bucket sized by ANONYMOUS_TMDB_RPS,
+        independent of RATE_LIMIT_RPS so the floor applies even when the
+        operator never configured a poster rate limit."""
+    if tmdb_key:
+        if _cfg.RATE_LIMIT_RPS <= 0:
+            return
+        tenant_id = hashlib.sha256(tmdb_key.encode("utf-8")).hexdigest()[:16]
+        rps = _cfg.RATE_LIMIT_RPS
+    elif _cfg.ACCESS_KEY and access_key and hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
+        if _cfg.RATE_LIMIT_RPS <= 0:
+            return
+        tenant_id = hashlib.sha256(access_key.encode("utf-8")).hexdigest()[:16]
+        rps = _cfg.RATE_LIMIT_RPS
+    else:
+        if _cfg.ANONYMOUS_TMDB_RPS <= 0:
+            return
+        tenant_id = "anonymous"
+        rps = _cfg.ANONYMOUS_TMDB_RPS
+    allowed, retry_after = await coord.check_rate_limit(tenant_id, rps)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded ({rps} req/s)",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
 @app.get("/search")
 async def search_proxy(
     q: str,
     tmdb_key: str = "",
     access_key: str = "",
 ):
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    _gate_anonymous_tmdb_proxy(access_key)
+    await _anonymous_tmdb_rate_limit(tmdb_key, access_key)
     if len(q) > 200:
         raise HTTPException(status_code=400, detail="Query too long")
 
@@ -5004,8 +5144,8 @@ async def resolve_imdb(
     tmdb_key: str = "",
     access_key: str = "",
 ):
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    _gate_anonymous_tmdb_proxy(access_key)
+    await _anonymous_tmdb_rate_limit(tmdb_key, access_key)
 
     _check_tmdb_id(tmdb_id)
     _check_type(type)
@@ -5084,6 +5224,351 @@ async def get_logo(
         media_type="image/png",
         headers={"Cache-Control": "public, max-age=2592000"},
     )
+
+
+# ---------------------------------------------------------------------------
+# Static-preset route (ElfHosted fork)
+# ---------------------------------------------------------------------------
+#
+# /p/{preset}/{type}/{imdb_id}.jpg is the public tier: anonymous, no keys, one
+# of a fixed set of looks, and deterministic per (preset, title) so a CDN can
+# hold it for a day. That makes it the overload surface, and the whole design
+# of this handler is about what an anonymous hit is NOT allowed to make the
+# server do.
+#
+# The moat, in one line: an anonymous hit may READ any cache, and may never
+# FILL an expensive one.
+#
+#   * Ratings and quality are cached-only. No MDBList call, no AIOStreams call.
+#   * Burned-in-text detection is cached-only, and a miss queues the BACKGROUND
+#     worker rather than scanning inline. A foreground OCR scan is ~400ms of
+#     pinned CPU, so a few hundred cold titles would be a denial of service
+#     with no authentication needed to trigger it.
+#   * A render made without all of those inputs is "undetermined": it may not
+#     match what /poster produces once the caches warm. It is served with a
+#     60-second Cache-Control and is NOT persisted, so an incomplete poster
+#     can neither poison the CDN for a day nor be stored under a key that a
+#     later, complete render would want.
+#
+# Composite keys come from _composite_cache_key, the same function /poster
+# uses, so an equivalent preset render and /poster render share one composite.
+_PRESET_ROUTE_VALID_TYPES = frozenset({"movie", "tv"})
+_PRESET_INCOMPLETE_TTL = 60   # short Cache-Control (s) for not-yet-warm renders
+
+
+@app.get("/p/{preset}/{type}/{imdb_id}.jpg")
+async def get_preset_poster(preset: str, type: str, imdb_id: str):
+    if not _cfg.PRESET_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    preset_params = get_preset(preset)
+    if preset_params is None:
+        raise HTTPException(status_code=404, detail=f"Unknown preset '{preset}'")
+
+    # AIOMetadata fills {type} with 'series' for TV; fold to the canonical 'tv'.
+    if type == "series":
+        type = "tv"
+    if type not in _PRESET_ROUTE_VALID_TYPES:
+        raise HTTPException(status_code=400, detail="Invalid type (movie|tv)")
+    _check_imdb_id(imdb_id)
+
+    effective_tmdb_key = _resolve_tmdb_key("")
+    if not effective_tmdb_key:
+        raise HTTPException(status_code=503, detail="Server TMDB key not configured")
+
+    # All anonymous preset traffic shares one operator-wide "preset" bucket so a
+    # runaway integration can't drag /poster down.
+    if _cfg.RATE_LIMIT_RPS > 0:
+        allowed, retry_after = await coord.check_rate_limit("preset", _cfg.RATE_LIMIT_RPS)
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded ({_cfg.RATE_LIMIT_RPS} req/s)",
+                headers={"Retry-After": str(retry_after)},
+            )
+
+    if _HTTP_CLIENT is None:
+        raise HTTPException(status_code=503, detail="Service unavailable")
+    client = _HTTP_CLIENT
+
+    tmdb_id = await resolve_imdb_to_tmdb(client, imdb_id, effective_tmdb_key, type)
+    if not tmdb_id:
+        raise HTTPException(status_code=404, detail="Title not found on TMDB")
+
+    raw_params = dict(preset_params)
+    rcfg = build_request_config(raw_params)
+
+    # The preset route always carries a real IMDb id, so the canonical identity
+    # is that id — but go through the same helper /poster uses rather than
+    # assuming it, so the two stay keyed alike if the rule ever changes.
+    canonical_id = _canonical_rating_id(imdb_id, "", tmdb_id)
+
+    # Same key shape as /poster → a preset and an equivalent /poster render
+    # share one composite.
+    final_cache_key = _composite_cache_key(
+        canonical_id, tmdb_id, type, raw_params, rcfg.fallback_to_imdb,
+        imdb_id=imdb_id,
+    )
+
+    def _preset_header(persisted: bool) -> dict:
+        ttl = _cfg.PRESET_CDN_CACHE_TTL if persisted else _PRESET_INCOMPLETE_TTL
+        return {"Cache-Control": f"public, max-age={ttl}"} if ttl > 0 else {}
+
+    # Cache hit: prefer a 302 to the CDN when a public URL is configured,
+    # else serve the bytes inline.
+    cdn_url = get_cached_final_poster_url(final_cache_key)
+    if cdn_url is not None:
+        if await is_cached_final_poster_fresh(final_cache_key):
+            logger.info(f"Preset {preset} cache hit (CDN redirect) for {final_cache_key}")
+            resp = Response(status_code=302)
+            resp.headers["Location"] = cdn_url
+            for k, v in _preset_header(True).items():
+                resp.headers[k] = v
+            return resp
+    else:
+        cached_jpeg = await get_cached_final_poster(final_cache_key)
+        if cached_jpeg is not None:
+            logger.info(f"Preset {preset} cache hit (inline) for {final_cache_key}")
+            return Response(content=cached_jpeg, media_type="image/jpeg",
+                            headers=_preset_header(True))
+
+    # Rating + quality: cached-only. None means "never queried" (suppress
+    # persistence); [] means "queried, nothing available" (safe to persist).
+    cached_rating = get_cached_rating(canonical_id)
+    cached_release_date = cached_rating[2] if cached_rating is not None else None
+    cached_quality = get_cached_quality(imdb_id, cached_release_date)
+    quality_tokens = cached_quality or []
+    # Any non-hidden badge mode reads quality_tokens; persisting before quality
+    # is cached would lock in an empty/grey badge for the long preset TTL.
+    wants_badges = rcfg.badge_display_mode != 0
+    quality_missing = wants_badges and cached_quality is None
+
+    # Bound before the try: the finally clears this slot, and a failure in the
+    # metadata fetch below happens before the coalescing future is created.
+    _render_fut: "asyncio.Future[bytes] | None" = None
+
+    try:
+        genre_ids, is_textless, logos, release_year, title, poster_path, backdrop_path, tmdb_data = (
+            await fetch_poster_metadata(
+                client, tmdb_id, effective_tmdb_key, type, rcfg.logo_language,
+            )
+        )
+
+        # TMDB-derived genre fallback — the preset path never calls MDBList, so
+        # for never-warmed titles derive the genre label from TMDB genre_ids
+        # (same logic /poster uses) rather than rendering "Unknown".
+        if cached_rating is not None:
+            (
+                ratings_dict, cached_genre, _crd, award_wins, award_noms, _af,
+                festival_keyword, age_rating, is_cult, is_true_story, is_metacritic,
+            ) = cached_rating
+            # The IMDb weight can come from the local dataset instead of
+            # MDBList, and that is a local table read, not a network call — so
+            # it is allowed here and keeps the preset score matching /poster's.
+            ratings_dict = _merge_imdb_dataset_rating(
+                ratings_dict if isinstance(ratings_dict, dict) else {},
+                imdb_id, rcfg,
+            )
+            weights = (
+                (rcfg.tv_weights or _cfg.TV_WEIGHTS) if type in ("tv", "series")
+                else (rcfg.movie_weights or _cfg.MOVIE_WEIGHTS)
+            )
+            score = (
+                calculate_weighted_score(ratings_dict, weights,
+                                         fallback_to_imdb=rcfg.fallback_to_imdb)
+                if isinstance(ratings_dict, dict) else "N/A"
+            )
+            genre = cached_genre or "Unknown"
+            rel = cached_release_date
+        else:
+            ratings_dict, score, genre, rel = {}, "N/A", "Unknown", None
+            award_wins, award_noms = [], []
+            festival_keyword = age_rating = None
+            is_cult = is_true_story = is_metacritic = False
+
+        if genre == "Unknown" and genre_ids:
+            _gid_set = set(genre_ids)
+            for _gid in _cfg.GENRE_PRIORITY:
+                if _gid in _gid_set and _cfg.GENRE_MAP.get(_gid):
+                    genre = _cfg.GENRE_MAP[_gid]
+                    break
+
+        # No-poster ladder: poster → backdrop → gradient canvas.
+        is_no_poster = poster_path is None
+        use_backdrop = is_no_poster and backdrop_path is not None
+        if use_backdrop:
+            image_coro = fetch_backdrop_image(client, tmdb_id, backdrop_path)
+        elif is_no_poster:
+            image_coro = _resolved(_make_fallback_canvas(genre_ids))
+        else:
+            image_coro = fetch_poster_image(client, tmdb_id, type, poster_path)
+
+        # Burned-in-text detection: CACHED ONLY. Never scan in the foreground on
+        # an anonymous hit. If a textless poster's detection isn't cached, the
+        # render is "undetermined" (it might differ from what /poster produces
+        # once OCR runs), so we don't persist it and we queue a background scan
+        # to warm it — matching /poster's det cache key exactly so the result
+        # is shared.
+        _suppress_overlay = False
+        _ocr_undetermined = False
+        _scan_selected = (
+            _cfg.TEXTLESS_TEXT_DETECTION and is_textless and not is_no_poster
+        )
+        if _scan_selected:
+            from text_detect import DETECT_RES_SIG
+            _det_src = f"ps:{poster_path}"
+            _det_key = f"{_det_src}|conf={_cfg.PPOCR_BOX_THRESHOLD}:{DETECT_RES_SIG}"
+            _det_cached = get_cached_text_detection(_det_key)
+            if _det_cached is None:
+                _ocr_undetermined = True
+                _queue_background_text_detection(_DeferredTextDetection(
+                    cache_key=_det_key,
+                    image_cache_key=f"{type}_{tmdb_id}_{poster_path.strip('/')}",
+                    title=tuple(v for v in (title, tmdb_data.get("original_title")) if v),
+                    source="poster",
+                    tmdb_id=tmdb_id,
+                    media_type=type,
+                    image_path=poster_path,
+                    vote_count=tmdb_data.get("vote_count"),
+                    source_key=_det_src,
+                ))
+            else:
+                _suppress_overlay = bool(_det_cached)
+
+        will_persist = (
+            cached_rating is not None and not quality_missing and not _ocr_undetermined
+        )
+
+        # Coalesce concurrent uncached renders — only on the will-persist path
+        # (an incomplete render must not be shared under the long preset TTL).
+        if will_persist:
+            _existing_fut = _render_inflight.get(final_cache_key)
+            if _existing_fut is not None:
+                logger.info(f"Preset {preset} coalescing on {final_cache_key}")
+                try:
+                    _coalesced = await _existing_fut
+                    # /poster's futures carry (bytes, provisional, expires_at);
+                    # this route's carry bare bytes. Accept either, because the
+                    # two share _render_inflight keyed by the same composite key
+                    # and either endpoint can be the one that got there first.
+                    if isinstance(_coalesced, tuple):
+                        _coalesced_bytes, _coalesced_provisional = _coalesced[0], _coalesced[1]
+                    else:
+                        _coalesced_bytes, _coalesced_provisional = _coalesced, False
+                    # A provisional /poster render is one rendered without all
+                    # its inputs, which is exactly what must not go out under
+                    # the long preset TTL.
+                    return Response(
+                        content=_coalesced_bytes, media_type="image/jpeg",
+                        headers=_preset_header(not _coalesced_provisional),
+                    )
+                except Exception:
+                    pass   # in-flight render failed; fall through and try ourselves
+            _render_fut = asyncio.get_running_loop().create_future()
+            _render_fut.add_done_callback(
+                lambda f: f.exception() if not f.cancelled() and f.exception() else None
+            )
+            _render_inflight[final_cache_key] = _render_fut
+
+        _overlay_logo = (
+            is_textless and not is_no_poster and not rcfg.textless and not _suppress_overlay
+        )
+        image, logo, trending_rank = await asyncio.gather(
+            image_coro,
+            fetch_logo(
+                client, logos, rcfg.logo_language,
+                imdb_id=imdb_id, original_language=tmdb_data.get("original_language"),
+                logo_priority=rcfg.logo_priority,
+            ) if _overlay_logo else _resolved(None),
+            fetch_trending_rank(client, tmdb_id, effective_tmdb_key, type),
+        )
+
+        discovery_meta = extract_discovery_meta(
+            tmdb_data=tmdb_data, media_type=type,
+            award_wins=award_wins, award_noms=award_noms,
+            trending_rank=trending_rank, tmdb_id=tmdb_id,
+            release_date=rel, keywords=[],
+            festival_keyword=festival_keyword,
+            is_cult_override=is_cult, is_true_story_override=is_true_story,
+            is_metacritic_override=is_metacritic,
+            is_digital_release_override=is_digital_release(imdb_id),
+        )
+
+        _bp_args = dict(
+            logo=logo if (_overlay_logo and logo) else None,
+            fallback_title=(
+                title if is_no_poster
+                else (title if is_textless and not logo and not rcfg.textless
+                      and not _suppress_overlay else None)
+            ),
+            discovery_meta=discovery_meta,
+            quality_tokens=quality_tokens,
+            release_year=release_year,
+            age_rating=age_rating,
+            no_poster=is_no_poster,
+        )
+
+        def _composite_and_encode() -> bytes:
+            result = build_poster(image, score, genre, rcfg, **_bp_args)
+            buf = io.BytesIO()
+            result.convert("RGB").save(buf, format="JPEG", quality=_cfg.JPEG_QUALITY)
+            return buf.getvalue()
+
+        # Same admission control as /poster, so preset traffic and /poster
+        # traffic queue against one cap rather than two independent ones.
+        _render_sem = _get_render_semaphore()
+        try:
+            if _cfg.RENDER_QUEUE_TIMEOUT > 0:
+                await asyncio.wait_for(_render_sem.acquire(),
+                                       timeout=_cfg.RENDER_QUEUE_TIMEOUT)
+            else:
+                await _render_sem.acquire()
+        except asyncio.TimeoutError:
+            _metrics.render_saturated_total.inc()
+            logger.warning(
+                f"Render queue saturated (cap={_cfg.POSTER_RENDER_CONCURRENCY}); "
+                f"503 for preset={preset} imdb={imdb_id}"
+            )
+            raise HTTPException(status_code=503, detail="Server saturated — try again shortly",
+                                headers={"Retry-After": "5"})
+        try:
+            _metrics.render_inflight.inc()
+            with _metrics.render_duration_seconds.time():
+                img_bytes = await asyncio.get_running_loop().run_in_executor(
+                    None, _composite_and_encode)
+        finally:
+            _metrics.render_inflight.dec()
+            _render_sem.release()
+
+        if will_persist:
+            # No request_params: replaying a /p URL through the trending
+            # refresh would need the /poster query string, which this route
+            # never had. The composite is still invalidated by tmdb_id like any
+            # other, so a rank change drops it and the next hit re-renders.
+            await set_cached_final_poster(final_cache_key, img_bytes)
+            logger.info(f"Preset {preset} rendered + cached {final_cache_key}")
+            if _render_fut is not None and not _render_fut.done():
+                _render_fut.set_result(img_bytes)
+        else:
+            logger.info(
+                f"Preset {preset} rendered (not persisted: "
+                f"rating_cached={cached_rating is not None}, "
+                f"quality_missing={quality_missing}, ocr_undetermined={_ocr_undetermined}) "
+                f"{final_cache_key}"
+            )
+        return Response(content=img_bytes, media_type="image/jpeg",
+                        headers=_preset_header(will_persist))
+    finally:
+        # Clear our coalescing slot. Waiters already hold the future object, so
+        # popping after a successful set_result is safe; on an error path we
+        # fail the future first so waiters don't hang. Only touch the future
+        # this call published — on the non-persisting path we never registered
+        # one, and popping then would steal another request's slot.
+        if _render_fut is not None:
+            if not _render_fut.done():
+                _render_fut.set_exception(HTTPException(status_code=500))
+            if _render_inflight.get(final_cache_key) is _render_fut:
+                _render_inflight.pop(final_cache_key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -5453,61 +5938,17 @@ async def get_poster(
     # Skipped when an explicit quality= override is supplied (one-off).
     # ------------------------------------------------------------------
     if not quality and not _cfg.DISABLE_COMPOSITE_CACHE:
-        # Server-side detection settings affect the rendered output but aren't URL
-        # params, so fold a signature into the hash.  Toggling detection or
-        # changing its thresholds then auto-busts stale composites (and leaves
-        # cache keys unchanged when the feature is off — backward compatible).
-        if _cfg.TEXTLESS_TEXT_DETECTION:
-            from text_detect import DETECT_RES_SIG
-            _detect_sig = (
-                f"|td={_cfg.PPOCR_BOX_THRESHOLD}:{_cfg.TEXTLESS_DETECTION_MAX_VOTES}:{DETECT_RES_SIG}"
-            )
-        else:
-            _detect_sig = ""
-        _poster_selection_sig = (
-            f"|ps={_cfg.TMDB_POSTER_MIN_VOTES}:"
-            f"{_cfg.TMDB_POSTER_MAX_SCORE_DROP:g}"
-        )
-        _rating_policy_sig = (
-            f"|rp={_cfg.RATING_MIN_VOTES}:"
-            f"{int(rcfg.fallback_to_imdb)}"
-        )
-        # The IMDb dataset changes the rendered score exactly the way
-        # RATING_MIN_VOTES does, so flipping IMDB_DATASET_ENABLED has to bust
-        # composites the same way. Appended only when the feature is on, so
-        # instances that never enable it keep every existing cache entry.
-        #
-        # is_ready() rather than is_enabled(): on the first-ever start the
-        # feature is on but the table is empty until the download lands, and
-        # posters rendered in that window would otherwise be cached at "N/A"
-        # for the full composite TTL.
-        _dataset_sig = (
-            f"|imdbds={int(imdb_dataset.is_ready())}:{_cfg.IMDB_DATASET_MIN_VOTES}"
-            if imdb_dataset.is_enabled()
-            else ""
-        )
-        _server_sig = "|server=" + _server_render_signature()
-        _params_hash = hashlib.sha256(
-            (
-                "&".join(f"{k}={v}" for k, v in sorted(raw_params.items()))
-                + _detect_sig
-                + _poster_selection_sig
-                + _rating_policy_sig
-                + _dataset_sig
-                + _server_sig
-            ).encode()
-        ).hexdigest()[:16]
-        # The anime key has to be part of this: the same imdb/tmdb pair renders
-        # different art depending on whether an anime id came with it, so the
-        # two must not share a composite cache entry.
-        # Non-anime uses canonical_id rather than the raw imdb_id so a TMDB-only
-        # title gets "tmdb:1698026:…" instead of a leading empty segment. For a
-        # title that has an IMDb id the two are the same string, so existing
-        # cache entries stay valid.
-        final_cache_key = (
-            f"{anime_key}:{imdb_id}:{tmdb_id}:{type}:{_params_hash}"
-            if is_anime
-            else f"{canonical_id}:{tmdb_id}:{type}:{_params_hash}"
+        # ElfHosted fork: the key construction lives in _composite_cache_key so
+        # the anonymous /p preset route builds byte-identical keys and shares
+        # these composites.
+        final_cache_key = _composite_cache_key(
+            canonical_id,
+            tmdb_id,
+            type,
+            raw_params,
+            rcfg.fallback_to_imdb,
+            anime_key=anime_key if is_anime else None,
+            imdb_id=imdb_id,
         )
         # ElfHosted fork: composite bytes live in the blobstore, so the read
         # and the write are awaited (see cache.py).

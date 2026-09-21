@@ -53,6 +53,8 @@ from cache import (
     get_cached_movie_release_info,
     set_cached_movie_release_info,
     release_status_expiry,
+    get_cached_imdb_to_tmdb,
+    set_cached_imdb_to_tmdb,
 )
 
 from config import (
@@ -622,6 +624,45 @@ async def fetch_poster_metadata(
     }
 
     return genre_ids, is_textless, logos, release_year, title, poster_path, backdrop_path, tmdb_data
+
+
+async def resolve_imdb_to_tmdb(
+    client: httpx.AsyncClient,
+    imdb_id: str,
+    tmdb_key: str,
+    media_type: str = "movie",
+) -> str | None:
+    """Resolve an imdb_id (tt...) to a TMDB id for the given media type
+    (ElfHosted fork). Cached forever — TMDB ids are stable. Returns None on miss.
+
+    Public preset URLs only carry the imdb_id (the universal Stremio
+    identifier); this resolver runs once per (imdb_id, media_type) and every
+    subsequent /p hit reads from the imdb_to_tmdb cache."""
+    cached = get_cached_imdb_to_tmdb(imdb_id, media_type)
+    if cached is not None:
+        return cached
+
+    endpoint = "tv_results" if media_type in ("tv", "series") else "movie_results"
+    url = f"https://api.themoviedb.org/3/find/{imdb_id}"
+    try:
+        resp = await client.get(url, params={"api_key": tmdb_key, "external_source": "imdb_id"})
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.HTTPError as exc:
+        logger.warning(f"imdb_to_tmdb resolve failed for {imdb_id}: {exc}")
+        return None
+
+    results = data.get(endpoint) or []
+    if not results:
+        logger.info(f"imdb_to_tmdb: no {media_type} match for {imdb_id}")
+        return None
+
+    tmdb_id = str(results[0].get("id") or "")
+    if not tmdb_id:
+        return None
+
+    set_cached_imdb_to_tmdb(imdb_id, media_type, tmdb_id)
+    return tmdb_id
 
 
 async def fetch_poster_image(
