@@ -14,10 +14,12 @@ import asyncio
 import logging
 import re
 import time
+from contextlib import suppress
 
 import httpx
 
 from cache import add_digital_releases
+import coordination as coord
 from config import DIGITAL_RELEASE_MAX_AGE_DAYS, DIGITAL_RELEASE_MIN_AGE_DAYS
 
 logger = logging.getLogger(__name__)
@@ -124,14 +126,52 @@ async def digital_release_poll_loop(
     If *initial_sync_done* is given, it's set once the first sync attempt
     finishes (success or failure) — other startup tasks (e.g. cache warming)
     can wait on it so they don't run concurrently with this one.
+
+    ElfHosted fork: leader-elected via the coordination layer so multi-replica
+    deployments only have one replica polling the source. With the default
+    in-process coordinator each worker leads its own iteration (matches
+    upstream).
     """
+    lease_ttl = float(_POLL_INTERVAL + 3600)  # one polling cycle + headroom
+    lease_token: str | None = None
+
     await asyncio.sleep(60)   # let the service finish warming up first
-    while True:
-        try:
-            await sync_digital_releases(client)
-        except Exception as exc:
-            logger.error(f"Digital release poll loop error: {exc}")
-        finally:
-            if initial_sync_done is not None and not initial_sync_done.is_set():
-                initial_sync_done.set()
-        await asyncio.sleep(_POLL_INTERVAL)
+    try:
+        while True:
+            if lease_token is None:
+                lease_token = await coord.try_acquire_lease(
+                    coord.LEASE_DIGITAL_RELEASE, lease_ttl,
+                )
+                if lease_token is not None:
+                    logger.info("Acquired digital-release-poll lease")
+            elif not await coord.refresh_lease(
+                coord.LEASE_DIGITAL_RELEASE, lease_token, lease_ttl,
+            ):
+                logger.info("Digital-release-poll lease lost")
+                lease_token = None
+
+            try:
+                if lease_token is not None:
+                    try:
+                        await sync_digital_releases(client)
+                    except Exception as exc:
+                        logger.error(f"Digital release poll loop error: {exc}")
+                else:
+                    logger.debug(
+                        "Digital release poll skipped — another replica holds the lease"
+                    )
+            finally:
+                # Set on EVERY path, including the one where this replica never
+                # held the lease. Whoever waits on this event is waiting for
+                # "the feed has had its chance", not for this replica to have
+                # been the one to run it — a follower that never sets it would
+                # hang the startup tasks gated on it for the whole poll
+                # interval, on every replica but one.
+                if initial_sync_done is not None and not initial_sync_done.is_set():
+                    initial_sync_done.set()
+
+            await asyncio.sleep(_POLL_INTERVAL)
+    finally:
+        if lease_token is not None:
+            with suppress(Exception):
+                await coord.release_lease(coord.LEASE_DIGITAL_RELEASE, lease_token)

@@ -29,6 +29,30 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     force=True,
 )
+# ElfHosted fork: optional structured JSON logs (LOG_FORMAT=json) for shipping
+# to Loki/Elasticsearch. Read straight from the env so logging is configured
+# before config.py is imported. Falls back to the text format above if
+# python-json-logger isn't installed. Default (text) is upstream behaviour.
+if os.environ.get("LOG_FORMAT", "text").strip().lower() == "json":
+    try:
+        from pythonjsonlogger.json import JsonFormatter
+    except Exception:
+        try:
+            from pythonjsonlogger.jsonlogger import JsonFormatter  # older versions
+        except Exception:
+            JsonFormatter = None
+    if JsonFormatter is not None:
+        _json_fmt = JsonFormatter(
+            "%(asctime)s %(levelname)s %(name)s %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S%z",
+        )
+        for _h in logging.getLogger().handlers:
+            _h.setFormatter(_json_fmt)
+    else:
+        logging.getLogger(__name__).warning(
+            "LOG_FORMAT=json but python-json-logger is not installed — "
+            "falling back to text logs."
+        )
 # Pull uvicorn's loggers into our root handler so all output shares the same format.
 for _uv_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
     _uv_logger = logging.getLogger(_uv_name)
@@ -644,7 +668,12 @@ from cache import (
     # composite request_params SELECT inline, which only works against SQLite.
     # The query lives behind a backend function so it works on Postgres too.
     list_composite_request_params,
+    close as close_db,
+    BACKEND_KIND as _STORAGE_KIND,
 )
+import blobstore
+import coordination as coord
+import metrics as _metrics
 from digital_release import digital_release_poll_loop
 import imdb_dataset
 from imdb_dataset import imdb_dataset_refresh_loop
@@ -3549,28 +3578,65 @@ def prune_rating_state(now: float) -> tuple[int, int]:
     return len(expired), len(orphans)
 
 
+async def _with_lease(lease_name: str, ttl_seconds: float) -> str | None:
+    """Best-effort leader election (ElfHosted fork). Returns a lease token if
+    this replica/worker is currently the leader, else None. With the
+    in-process coordinator each worker is its own leader (no cross-process
+    state); with the Redis coordinator exactly one replica holds the lease."""
+    token = await coord.try_acquire_lease(lease_name, ttl_seconds)
+    if token is not None:
+        logger.info(f"Acquired lease {lease_name!r} (token={token})")
+    return token
+
+
 async def _cache_prune_loop() -> None:
-    """Periodically prune expired rows from all cache tables."""
+    """Periodically prune expired rows from all cache tables. Leader-elected
+    so multi-replica deployments only run one prune per cycle."""
+    # Lease TTL covers one iteration's sleep + run, plus a buffer so a slow
+    # SQLite VACUUM doesn't release the lease mid-run.
+    lease_ttl = 8 * 3600.0
+    lease_token: str | None = None
+
     # Wait a few minutes after startup before the first run so the service
     # is fully warmed before taking the SQLite write lock.
     await asyncio.sleep(300)
-    while True:
-        logger.info("Running scheduled cache prune")
-        # ElfHosted fork: prune_caches is a coroutine (it deletes composite
-        # blobs from the blobstore alongside the metadata rows), so it is
-        # awaited rather than handed to the executor — run_in_executor would
-        # build the coroutine in a worker thread and never run it. The DB-side
-        # work inside is still sync, which is fine at this cadence.
-        await prune_caches()
+    try:
+        while True:
+            if lease_token is None:
+                lease_token = await _with_lease(coord.LEASE_CACHE_PRUNE, lease_ttl)
+            elif not await coord.refresh_lease(coord.LEASE_CACHE_PRUNE, lease_token, lease_ttl):
+                logger.info(f"Lease {coord.LEASE_CACHE_PRUNE!r} lost")
+                lease_token = None
 
-        expired, orphans = prune_rating_state(asyncio.get_running_loop().time())
-        if expired or orphans:
-            logger.debug(
-                f"Pruned {expired} expired rating backoff entries "
-                f"and {orphans} stranded failure counters"
-            )
+            if lease_token is not None:
+                logger.info("Running scheduled cache prune (leader)")
+                # ElfHosted fork: prune_caches is a coroutine (it deletes
+                # composite blobs from the blobstore alongside the metadata
+                # rows), so it is awaited rather than handed to the executor —
+                # run_in_executor would build the coroutine in a worker thread
+                # and never run it. The DB-side work inside is still sync,
+                # which is fine at this cadence.
+                await prune_caches()
+                # Coordinator-managed state (rating backoff, bg-fetch claims):
+                # evicts expired per-worker entries on the in-process backend;
+                # a no-op on Redis (the server expires keys itself).
+                await coord.prune_expired()
+            else:
+                logger.debug("Cache prune skipped — another replica holds the lease")
 
-        await asyncio.sleep(6 * 3600)   # every 6 hours
+            # Per-worker in-memory state, so this runs regardless of leadership.
+            expired, orphans = prune_rating_state(asyncio.get_running_loop().time())
+            if expired or orphans:
+                logger.debug(
+                    f"Pruned {expired} expired rating backoff entries "
+                    f"and {orphans} stranded failure counters"
+                )
+
+            await asyncio.sleep(6 * 3600)   # every 6 hours
+    finally:
+        if lease_token is not None:
+            with suppress(Exception):
+                await coord.release_lease(coord.LEASE_CACHE_PRUNE, lease_token)
 
 
 async def _run_cache_warm_cycle(client: httpx.AsyncClient) -> None:
@@ -4043,10 +4109,27 @@ async def _run_trending_fetch_cycle(client: httpx.AsyncClient) -> None:
 
 async def _trending_fetch_loop() -> None:
     """Periodically fetch trending items and regenerate cached posters."""
+    # ElfHosted fork: leader-elected. This cycle re-renders composites through
+    # the API, so on an N-replica deployment it would otherwise do N times the
+    # work against the same shared cache.
+    lease_ttl = 26 * 3600.0   # one daily cycle plus headroom
+    lease_token: str | None = None
+
+    async def _lead() -> bool:
+        nonlocal lease_token
+        if lease_token is None:
+            lease_token = await _with_lease(coord.LEASE_TRENDING_FETCH, lease_ttl)
+        elif not await coord.refresh_lease(
+            coord.LEASE_TRENDING_FETCH, lease_token, lease_ttl
+        ):
+            logger.info(f"Lease {coord.LEASE_TRENDING_FETCH!r} lost")
+            lease_token = None
+        return lease_token is not None
+
     # First run immediately on startup
     await asyncio.sleep(10)
     try:
-        if _HTTP_CLIENT is not None:
+        if _HTTP_CLIENT is not None and await _lead():
             await _run_trending_fetch_cycle(_HTTP_CLIENT)
     except Exception as exc:
         logger.error(f"Trending fetch: startup cycle failed: {exc}")
@@ -4075,8 +4158,12 @@ async def _trending_fetch_loop() -> None:
         logger.info(f"Trending fetch: next cycle scheduled in {wait / 3600:.1f} hours")
         await asyncio.sleep(wait)
         try:
-            if _HTTP_CLIENT is not None:
+            if _HTTP_CLIENT is None:
+                pass
+            elif await _lead():
                 await _run_trending_fetch_cycle(_HTTP_CLIENT)
+            else:
+                logger.debug("Trending fetch skipped — another replica holds the lease")
         except Exception as exc:
             logger.error(f"Trending fetch: cycle failed: {exc}")
 
@@ -4121,33 +4208,61 @@ async def _cache_warm_loop(digital_release_ready: asyncio.Event | None = None) -
     else:
         wait = max(_CACHE_WARM_MIN_WAIT_SECS, (last_run + interval_secs) - time.time())
 
+    # ElfHosted fork: leader-elected. The warmer spends the operator's MDBList
+    # daily quota, and its own CACHE_WARM_MDBLIST_RESERVE guard counts only
+    # what THIS process spent — it cannot see sibling replicas draining the
+    # same key. Unleased, an N-replica deployment burns roughly N budgets a
+    # cycle and blows through the reserve the guard exists to protect.
+    lease_ttl = max(interval_secs, 3600.0) + 3600.0
+    lease_token: str | None = None
+
     first_cycle = True
-    while True:
-        logger.info(
-            f"Cache warm: next cycle scheduled for {_format_local(time.time() + wait)} "
-            f"(in {wait / 60:.1f} min)"
-        )
-        await asyncio.sleep(wait)
-        if first_cycle and digital_release_ready is not None and not digital_release_ready.is_set():
+    try:
+        while True:
+            logger.info(
+                f"Cache warm: next cycle scheduled for {_format_local(time.time() + wait)} "
+                f"(in {wait / 60:.1f} min)"
+            )
+            await asyncio.sleep(wait)
+            if first_cycle and digital_release_ready is not None and not digital_release_ready.is_set():
+                try:
+                    await asyncio.wait_for(digital_release_ready.wait(), timeout=120)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Cache warm: digital release sync didn't finish within 120s — proceeding anyway"
+                    )
+            first_cycle = False
+
+            if lease_token is None:
+                lease_token = await _with_lease(coord.LEASE_CACHE_WARM, lease_ttl)
+            elif not await coord.refresh_lease(
+                coord.LEASE_CACHE_WARM, lease_token, lease_ttl
+            ):
+                logger.info(f"Lease {coord.LEASE_CACHE_WARM!r} lost")
+                lease_token = None
+
             try:
-                await asyncio.wait_for(digital_release_ready.wait(), timeout=120)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Cache warm: digital release sync didn't finish within 120s — proceeding anyway"
-                )
-        first_cycle = False
-        try:
-            if _HTTP_CLIENT is not None:
-                await _run_cache_warm_cycle(_HTTP_CLIENT)
-                set_app_state(_CACHE_WARM_LAST_RUN_KEY, str(time.time()))
+                if lease_token is None:
+                    logger.debug("Cache warm skipped — another replica holds the lease")
+                elif _HTTP_CLIENT is not None:
+                    await _run_cache_warm_cycle(_HTTP_CLIENT)
+                    # Written by the leader only. The timestamp gates the
+                    # restart-suppression wait at the top of this function, and
+                    # it is shared state: a follower writing it would tell every
+                    # replica a cycle had run when none had on their watch.
+                    set_app_state(_CACHE_WARM_LAST_RUN_KEY, str(time.time()))
+                else:
+                    logger.warning("Cache warm: HTTP client not ready — skipping this cycle")
+            except Exception as exc:
+                logger.error(f"Cache warm: cycle failed: {exc}")
+            if _cfg.CACHE_WARM_AT_HOUR is not None:
+                wait = max(_CACHE_WARM_MIN_WAIT_SECS, _seconds_until_next_hour(_cfg.CACHE_WARM_AT_HOUR))
             else:
-                logger.warning("Cache warm: HTTP client not ready — skipping this cycle")
-        except Exception as exc:
-            logger.error(f"Cache warm: cycle failed: {exc}")
-        if _cfg.CACHE_WARM_AT_HOUR is not None:
-            wait = max(_CACHE_WARM_MIN_WAIT_SECS, _seconds_until_next_hour(_cfg.CACHE_WARM_AT_HOUR))
-        else:
-            wait = interval_secs
+                wait = interval_secs
+    finally:
+        if lease_token is not None:
+            with suppress(Exception):
+                await coord.release_lease(coord.LEASE_CACHE_WARM, lease_token)
 
 
 @asynccontextmanager
@@ -4155,8 +4270,21 @@ async def lifespan(app: FastAPI):
     global _HTTP_CLIENT, _configurator_html, _render_assets_signature
     global _background_detection_queue, _background_detection_task
     init_db()
-    logger.info(f"Cache initialised (composite TTL {_cfg.COMPOSITE_CACHE_TTL}s / "
-                f"{_cfg.COMPOSITE_CACHE_TTL / 86400:.1f}d)")
+    await blobstore.init()
+    await coord.init()
+    with suppress(Exception):
+        _metrics.backend_info.labels(
+            storage=_STORAGE_KIND,
+            coordinator=getattr(coord, "BACKEND_KIND", "inprocess"),
+            blobstore=getattr(blobstore, "BACKEND_KIND", "local"),
+        ).set(1)
+    logger.info(
+        f"Cache initialised (storage={_STORAGE_KIND}, "
+        f"blobstore={getattr(blobstore, 'BACKEND_KIND', 'local')}, "
+        f"coordination={getattr(coord, 'BACKEND_KIND', 'inprocess')}; "
+        f"composite TTL {_cfg.COMPOSITE_CACHE_TTL}s / "
+        f"{_cfg.COMPOSITE_CACHE_TTL / 86400:.1f}d)"
+    )
     imdb_dataset.init_db()
     if imdb_dataset.is_enabled():
         logger.info(
@@ -4283,6 +4411,13 @@ async def lifespan(app: FastAPI):
     _shutdown_detect_executor()
     await _HTTP_CLIENT.aclose()
     logger.info("HTTP client closed")
+    with suppress(Exception):
+        await coord.close()
+    with suppress(Exception):
+        await blobstore.close()
+    with suppress(Exception):
+        close_db()
+    logger.info("Storage + blobstore + coordination closed")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -4563,9 +4698,60 @@ def _load_configurator_html() -> str:
 
 
 @app.get("/health")
+@app.get("/live")
 async def health_check():
-    """Lightweight liveness probe — no auth required, used by Docker healthcheck."""
+    """Lightweight liveness probe — no auth required, used by Docker healthcheck.
+    /live is a Kubernetes-idiomatic alias; pair it with /ready for readiness."""
     return {"status": "ok"}
+
+
+@app.get("/ready")
+async def readiness_probe():
+    """Readiness probe (ElfHosted fork) — checks the backends this replica
+    depends on so a load balancer can pull it from rotation when a dependency
+    is unhealthy, without killing the process. Each probe runs concurrently;
+    sync probes go to the threadpool so a stalled backend can't pin the loop."""
+    import cache as _cache_mod
+    import blobstore as _blob_mod
+
+    async def _coord_check() -> bool:
+        if coord.BACKEND_KIND == "redis":
+            from coordination import redis_backend as _rb
+            return await _rb.aping()
+        return coord.ping()
+
+    db_ok, blob_ok, coord_ok = await asyncio.gather(
+        asyncio.to_thread(_cache_mod.ping),
+        asyncio.to_thread(_blob_mod.ping),
+        _coord_check(),
+    )
+    body = {
+        "storage":     {"kind": _cache_mod.BACKEND_KIND, "ok": db_ok},
+        "coordinator": {"kind": coord.BACKEND_KIND,      "ok": coord_ok},
+        "blobstore":   {"kind": _blob_mod.BACKEND_KIND,  "ok": blob_ok},
+    }
+    if not (db_ok and coord_ok and blob_ok):
+        return JSONResponse(status_code=503, content={"status": "degraded", **body})
+    return {"status": "ok", **body}
+
+
+@app.get("/metrics")
+async def metrics_endpoint(access_key: str = ""):
+    """Prometheus exposition (ElfHosted fork). Optional shared-secret guard via
+    METRICS_ACCESS_KEY (defence-in-depth when /metrics is publicly reachable —
+    operators should still gate it at the ingress). Aggregates across uvicorn
+    workers when PROMETHEUS_MULTIPROC_DIR is set."""
+    if _cfg.METRICS_ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.METRICS_ACCESS_KEY):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, CollectorRegistry
+    if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+        from prometheus_client import multiprocess
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        payload = generate_latest(registry)
+    else:
+        payload = generate_latest()
+    return Response(content=payload, media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/stats")
@@ -5055,6 +5241,26 @@ async def get_poster(
     if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
         raise HTTPException(status_code=403, detail="Unauthorized, your access key is not valid for this instance.")
 
+    # ElfHosted fork: per-tenant rate limit. Tenant identity is derived from
+    # the user-supplied key when the user brings their own (so a noisy tenant
+    # throttles itself without dragging others down); requests on the
+    # operator's keys share the "operator" bucket. Disabled when
+    # RATE_LIMIT_RPS=0 (upstream behaviour).
+    if _cfg.RATE_LIMIT_RPS > 0:
+        if tmdb_key:
+            tenant_id = hashlib.sha256(tmdb_key.encode("utf-8")).hexdigest()[:16]
+        elif mdblist_key:
+            tenant_id = hashlib.sha256(mdblist_key.encode("utf-8")).hexdigest()[:16]
+        else:
+            tenant_id = "operator"
+        allowed, retry_after = await coord.check_rate_limit(tenant_id, _cfg.RATE_LIMIT_RPS)
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded ({_cfg.RATE_LIMIT_RPS} req/s)",
+                headers={"Retry-After": str(retry_after)},
+            )
+
     _check_type(type)
 
     # Done before anything reads imdb_id — the composite cache key is built from
@@ -5542,11 +5748,36 @@ async def get_poster(
         )
     _renders_queued += 1
     try:
-        await _render_sem.acquire()
+        # ElfHosted fork: upstream waits here indefinitely, which is right for
+        # a private instance and wrong for a public one — a saturated queue
+        # there just becomes client timeouts with no signal to back off. With
+        # RENDER_QUEUE_TIMEOUT set, give up and tell the client to retry.
+        # Timing out is handled exactly like the cancellation below, because
+        # the consequences are identical: the coalescing future is already
+        # published and its riders must not be left waiting on a render that
+        # is never going to start.
+        if _cfg.RENDER_QUEUE_TIMEOUT > 0:
+            await asyncio.wait_for(
+                _render_sem.acquire(), timeout=_cfg.RENDER_QUEUE_TIMEOUT
+            )
+        else:
+            await _render_sem.acquire()
     except BaseException as exc:
-        # Cancelled while queued (shutdown, mostly). Nothing has been touched
-        # yet, but the coalescing future was already published and anyone
-        # riding it must not wait forever.
+        # Cancelled or timed out while queued. Nothing has been touched yet,
+        # but the coalescing future was already published and anyone riding it
+        # must not wait forever.
+        if isinstance(exc, asyncio.TimeoutError):
+            _metrics.render_saturated_total.inc()
+            logger.warning(
+                f"Render queue saturated (cap={_cfg.POSTER_RENDER_CONCURRENCY}, "
+                f"waited {_cfg.RENDER_QUEUE_TIMEOUT}s); returning 503 for "
+                f"tmdb_id={tmdb_id}"
+            )
+            exc = HTTPException(
+                status_code=503,
+                detail="Server saturated — try again shortly",
+                headers={"Retry-After": "5"},
+            )
         if _render_fut is not None and not _render_fut.done():
             _render_fut.set_exception(exc)
         if final_cache_key is not None:
@@ -5554,7 +5785,7 @@ async def get_poster(
         if _rating_event_to_set is not None:
             _rating_event_to_set.set()
             _rating_fetch_inflight.pop(canonical_id, None)
-        raise
+        raise exc
     finally:
         _renders_queued -= 1
     _active_poster_renders += 1
@@ -6694,9 +6925,18 @@ async def get_poster(
             result.convert("RGB").save(buf, format=_cfg.IMAGE_FORMAT.upper(), quality=_quality)
             return buf.getvalue()
 
-        img_bytes = await asyncio.get_running_loop().run_in_executor(
-            None, _composite_and_encode
-        )
+        # ElfHosted fork: meter the Pillow composite itself. The admission
+        # semaphore above covers the whole render pipeline including upstream
+        # calls, so its occupancy does not tell an operator how much of a slow
+        # render is CPU; this does.
+        try:
+            _metrics.render_inflight.inc()
+            with _metrics.render_duration_seconds.time():
+                img_bytes = await asyncio.get_running_loop().run_in_executor(
+                    None, _composite_and_encode
+                )
+        finally:
+            _metrics.render_inflight.dec()
 
         # Persist the finished poster so future requests skip the pipeline.
         # Skipped when:

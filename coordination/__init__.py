@@ -77,3 +77,11 @@ MDBLIST_GLOBAL_KEY: str = "all"
 # its own leader (no cross-process state), which matches upstream behaviour.
 LEASE_CACHE_PRUNE: str   = "cache-prune"
 LEASE_DIGITAL_RELEASE: str = "digital-release-poll"
+# Upstream v1.2.0 added two more periodic loops, and unlike the prune these
+# spend a shared, finite budget: the cache warmer burns the operator's MDBList
+# daily quota and TMDB calls, and the trending refresh re-renders composites
+# through the API. Left unleased they would cost N times that on an N-replica
+# deployment — the warmer's own quota reserve is per-process and cannot see
+# the other replicas spending the same key.
+LEASE_CACHE_WARM: str    = "cache-warm"
+LEASE_TRENDING_FETCH: str = "trending-fetch"

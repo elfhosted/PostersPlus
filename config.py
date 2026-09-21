@@ -184,13 +184,18 @@ OBJECT_STORE_URL        = os.environ.get("OBJECT_STORE_URL", "").strip()
 OBJECT_STORE_PUBLIC_URL = os.environ.get("OBJECT_STORE_PUBLIC_URL", "").strip()
 
 # --- Hosted-mode resource ceilings (ElfHosted fork) -----------------------
-# RENDER_CONCURRENCY caps Pillow renders in flight at once. Each render pins a
-# CPU core + ~10MB transient RAM; a burst of unique-param requests would
-# otherwise saturate every core and stall the event loop. Default = cpu_count
-# so single-tenant deploys behave like upstream (no artificial cap).
-RENDER_CONCURRENCY      = int(os.environ.get("RENDER_CONCURRENCY", "0")) or (os.cpu_count() or 2)
-# How long /poster waits for a render slot before returning 503. 0 = wait
-# forever; default 30s gives saturated clients a clear back-off signal.
+# Upstream v1.2.0 grew its own render-admission cap, POSTER_RENDER_CONCURRENCY
+# (see further down), and it is the better of the two: it gates the whole
+# render pipeline — upstream API calls included — rather than just the Pillow
+# encode the fork's own semaphore wrapped. So the fork's cap is gone and
+# RENDER_CONCURRENCY survives only as an alias, to avoid silently ignoring the
+# variable on deployments that already set it. Unset, upstream's default wins.
+RENDER_CONCURRENCY      = int(os.environ.get("RENDER_CONCURRENCY", "0"))
+# How long /poster waits for a render slot before giving up with 503 +
+# Retry-After. Upstream queues indefinitely, which is right for a private
+# instance and wrong for a public one: a saturated queue there just converts
+# into client timeouts with no signal to back off. 0 restores upstream's
+# wait-forever behaviour.
 RENDER_QUEUE_TIMEOUT    = float(os.environ.get("RENDER_QUEUE_TIMEOUT", "30"))
 
 # --- Hosted-mode observability (ElfHosted fork) ---------------------------
@@ -398,6 +403,11 @@ MDBLIST_CONCURRENCY          = int(os.environ.get("MDBLIST_CONCURRENCY", "3"))
 # upstream each; nothing limited the number of renders competing for the pool.
 # 8 renders x ~4 calls fits inside the pool with headroom for background work.
 POSTER_RENDER_CONCURRENCY    = max(1, int(os.environ.get("POSTER_RENDER_CONCURRENCY", "8")))
+# ElfHosted fork: honour the fork's older RENDER_CONCURRENCY name. Defined
+# after upstream's so a deployment that sets the old variable still gets the
+# cap it asked for; setting both means POSTER_RENDER_CONCURRENCY is ignored.
+if RENDER_CONCURRENCY > 0:
+    POSTER_RENDER_CONCURRENCY = RENDER_CONCURRENCY
 
 # -----------------------------------------------------------------------
 # IMDb local ratings dataset — an MDBList-free way to source the "imdb"
