@@ -5289,7 +5289,7 @@ async def search_proxy(
     if _HTTP_CLIENT is None:
         raise HTTPException(status_code=503, detail="Service unavailable")
     resp = await _HTTP_CLIENT.get(
-        "https://api.themoviedb.org/3/search/multi",
+        f"{_cfg.TMDB_API_BASE}/search/multi",
         params={
             "api_key": effective_key,
             "query": q,
@@ -5318,9 +5318,9 @@ async def resolve_imdb(
         raise HTTPException(status_code=400, detail="No TMDB API key available")
 
     endpoint = (
-        f"https://api.themoviedb.org/3/tv/{tmdb_id}/external_ids"
+        f"{_cfg.TMDB_API_BASE}/tv/{tmdb_id}/external_ids"
         if type == "tv"
-        else f"https://api.themoviedb.org/3/movie/{tmdb_id}/external_ids"
+        else f"{_cfg.TMDB_API_BASE}/movie/{tmdb_id}/external_ids"
     )
 
     if _HTTP_CLIENT is None:

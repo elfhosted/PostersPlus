@@ -58,6 +58,7 @@ from cache import (
 )
 
 from config import (
+    TMDB_API_BASE,
     POSTER_WIDTH,
     POSTER_HEIGHT,
     LANDSCAPE_WIDTH,
@@ -418,7 +419,7 @@ async def fetch_poster_metadata(
 
     logger.info(f"External API Call: Requested meta from TMDB for {tmdb_id}")
     resp = await client.get(
-        f"https://api.themoviedb.org/3/{endpoint}/{tmdb_id}",
+        f"{TMDB_API_BASE}/{endpoint}/{tmdb_id}",
         params={
             "api_key": tmdb_key,
             "append_to_response": "images,credits,external_ids",
@@ -539,7 +540,7 @@ async def fetch_poster_metadata(
                 f"Fetching supplemental {original_language} images for {tmdb_id}"
             )
             supp = await client.get(
-                f"https://api.themoviedb.org/3/{endpoint}/{tmdb_id}/images",
+                f"{TMDB_API_BASE}/{endpoint}/{tmdb_id}/images",
                 params={
                     "api_key":                tmdb_key,
                     "include_image_language": original_language,
@@ -643,7 +644,7 @@ async def resolve_imdb_to_tmdb(
         return cached
 
     endpoint = "tv_results" if media_type in ("tv", "series") else "movie_results"
-    url = f"https://api.themoviedb.org/3/find/{imdb_id}"
+    url = f"{TMDB_API_BASE}/find/{imdb_id}"
     try:
         resp = await client.get(url, params={"api_key": tmdb_key, "external_source": "imdb_id"})
         resp.raise_for_status()
@@ -1543,7 +1544,7 @@ async def fetch_trending_rank(
 
                     async def _fetch_page(page: int) -> list[dict]:
                         resp = await client.get(
-                            f"https://api.themoviedb.org/3/trending/{endpoint}/day",
+                            f"{TMDB_API_BASE}/trending/{endpoint}/day",
                             params={"api_key": tmdb_key, "page": page},
                         )
                         resp.raise_for_status()
@@ -1598,7 +1599,7 @@ async def fetch_trending_candidates(
         for page in range(1, pages_per_list + 1):
             try:
                 resp = await client.get(
-                    f"https://api.themoviedb.org/3/trending/{media_type}/{window}",
+                    f"{TMDB_API_BASE}/trending/{media_type}/{window}",
                     params={"api_key": tmdb_key, "page": page},
                 )
                 resp.raise_for_status()
@@ -1696,7 +1697,7 @@ async def fetch_popular_candidates(
         for page in range(1, pages_per_list + 1):
             try:
                 resp = await client.get(
-                    f"https://api.themoviedb.org/3/{media_type}/popular",
+                    f"{TMDB_API_BASE}/{media_type}/popular",
                     params={"api_key": tmdb_key, "page": page},
                 )
                 resp.raise_for_status()
@@ -1756,7 +1757,7 @@ async def fetch_supplemental_candidates(
         for page in range(1, pages_per_list + 1):
             try:
                 resp = await client.get(
-                    f"https://api.themoviedb.org/3/{media_type}/{list_name}",
+                    f"{TMDB_API_BASE}/{media_type}/{list_name}",
                     params={"api_key": tmdb_key, "page": page},
                 )
                 resp.raise_for_status()
@@ -1810,7 +1811,7 @@ async def resolve_tmdb_id_from_imdb(
     """
     try:
         resp = await client.get(
-            f"https://api.themoviedb.org/3/find/{imdb_id}",
+            f"{TMDB_API_BASE}/find/{imdb_id}",
             params={"api_key": tmdb_key, "external_source": "imdb_id"},
         )
         resp.raise_for_status()
@@ -2063,7 +2064,7 @@ async def fetch_movie_release_info(
     try:
         logger.info(f"External API Call: TMDB release_dates for movie {tmdb_id}")
         resp = await client.get(
-            f"https://api.themoviedb.org/3/movie/{tmdb_id}/release_dates",
+            f"{TMDB_API_BASE}/movie/{tmdb_id}/release_dates",
             params={"api_key": tmdb_key},
         )
         resp.raise_for_status()

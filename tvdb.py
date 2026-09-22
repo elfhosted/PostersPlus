@@ -37,6 +37,7 @@ from cache import (
     set_cached_tmdb_poster,
 )
 from config import (
+    TVDB_API_BASE,
     SERVER_TVDB_KEY,
     TVDB_SUBSCRIBER_PIN,
     TVDB_CONCURRENCY,
@@ -47,7 +48,7 @@ from config import (
     POSTER_HEIGHT,
 )
 
-_API_BASE      = "https://api4.thetvdb.com/v4"
+_API_BASE      = TVDB_API_BASE   # ElfHosted fork: configurable (emdb)
 _ARTWORK_BASE  = "https://artworks.thetvdb.com"
 
 # Refresh the ~1-month token comfortably before it expires.

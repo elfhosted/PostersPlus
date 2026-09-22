@@ -18,6 +18,7 @@ except ImportError:
 from awards import (FETCH_FAILED, _FetchFailed, _RateLimited, dominant_frost_rgb,
                     _frost_ink, _frosted_tint)
 from config import (
+    MDBLIST_API_BASE,
     ANIME_RATING_SOURCES,
     GENRE_MAP,
     GENRE_PRIORITY,
@@ -157,7 +158,7 @@ async def fetch_rating(
             f"{provider}/{media_id}"
         )
         resp = await client.get(
-            f"https://api.mdblist.com/{provider}/{mdb_type}/{media_id}",
+            f"{MDBLIST_API_BASE}/{provider}/{mdb_type}/{media_id}",
             params={"apikey": mdblist_key, "append_to_response": "keyword"},
             timeout=10.0,
         )
