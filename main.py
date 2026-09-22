@@ -4882,6 +4882,13 @@ def _composite_cache_key(
         else ""
     )
     _server_sig = "|server=" + _server_render_signature()
+    # ElfHosted fork: a composite rendered with no quality source can't carry
+    # badges, and nothing re-renders it when a source is added later — cache
+    # hits return before quality is looked at. Keying it apart means adding a
+    # source moves every request to a fresh key instead of serving badge-less
+    # composites for the rest of their TTL. Appended only when no source is
+    # configured, so instances that have one keep all their existing keys.
+    _quality_sig = "" if quality_source_configured() else "|noqs"
     _params_hash = hashlib.sha256(
         (
             "&".join(f"{k}={v}" for k, v in sorted(raw_params.items()))
@@ -4889,6 +4896,7 @@ def _composite_cache_key(
             + _poster_selection_sig
             + _rating_policy_sig
             + _dataset_sig
+            + _quality_sig
             + _server_sig
         ).encode()
     ).hexdigest()[:16]
@@ -5763,7 +5771,16 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str, shape: str = "
     # Any non-hidden badge mode reads quality_tokens; persisting before quality
     # is cached would lock in an empty/grey badge for the long preset TTL.
     wants_badges = rcfg.badge_display_mode != 0 and not _is_landscape
-    quality_missing = wants_badges and cached_quality is None
+    # Wait for quality only when a source exists to supply it. /poster never
+    # waits without one (it can't be fetched, so it isn't pending); /p used to
+    # treat it as permanently missing, so on an instance with no source every
+    # badge preset stayed unpersistable and re-rendered on every hit. That was
+    # the public instance: no AIOStreams/QualiCache/scraper, and its traffic is
+    # almost entirely the retired badge presets — 99% of renders unpersisted.
+    # Cached quality is still READ either way (wants_badges is unchanged): a
+    # source removed after badges were cached shouldn't drop those badges.
+    _quality_can_arrive = quality_source_configured()
+    quality_missing = wants_badges and cached_quality is None and _quality_can_arrive
 
     # Coalesce onto an in-flight render for the same composite, BEFORE taking
     # an admission slot.
@@ -5859,7 +5876,7 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str, shape: str = "
         if not imdb_id and effective_imdb_id and wants_badges:
             cached_quality = get_cached_quality(effective_imdb_id, cached_release_date)
             quality_tokens = cached_quality or []
-            quality_missing = cached_quality is None
+            quality_missing = cached_quality is None and _quality_can_arrive
         elif not effective_imdb_id:
             # No IMDb id anywhere: quality can never be fetched for this title,
             # so waiting on it would keep the render unpersistable forever.
