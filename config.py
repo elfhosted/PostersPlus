@@ -156,16 +156,16 @@ KITSU_API_BASE        = os.environ.get("KITSU_API_BASE", "https://kitsu.io/api/e
 # ElfHosted fork: API base URLs for the metadata services, so an operator can
 # route lookups through a shared caching proxy (ElfHosted runs emdb, e.g.
 # TMDB_API_BASE=http://elfhosted-internal.emdb/tmdb/3). Defaults are the public
-# endpoints, so unset is upstream behaviour. Only JSON lookups go through
+# endpoints, so unset — or set to "" — is upstream behaviour. Only JSON lookups go through
 # these; artwork still comes straight from the image CDNs.
 #
 # Behind a proxy that strips X-RateLimit-* response headers (emdb does), the
 # MDBList quota snapshot stays unknown: CACHE_WARM_MDBLIST_RESERVE and the /p
 # rating warm then cannot see a key nearing its daily limit and stop only on
 # the 429, which is still honoured fleet-wide.
-TMDB_API_BASE         = os.environ.get("TMDB_API_BASE", "https://api.themoviedb.org/3").strip().rstrip("/")
-MDBLIST_API_BASE      = os.environ.get("MDBLIST_API_BASE", "https://api.mdblist.com").strip().rstrip("/")
-TVDB_API_BASE         = os.environ.get("TVDB_API_BASE", "https://api4.thetvdb.com/v4").strip().rstrip("/")
+TMDB_API_BASE         = (os.environ.get("TMDB_API_BASE", "").strip().rstrip("/") or "https://api.themoviedb.org/3")
+MDBLIST_API_BASE      = (os.environ.get("MDBLIST_API_BASE", "").strip().rstrip("/") or "https://api.mdblist.com")
+TVDB_API_BASE         = (os.environ.get("TVDB_API_BASE", "").strip().rstrip("/") or "https://api4.thetvdb.com/v4")
 
 # Ordered list of all configured server-side MDBList keys (primary first).
 # Used by the key-rotation logic in main.py to fall back when a key is exhausted.
