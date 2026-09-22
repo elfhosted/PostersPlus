@@ -5550,7 +5550,15 @@ _PRESET_INCOMPLETE_TTL = 60   # short Cache-Control (s) for not-yet-warm renders
 
 
 @app.get("/p/{preset}/{type}/{imdb_id}.jpg")
-async def get_preset_poster(preset: str, type: str, imdb_id: str):
+async def get_preset_poster(preset: str, type: str, imdb_id: str, shape: str = ""):
+    """Anonymous preset render.
+
+    The id segment is an IMDb id ("tt0111161") or a TMDB id in Nuvio's/
+    Stremio's namespaced form ("tmdb:278"), so a client pattern like
+    /p/<preset>/{type}/{id}.jpg?shape={shape} covers IMDb- and TMDB-keyed
+    catalogues alike. ``shape=landscape`` renders the 16:9 layout; ``poster``,
+    ``square`` or nothing renders the portrait one.
+    """
     if not _cfg.PRESET_ENABLED:
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -5563,7 +5571,20 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
         type = "tv"
     if type not in _PRESET_ROUTE_VALID_TYPES:
         raise HTTPException(status_code=400, detail="Invalid type (movie|tv)")
-    _check_imdb_id(imdb_id)
+    # "tmdb:<digits>" names the title directly; anything else must be an IMDb
+    # id. A TMDB-only request has no IMDb enrichment and is keyed "tmdb:<id>",
+    # exactly as /poster keys a TMDB-only request, so the two share composites.
+    _direct_tmdb_id = ""
+    if imdb_id.startswith("tmdb:"):
+        _direct_tmdb_id = imdb_id[len("tmdb:"):]
+        _check_tmdb_id(_direct_tmdb_id)
+        imdb_id = ""
+    else:
+        _check_imdb_id(imdb_id)
+    _shape = (shape or "").strip().lower()
+    if _shape not in ("", "poster", "portrait", "square", "landscape"):
+        raise HTTPException(status_code=400, detail="Invalid shape (poster|landscape)")
+    _is_landscape = _shape == "landscape"
 
     effective_tmdb_key = _resolve_tmdb_key("")
     if not effective_tmdb_key:
@@ -5589,7 +5610,9 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
     # it. Unbounded, an anonymous burst of unknown ids would drain the shared
     # HTTP pool that the render cap exists to protect, so a cold lookup takes a
     # slot of its own. Warm lookups are a local read and skip this.
-    if get_cached_imdb_to_tmdb(imdb_id, type) is None:
+    if _direct_tmdb_id:
+        tmdb_id = _direct_tmdb_id
+    elif get_cached_imdb_to_tmdb(imdb_id, type) is None:
         _resolve_sem = _get_render_semaphore()
         try:
             if _cfg.RENDER_QUEUE_TIMEOUT > 0:
@@ -5612,6 +5635,10 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
         raise HTTPException(status_code=404, detail="Title not found on TMDB")
 
     raw_params = dict(preset_params)
+    # Only landscape is added to the params, so every existing portrait preset
+    # keeps its composite key; landscape gets its own, as on /poster.
+    if _is_landscape:
+        raw_params["shape"] = "landscape"
     rcfg = build_request_config(raw_params)
 
     # The preset route always carries a real IMDb id, so the canonical identity
@@ -5680,11 +5707,13 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
     # persistence); [] means "queried, nothing available" (safe to persist).
     cached_rating = get_cached_rating(canonical_id)
     cached_release_date = cached_rating[2] if cached_rating is not None else None
-    cached_quality = get_cached_quality(imdb_id, cached_release_date)
+    cached_quality = (
+        get_cached_quality(imdb_id, cached_release_date) if imdb_id else None
+    )
     quality_tokens = cached_quality or []
     # Any non-hidden badge mode reads quality_tokens; persisting before quality
     # is cached would lock in an empty/grey badge for the long preset TTL.
-    wants_badges = rcfg.badge_display_mode != 0
+    wants_badges = rcfg.badge_display_mode != 0 and not _is_landscape
     quality_missing = wants_badges and cached_quality is None
 
     # Coalesce onto an in-flight render for the same composite, BEFORE taking
@@ -5767,6 +5796,13 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             )
         )
 
+        # IMDb id for enrichment lookups — the request's, else the one TMDB
+        # returned — exactly as /poster derives effective_imdb_id. For a
+        # "tmdb:<id>" request this is what lets the IMDb dataset, digital
+        # release and Metahub logo still apply. It is NOT the cache identity:
+        # canonical_id stays "tmdb:<id>", which is fixed before any fetch.
+        effective_imdb_id = imdb_id or tmdb_data.get("imdb_id") or ""
+
         # TMDB-derived genre fallback — the preset path never calls MDBList, so
         # for never-warmed titles derive the genre label from TMDB genre_ids
         # (same logic /poster uses) rather than rendering "Unknown".
@@ -5786,7 +5822,7 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             # it is allowed here and keeps the preset score matching /poster's.
             ratings_dict = _merge_imdb_dataset_rating(
                 ratings_dict if isinstance(ratings_dict, dict) else {},
-                imdb_id, rcfg,
+                effective_imdb_id, rcfg,
             )
             weights = (
                 (rcfg.tv_weights or _cfg.TV_WEIGHTS) if type in ("tv", "series")
@@ -5805,7 +5841,7 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             _queue_rating_warm(canonical_id, imdb_id, tmdb_id, type, genre_ids)
             # The IMDb dataset is still a local table, so a dataset-sourced
             # score is allowed here exactly as /poster uses it.
-            ratings_dict = _merge_imdb_dataset_rating({}, imdb_id, rcfg)
+            ratings_dict = _merge_imdb_dataset_rating({}, effective_imdb_id, rcfg)
             if ratings_dict:
                 weights = (
                     (rcfg.tv_weights or _cfg.TV_WEIGHTS) if type in ("tv", "series")
@@ -5852,101 +5888,129 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             _orig_art = _p_default or next(iter(_ranked_posters), None)
         else:
             _orig_art = next(iter(_ranked_posters), None) or _p_default
-        # Art selection, mirroring /poster step for step: the two routes share
-        # composite keys, so a preset that picked different art would store a
-        # different poster under the key /poster reads.
-        #
-        #   no poster, or a poster with its title burned in → backdrop crop,
-        #   which is textless, so our logo goes on top;
-        #   original-art mode overrides both and serves the poster as-is.
-        _art_undetermined = False
-        use_backdrop = bool(backdrop_path) and (poster_path is None or not is_textless)
-        if use_backdrop:
-            is_textless = True
-        if rcfg.use_original_art and _orig_art:
-            poster_path = _orig_art
-            is_textless = False
+        if _is_landscape:
+            # Landscape, mirroring /poster's short-circuit: the backdrop as
+            # shot, picked by TMDB's own language tag rather than by OCR, so
+            # there is no scan to defer and nothing the moat forbids.
+            #   textless — the language-neutral backdrop, our logo on top;
+            #   original — the highest-voted text-bearing one, title included.
+            # Each falls back to the other, and is_textless follows the art
+            # actually chosen, which is what the renderer must key off.
+            _art_undetermined = False
+            _ocr_undetermined = False
+            _suppress_overlay = False
             use_backdrop = False
-        is_no_poster = poster_path is None and not use_backdrop
-
-        _vc = tmdb_data.get("vote_count")
-        _vote_detection_ok = _detection_vote_ok(_vc)
-
-        # A text-bearing poster under the vote gate is where /poster tries its
-        # rescues — a text-aware crop of a text-bearing backdrop, then TVDB art
-        # — each needing OCR or a request the moat forbids. The official
-        # poster is a fine anonymous answer, but may not be the image /poster
-        # stores under this key, so don't share it.
-        _orig_mode = bool(rcfg.use_original_art and _orig_art)
-        if (not use_backdrop and not is_no_poster and not is_textless
-                and not _orig_mode and _vote_detection_ok):
-            _tmdb_rescue = (_cfg.TEXTLESS_TEXT_DETECTION
-                            and bool(tmdb_data.get("text_backdrop_path")))
-            _tvdb_rescue = (tvdb.tvdb_enabled()
-                            and (_cfg.TVDB_USE_BACKDROPS or _cfg.TVDB_USE_POSTERS))
-            if _tmdb_rescue or _tvdb_rescue:
-                _art_undetermined = True
-        if use_backdrop:
-            # /poster crops a backdrop text-aware when detection is on and the
-            # title is under the vote gate — and that crop runs OCR, which this
-            # route may not. Crop plainly, and if /poster would have cropped
-            # differently, don't share the result.
-            _poster_would_avoid_text = (
-                _cfg.TEXTLESS_TEXT_DETECTION and _vote_detection_ok
-            )
-            if _poster_would_avoid_text:
-                _art_undetermined = True
-            image_coro = fetch_backdrop_image(
-                client, tmdb_id, backdrop_path, avoid_text=False
-            )
-        elif is_no_poster:
-            # /poster tries TVDB art and the atmospheric genre backgrounds
-            # before the flat canvas — more requests than the moat allows. The
-            # canvas is a fine anonymous answer but not the same poster.
-            _art_undetermined = True
-            image_coro = _resolved(_make_fallback_canvas(genre_ids))
+            _vc = tmdb_data.get("vote_count")
+            _vote_detection_ok = _detection_vote_ok(_vc)
+            _ls_text_bd = tmdb_data.get("text_backdrop_path")
+            if rcfg.landscape_art == "original":
+                _ls_path = _ls_text_bd or backdrop_path
+                is_textless = _ls_text_bd is None and _ls_path is not None
+            else:
+                _ls_path = backdrop_path or _ls_text_bd
+                is_textless = bool(backdrop_path)
+            is_no_poster = _ls_path is None
+            if _ls_path is None:
+                image_coro = _resolved(_make_landscape_canvas(genre_ids))
+                is_textless = True
+            else:
+                image_coro = fetch_landscape_image(client, tmdb_id, _ls_path)
         else:
-            image_coro = fetch_poster_image(client, tmdb_id, type, poster_path)
-
-        # Burned-in-text detection: CACHED ONLY. Never scan in the foreground on
-        # an anonymous hit. The detection key follows the art actually chosen —
-        # a backdrop is scanned under its own "bd:" key, exactly as /poster
-        # does, so a result either route computes is shared. Uncached means the
-        # render is undetermined: queue the background scan and don't persist.
-        _suppress_overlay = False
-        _ocr_undetermined = False
-        _scan_selected = (
-            _cfg.TEXTLESS_TEXT_DETECTION and is_textless and not is_no_poster
-        )
-        if _scan_selected:
-            from text_detect import DETECT_RES_SIG
+            # Art selection, mirroring /poster step for step: the two routes share
+            # composite keys, so a preset that picked different art would store a
+            # different poster under the key /poster reads.
+            #
+            #   no poster, or a poster with its title burned in → backdrop crop,
+            #   which is textless, so our logo goes on top;
+            #   original-art mode overrides both and serves the poster as-is.
+            _art_undetermined = False
+            use_backdrop = bool(backdrop_path) and (poster_path is None or not is_textless)
             if use_backdrop:
-                _det_src = f"bd:{backdrop_path}:{_CROP_VERSION}:plain"
-                _image_cache_key = (
-                    f"backdrop_{tmdb_id}_{backdrop_path.strip('/')}_{_CROP_VERSION}"
+                is_textless = True
+            if rcfg.use_original_art and _orig_art:
+                poster_path = _orig_art
+                is_textless = False
+                use_backdrop = False
+            is_no_poster = poster_path is None and not use_backdrop
+
+            _vc = tmdb_data.get("vote_count")
+            _vote_detection_ok = _detection_vote_ok(_vc)
+
+            # A text-bearing poster under the vote gate is where /poster tries its
+            # rescues — a text-aware crop of a text-bearing backdrop, then TVDB art
+            # — each needing OCR or a request the moat forbids. The official
+            # poster is a fine anonymous answer, but may not be the image /poster
+            # stores under this key, so don't share it.
+            _orig_mode = bool(rcfg.use_original_art and _orig_art)
+            if (not use_backdrop and not is_no_poster and not is_textless
+                    and not _orig_mode and _vote_detection_ok):
+                _tmdb_rescue = (_cfg.TEXTLESS_TEXT_DETECTION
+                                and bool(tmdb_data.get("text_backdrop_path")))
+                _tvdb_rescue = (tvdb.tvdb_enabled()
+                                and (_cfg.TVDB_USE_BACKDROPS or _cfg.TVDB_USE_POSTERS))
+                if _tmdb_rescue or _tvdb_rescue:
+                    _art_undetermined = True
+            if use_backdrop:
+                # /poster crops a backdrop text-aware when detection is on and the
+                # title is under the vote gate — and that crop runs OCR, which this
+                # route may not. Crop plainly, and if /poster would have cropped
+                # differently, don't share the result.
+                _poster_would_avoid_text = (
+                    _cfg.TEXTLESS_TEXT_DETECTION and _vote_detection_ok
                 )
-                _det_source = "backdrop"
+                if _poster_would_avoid_text:
+                    _art_undetermined = True
+                image_coro = fetch_backdrop_image(
+                    client, tmdb_id, backdrop_path, avoid_text=False
+                )
+            elif is_no_poster:
+                # /poster tries TVDB art and the atmospheric genre backgrounds
+                # before the flat canvas — more requests than the moat allows. The
+                # canvas is a fine anonymous answer but not the same poster.
+                _art_undetermined = True
+                image_coro = _resolved(_make_fallback_canvas(genre_ids))
             else:
-                _det_src = f"ps:{poster_path}"
-                _image_cache_key = f"{type}_{tmdb_id}_{poster_path.strip('/')}"
-                _det_source = "poster"
-            _det_key = f"{_det_src}|conf={_cfg.PPOCR_BOX_THRESHOLD}:{DETECT_RES_SIG}"
-            _det_cached = get_cached_text_detection(_det_key)
-            if _det_cached is None:
-                _ocr_undetermined = True
-                _queue_background_text_detection(_DeferredTextDetection(
-                    cache_key=_det_key,
-                    image_cache_key=_image_cache_key,
-                    title=tuple(v for v in (title, tmdb_data.get("original_title")) if v),
-                    source=_det_source,
-                    tmdb_id=tmdb_id,
-                    media_type=type,
-                    image_path=poster_path,
-                    vote_count=_vc,
-                    source_key=_det_src,
-                ))
-            else:
-                _suppress_overlay = bool(_det_cached)
+                image_coro = fetch_poster_image(client, tmdb_id, type, poster_path)
+
+            # Burned-in-text detection: CACHED ONLY. Never scan in the foreground on
+            # an anonymous hit. The detection key follows the art actually chosen —
+            # a backdrop is scanned under its own "bd:" key, exactly as /poster
+            # does, so a result either route computes is shared. Uncached means the
+            # render is undetermined: queue the background scan and don't persist.
+            _suppress_overlay = False
+            _ocr_undetermined = False
+            _scan_selected = (
+                _cfg.TEXTLESS_TEXT_DETECTION and is_textless and not is_no_poster
+            )
+            if _scan_selected:
+                from text_detect import DETECT_RES_SIG
+                if use_backdrop:
+                    _det_src = f"bd:{backdrop_path}:{_CROP_VERSION}:plain"
+                    _image_cache_key = (
+                        f"backdrop_{tmdb_id}_{backdrop_path.strip('/')}_{_CROP_VERSION}"
+                    )
+                    _det_source = "backdrop"
+                else:
+                    _det_src = f"ps:{poster_path}"
+                    _image_cache_key = f"{type}_{tmdb_id}_{poster_path.strip('/')}"
+                    _det_source = "poster"
+                _det_key = f"{_det_src}|conf={_cfg.PPOCR_BOX_THRESHOLD}:{DETECT_RES_SIG}"
+                _det_cached = get_cached_text_detection(_det_key)
+                if _det_cached is None:
+                    _ocr_undetermined = True
+                    _queue_background_text_detection(_DeferredTextDetection(
+                        cache_key=_det_key,
+                        image_cache_key=_image_cache_key,
+                        title=tuple(v for v in (title, tmdb_data.get("original_title")) if v),
+                        source=_det_source,
+                        tmdb_id=tmdb_id,
+                        media_type=type,
+                        image_path=poster_path,
+                        vote_count=_vc,
+                        source_key=_det_src,
+                    ))
+                else:
+                    _suppress_overlay = bool(_det_cached)
 
         # Release status, cached-only.
         #
@@ -5979,7 +6043,7 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
                     _queue_release_warm(tmdb_id, tmdb_data.get("tmdb_status"))
             # Both overrides below are local lookups, so they stay honest here.
             if (_release_status in ("Cinema", "Production")
-                    and is_digital_release(imdb_id)):
+                    and is_digital_release(effective_imdb_id)):
                 _release_status = "Streaming"
             if (rcfg.release_status_cinema_only
                     and _release_status not in ("Cinema", "Production")):
@@ -6028,7 +6092,8 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             image_coro,
             fetch_logo(
                 client, logos, rcfg.logo_language,
-                imdb_id=imdb_id, original_language=tmdb_data.get("original_language"),
+                imdb_id=effective_imdb_id or None,
+                original_language=tmdb_data.get("original_language"),
                 logo_priority=rcfg.logo_priority,
             ) if _overlay_logo else _resolved(None),
             fetch_trending_rank(client, tmdb_id, effective_tmdb_key, type),
@@ -6051,7 +6116,7 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             festival_keyword=festival_keyword,
             is_cult_override=is_cult, is_true_story_override=is_true_story,
             is_metacritic_override=is_metacritic,
-            is_digital_release_override=is_digital_release(imdb_id),
+            is_digital_release_override=is_digital_release(effective_imdb_id),
             release_status_override=_release_status,
             recent_digital_release_date=_recent_digital_release_date,
         )
@@ -6075,7 +6140,8 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
         )
 
         def _composite_and_encode() -> bytes:
-            result = build_poster(image, score, genre, rcfg, **_bp_args)
+            _render = build_landscape if _is_landscape else build_poster
+            result = _render(image, score, genre, rcfg, **_bp_args)
             buf = io.BytesIO()
             # Must match /poster's encoding: the two share a composite key, so
             # a JPEG written here is later served as image/<IMAGE_FORMAT> by
@@ -6416,6 +6482,23 @@ async def get_poster(
         # Handing the empty string to the format checks was worse still: it
         # reported a missing id as malformed, and named whichever param happened
         # to be checked first.
+        # ElfHosted fork (POSTER_RESOLVE_IMDB): an IMDb-only request resolves
+        # its tmdb_id server-side. The resolved request is keyed exactly like
+        # one that sent both ids — canonical_id is the IMDb id either way — so
+        # the two share composites rather than rendering the title twice.
+        if not tmdb_id and imdb_id and _cfg.POSTER_RESOLVE_IMDB:
+            _check_imdb_id(imdb_id)
+            _resolve_key = _resolve_tmdb_key(tmdb_key)
+            if _resolve_key and _HTTP_CLIENT is not None:
+                tmdb_id = await resolve_imdb_to_tmdb(
+                    _HTTP_CLIENT, imdb_id, _resolve_key,
+                    "tv" if type in ("tv", "series") else "movie",
+                ) or ""
+                if not tmdb_id:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"No TMDB {type} found for imdb_id {imdb_id}",
+                    )
         if not tmdb_id:
             raise HTTPException(
                 status_code=400,

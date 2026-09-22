@@ -10,7 +10,7 @@ Posters+ runs in two postures:
 
 ## Endpoints
 
-- `GET /p/{preset}/{type}/{imdb_id}.jpg` — anonymous preset URL. `preset` is one of: tinted_mini_notch, tinted_mini_sash, bar_notch, bar_sash, ratingbar_notch, ratingbar_sash, clean_notch, clean_sash, mini_sash_oa, bar_notch_oa. `type` is `movie` or `tv`. CDN-cacheable, no per-user keys.
+- `GET /p/{preset}/{type}/{id}.jpg[?shape=landscape]` — anonymous preset URL. `id` is an IMDb id (`tt0111161`) or a namespaced TMDB id (`tmdb:278`); `shape=landscape` renders the 16:9 layout (Nuvio's `{shape}` placeholder fills this). `preset` is one of: tinted_mini_notch, tinted_mini_sash, bar_notch, bar_sash, ratingbar_notch, ratingbar_sash, clean_notch, clean_sash, mini_sash_oa, bar_notch_oa. `type` is `movie` or `tv`. CDN-cacheable, no per-user keys.
 - `GET /poster?...` — full per-poster configuration via query params. Requires `access_key` on instances with `ACCESS_KEY` configured.
 - `GET /server-caps` — instance capability report (which keys are configured, whether presets are enabled, preset list).
 

@@ -243,6 +243,14 @@ PRESET_CDN_CACHE_TTL  = int(os.environ.get("PRESET_CDN_CACHE_TTL", "86400"))
 # Off by default so instances where /poster traffic warms the cache keep
 # /p from spending quota. Public-tier instances should set it true.
 PRESET_MDBLIST_FETCH  = os.environ.get("PRESET_MDBLIST_FETCH", "").strip().lower() in ("1", "true", "yes")
+# Accept /poster requests that carry only an IMDb id, resolving tmdb_id
+# server-side (TMDB /find, cached permanently in imdb_to_tmdb_cache — and
+# shared fleet-wide when TMDB_API_BASE points at emdb). Clients such as Nuvio
+# only fill {tmdb_id} when the catalogue carries one, and drop the whole URL
+# when it's empty; Cinemeta-backed catalogues mostly carry only IMDb ids, so
+# without this those titles silently keep their original posters. Off by
+# default: upstream rejects an IMDb-only request with a 400 naming tmdb_id.
+POSTER_RESOLVE_IMDB   = os.environ.get("POSTER_RESOLVE_IMDB", "").strip().lower() in ("1", "true", "yes")
 # Floor on anonymous /search and /resolve-imdb (the public preset flow needs
 # the title picker). RATE_LIMIT_RPS only gates /poster + /p; without this
 # independent floor an operator who left RATE_LIMIT_RPS=0 would leave the TMDB

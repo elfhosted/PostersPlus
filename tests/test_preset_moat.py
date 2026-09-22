@@ -367,6 +367,78 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
             config.PRESET_MDBLIST_FETCH, config.SERVER_MDBLIST_KEYS = saved
         fetch.assert_not_awaited()
 
+    async def test_landscape_shape_renders_the_landscape_layout(self):
+        """Nuvio sends ?shape={shape}; landscape must use the landscape art and
+        renderer, and live under its own composite key so it can never be
+        served for a portrait request (or vice versa)."""
+        meta = (
+            [28], True, [], "1994", "Test Title", "/poster.jpg", "/backdrop.jpg",
+            {"vote_count": 1234, "original_language": "en"},
+        )
+        landscape_art = mock.AsyncMock(return_value=_img())
+        poster_art = mock.AsyncMock(return_value=_img())
+        renderer = mock.Mock(return_value=_img())
+        ctxs = self._patches(meta) + [
+            mock.patch.object(main, "fetch_landscape_image", landscape_art),
+            mock.patch.object(main, "fetch_poster_image", poster_art),
+            mock.patch.object(main, "build_landscape", renderer),
+        ]
+        for c in ctxs:
+            c.start()
+        try:
+            await main.get_preset_poster("clean_notch", "movie", "tt0111161",
+                                         shape="landscape")
+        finally:
+            for c in ctxs:
+                c.stop()
+        landscape_art.assert_awaited()
+        poster_art.assert_not_awaited()
+        renderer.assert_called_once()
+
+        base = dict(main.get_preset("clean_notch"))
+        fb = main.build_request_config(base).fallback_to_imdb
+        portrait_key = main._composite_cache_key("tt0111161", "278", "movie", base, fb)
+        landscape_key = main._composite_cache_key(
+            "tt0111161", "278", "movie", {**base, "shape": "landscape"}, fb)
+        self.assertNotEqual(portrait_key, landscape_key)
+
+    async def test_poster_and_square_shapes_keep_the_portrait_key(self):
+        """Adding ?shape= must not fork the cache for existing portrait URLs."""
+        seen = []
+        real = main._composite_cache_key
+
+        def _spy(*a, **k):
+            key = real(*a, **k)
+            seen.append(key)
+            return key
+
+        with mock.patch.object(main, "_composite_cache_key", _spy):
+            for shape in ("", "poster", "square"):
+                ctxs = self._patches(_META_NON_TEXTLESS)
+                for c in ctxs:
+                    c.start()
+                try:
+                    await main.get_preset_poster("clean_notch", "movie", "tt0111161",
+                                                 shape=shape)
+                finally:
+                    for c in ctxs:
+                        c.stop()
+        self.assertEqual(len(set(seen)), 1, seen)
+
+    async def test_a_tmdb_namespaced_id_skips_imdb_resolution(self):
+        resolver = mock.AsyncMock(return_value="999")
+        ctxs = self._patches(_META_NON_TEXTLESS)
+        for c in ctxs:
+            c.start()
+        try:
+            with mock.patch.object(main, "resolve_imdb_to_tmdb", resolver):
+                resp = await main.get_preset_poster("clean_notch", "movie", "tmdb:278")
+        finally:
+            for c in ctxs:
+                c.stop()
+        resolver.assert_not_awaited()
+        self.assertEqual(resp.status_code, 200)
+
     async def test_unwarmed_release_status_is_not_persisted(self):
         """A film with a cached rating but no cached release status is still
         incomplete.
