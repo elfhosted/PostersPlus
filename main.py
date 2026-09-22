@@ -5553,8 +5553,8 @@ _PRESET_INCOMPLETE_TTL = 60   # short Cache-Control (s) for not-yet-warm renders
 async def get_preset_poster(preset: str, type: str, imdb_id: str, shape: str = ""):
     """Anonymous preset render.
 
-    The id segment is an IMDb id ("tt0111161") or a TMDB id in Nuvio's/
-    Stremio's namespaced form ("tmdb:278"), so a client pattern like
+    The id segment is an IMDb id ("tt0111161") or a TMDB id, bare ("278") or
+    in Nuvio's/Stremio's namespaced form ("tmdb:278"), so a client pattern like
     /p/<preset>/{type}/{id}.jpg?shape={shape} covers IMDb- and TMDB-keyed
     catalogues alike. ``shape=landscape`` renders the 16:9 layout; ``poster``,
     ``square`` or nothing renders the portrait one.
@@ -5574,9 +5574,12 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str, shape: str = "
     # "tmdb:<digits>" names the title directly; anything else must be an IMDb
     # id. A TMDB-only request has no IMDb enrichment and is keyed "tmdb:<id>",
     # exactly as /poster keys a TMDB-only request, so the two share composites.
+    # A bare number is also a TMDB id: IMDb ids always carry the "tt" prefix,
+    # so there is no ambiguity, and it is what a pipe placeholder such as
+    # Nuvio's {imdb_id|tmdb_id} substitutes for a TMDB-keyed title.
     _direct_tmdb_id = ""
-    if imdb_id.startswith("tmdb:"):
-        _direct_tmdb_id = imdb_id[len("tmdb:"):]
+    if imdb_id.startswith("tmdb:") or imdb_id.isdigit():
+        _direct_tmdb_id = imdb_id[len("tmdb:"):] if imdb_id.startswith("tmdb:") else imdb_id
         _check_tmdb_id(_direct_tmdb_id)
         imdb_id = ""
     else:

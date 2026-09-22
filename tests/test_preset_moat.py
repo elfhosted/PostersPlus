@@ -432,12 +432,13 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
             c.start()
         try:
             with mock.patch.object(main, "resolve_imdb_to_tmdb", resolver):
-                resp = await main.get_preset_poster("clean_notch", "movie", "tmdb:278")
+                for tmdb_form in ("tmdb:278", "278"):
+                    resp = await main.get_preset_poster("clean_notch", "movie", tmdb_form)
+                    self.assertEqual(resp.status_code, 200, tmdb_form)
         finally:
             for c in ctxs:
                 c.stop()
         resolver.assert_not_awaited()
-        self.assertEqual(resp.status_code, 200)
 
     async def test_unwarmed_release_status_is_not_persisted(self):
         """A film with a cached rating but no cached release status is still
