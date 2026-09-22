@@ -59,6 +59,39 @@ class PosterImdbResolutionTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 404)
 
 
+class ColdResolutionAdmissionTests(PosterImdbResolutionTests):
+    """A cold IMDb->TMDB lookup is a TMDB request made before render
+    admission, so it takes a render slot of its own; a cached one doesn't."""
+
+    def _with_slot_held(self, cached):
+        import asyncio
+        config.POSTER_RESOLVE_IMDB = True
+        saved = (config.POSTER_RENDER_CONCURRENCY, main._render_semaphore,
+                 config.RENDER_QUEUE_TIMEOUT)
+        config.POSTER_RENDER_CONCURRENCY, config.RENDER_QUEUE_TIMEOUT = 1, 0.05
+        sem = asyncio.Semaphore(0)          # the only slot is taken
+        main._render_semaphore = sem
+        resolver = mock.AsyncMock(return_value="1396")
+        try:
+            with mock.patch.object(main, "get_cached_imdb_to_tmdb",
+                                   return_value="1396" if cached else None):
+                resp = self._get(resolver)
+        finally:
+            (config.POSTER_RENDER_CONCURRENCY, main._render_semaphore,
+             config.RENDER_QUEUE_TIMEOUT) = saved
+        return resp, resolver
+
+    def test_cold_lookup_waits_for_a_slot(self):
+        resp, resolver = self._with_slot_held(cached=False)
+        self.assertEqual(resp.status_code, 503)
+        resolver.assert_not_awaited()
+
+    def test_cached_lookup_needs_no_slot(self):
+        resp, resolver = self._with_slot_held(cached=True)
+        self.assertEqual(resp.status_code, 418)       # resolved, reached the id check
+        resolver.assert_awaited_once()
+
+
 class NuvioIdPatternTests(PosterImdbResolutionTests):
     """The configurator's Nuvio pattern sends only stremio_id={id}, which Nuvio
     always fills with the namespaced meta id. Each form must reach a tmdb_id."""

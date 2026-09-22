@@ -5422,7 +5422,7 @@ function buildLockedTemplateUrl(domain) {
   if (urlFormat() === 'nuvio') {
     // Pipe syntax: Nuvio only requests titles that carry one of these ids and
     // substitutes that id; /p accepts tt…, bare TMDB numbers and tmdb:….
-    return `${domain}/p/${lockedPresetId}/{type}/{imdb_id|tmdb_id}.jpg?shape={shape}`;
+    return `${nuvioDomain(domain)}/p/${lockedPresetId}/{type}/{imdb_id|tmdb_id}.jpg?shape={shape}`;
   }
   return `${domain}/p/${lockedPresetId}/{type}/{imdb_id}.jpg`;
 }
@@ -5522,6 +5522,9 @@ function restoreUrlFormat() {
   const sel = document.getElementById('cfg-url-format');
   if (sel && (saved === 'nuvio' || saved === 'aiometadata')) sel.value = saved;
   updateUrlFormatHint();
+  // The URL box was filled before /server-caps answered; refresh it so a
+  // returning Nuvio user sees (and hand-copies) the Nuvio pattern.
+  try { build(); } catch (e) {}
 }
 
 function updateUrlFormatHint() {
@@ -5536,13 +5539,28 @@ function updateUrlFormatHint() {
   }
 }
 
+// The domain a Nuvio pattern should carry. On a LAN/localhost visit the
+// configurator auto-fills http://postersplus:<port> — the hostname AIOMetadata's
+// Docker-side proxy uses — which a TV or phone running Nuvio cannot resolve.
+// Swap that auto-filled value for the address the browser actually reached;
+// a domain the user typed in themselves is left alone.
+function nuvioDomain(domain) {
+  const autoFilled = `http://postersplus:${window.location.port || '8000'}`;
+  return (_REWRITE_DOMAIN && domain === autoFilled) ? window.location.origin : domain;
+}
+
 // Rewrite a generated /poster template into a Nuvio pattern. String-level on
 // purpose: URL/URLSearchParams would percent-encode the braces, and a pattern
 // with %7Bid%7D never matches Nuvio's literal placeholder.
 function toNuvioPattern(url) {
   const q = url.indexOf('?');
   if (q < 0) return url;
-  const base = url.slice(0, q);
+  // lastIndexOf up to the '?': a plain indexOf finds '/poster' inside the
+  // hostname '//postersplus:8000' itself.
+  const pathAt = url.lastIndexOf('/poster', q);
+  const base = pathAt < 0
+    ? url.slice(0, q)
+    : nuvioDomain(url.slice(0, pathAt)) + url.slice(pathAt, q);
   const ID_KEYS = new Set(['tmdb_id', 'imdb_id', 'stremio_id', 'anilist_id', 'kitsu_id', 'type', 'shape']);
   const kept = url.slice(q + 1).split('&').filter(kv => kv && !ID_KEYS.has(kv.split('=')[0]));
   const ids = serverCaps.poster_resolve_imdb

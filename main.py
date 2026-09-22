@@ -5468,13 +5468,33 @@ def _queue_rating_warm(
         _mdblist_semaphore = asyncio.Semaphore(_cfg.MDBLIST_CONCURRENCY)
     _rating_warm_pending.add(canonical_id)
 
+    async def _pick_key() -> str | None:
+        """A configured key that is off cooldown here AND fleet-wide and has
+        quota left, trying each in turn. The local check alone would keep
+        choosing a key a sibling replica has already been 429'd on."""
+        now = loop.time()
+        keys = _cfg.SERVER_MDBLIST_KEYS
+        start = _resolve_mdblist_key("")
+        order = keys[keys.index(start):] + keys[:keys.index(start)] if start in keys else list(keys)
+        for candidate in order:
+            if _warm_mdblist_key_with_quota(candidate, now, 0) != candidate:
+                continue
+            if await _fleet_mdblist_cooling(candidate):
+                continue
+            return candidate
+        return None
+
     async def _warm() -> None:
         try:
-            now = loop.time()
-            key = _warm_mdblist_key_with_quota(_resolve_mdblist_key(""), now, 0)
-            if key is None or await _fleet_mdblist_cooling(key):
-                return
             async with _mdblist_semaphore:
+                # Chosen only once admitted. Picking before the wait meant a
+                # burst of queued warms all carried the same key into the
+                # semaphore, and when the first came back 429 the rest still
+                # spent it — one call each against a key that had just said
+                # stop.
+                key = await _pick_key()
+                if key is None:
+                    return
                 result = await fetch_rating(
                     _HTTP_CLIENT, key, genre_ids, media_type,
                     media_id=imdb_id or tmdb_id,
@@ -5808,6 +5828,20 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str, shape: str = "
         # release and Metahub logo still apply. It is NOT the cache identity:
         # canonical_id stays "tmdb:<id>", which is fixed before any fetch.
         effective_imdb_id = imdb_id or tmdb_data.get("imdb_id") or ""
+
+        # Quality is IMDb-keyed. A TMDB-keyed request had no IMDb id when
+        # quality was read above, so read it again now that TMDB has supplied
+        # one — otherwise a badge preset would always see "missing", never
+        # show its badges, and never become persistable.
+        if not imdb_id and effective_imdb_id and wants_badges:
+            cached_quality = get_cached_quality(effective_imdb_id, cached_release_date)
+            quality_tokens = cached_quality or []
+            quality_missing = cached_quality is None
+        elif not effective_imdb_id:
+            # No IMDb id anywhere: quality can never be fetched for this title,
+            # so waiting on it would keep the render unpersistable forever.
+            # /poster persists these without badges; so do we.
+            quality_missing = False
 
         # TMDB-derived genre fallback — the preset path never calls MDBList, so
         # for never-warmed titles derive the genre label from TMDB genre_ids
@@ -6504,11 +6538,36 @@ async def get_poster(
         if not tmdb_id and imdb_id and _cfg.POSTER_RESOLVE_IMDB:
             _check_imdb_id(imdb_id)
             _resolve_key = _resolve_tmdb_key(tmdb_key)
+            _resolve_type = "tv" if type in ("tv", "series") else "movie"
             if _resolve_key and _HTTP_CLIENT is not None:
-                tmdb_id = await resolve_imdb_to_tmdb(
-                    _HTTP_CLIENT, imdb_id, _resolve_key,
-                    "tv" if type in ("tv", "series") else "movie",
-                ) or ""
+                # A cold resolution is a TMDB request made before this request
+                # reaches render admission; a catalogue burst of IMDb-only
+                # titles would otherwise walk past POSTER_RENDER_CONCURRENCY
+                # and drain the shared HTTP pool. Same guard as /p. A cached
+                # mapping is a local read and skips it.
+                _cold = get_cached_imdb_to_tmdb(imdb_id, _resolve_type) is None
+                if _cold:
+                    _resolve_sem = _get_render_semaphore()
+                    try:
+                        if _cfg.RENDER_QUEUE_TIMEOUT > 0:
+                            await asyncio.wait_for(
+                                _resolve_sem.acquire(), timeout=_cfg.RENDER_QUEUE_TIMEOUT
+                            )
+                        else:
+                            await _resolve_sem.acquire()
+                    except asyncio.TimeoutError:
+                        _metrics.render_saturated_total.inc()
+                        raise HTTPException(
+                            status_code=503, detail="Server saturated — try again shortly",
+                            headers={"Retry-After": "5"},
+                        )
+                try:
+                    tmdb_id = await resolve_imdb_to_tmdb(
+                        _HTTP_CLIENT, imdb_id, _resolve_key, _resolve_type,
+                    ) or ""
+                finally:
+                    if _cold:
+                        _resolve_sem.release()
                 if not tmdb_id:
                     raise HTTPException(
                         status_code=404,

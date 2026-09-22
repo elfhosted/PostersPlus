@@ -440,6 +440,31 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
                 c.stop()
         resolver.assert_not_awaited()
 
+    async def test_a_tmdb_keyed_badge_preset_reads_quality_by_the_found_imdb_id(self):
+        """Quality is IMDb-keyed. A tmdb:<id> request has no IMDb id until
+        TMDB supplies one, so quality has to be read again with that id, or a
+        badge preset never shows badges and never persists."""
+        meta = (
+            [28], False, [], "1994", "Test Title", "/poster.jpg", None,
+            {"vote_count": 1234, "original_language": "en", "imdb_id": "tt0111161"},
+        )
+        cache.set_cached_quality("tt0111161", ["4K", "HDR"], "1994-01-01")
+        seen = []
+        real = main.get_cached_quality
+
+        def _spy(imdb, rel=None):
+            seen.append(imdb)
+            return real(imdb, rel)
+        ctxs = self._patches(meta) + [mock.patch.object(main, "get_cached_quality", _spy)]
+        for c in ctxs:
+            c.start()
+        try:
+            await main.get_preset_poster("prestige_rating_bar", "movie", "tmdb:278")
+        finally:
+            for c in ctxs:
+                c.stop()
+        self.assertIn("tt0111161", seen)
+
     async def test_unwarmed_release_status_is_not_persisted(self):
         """A film with a cached rating but no cached release status is still
         incomplete.
