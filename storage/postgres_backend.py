@@ -18,6 +18,7 @@ import logging
 import os
 import time
 import json
+import uuid
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -245,7 +246,8 @@ def _bootstrap_schema(conn) -> None:
                 cache_key  TEXT PRIMARY KEY,
                 cached_at  BIGINT NOT NULL,
                 request_params TEXT,
-                expires_at BIGINT
+                expires_at BIGINT,
+                blob_key   TEXT
             )
         """)
         # request_params lets the trending refresh replay the exact /poster
@@ -253,9 +255,13 @@ def _bootstrap_schema(conn) -> None:
         # own deadline, because a render derived from a trending rank or a
         # release status must not outlive the fact it was derived from. NULL
         # rows predate the column and fall back to cached_at + TTL + jitter.
+        # blob_key names the versioned object holding this row's bytes (see
+        # _new_blob_key); rows written before it keep their blob under the
+        # cache key.
         for _col, _definition in (
             ("request_params", "TEXT"),
             ("expires_at",     "BIGINT"),
+            ("blob_key",       "TEXT"),
         ):
             cur.execute(
                 f"ALTER TABLE final_poster_cache "
@@ -263,6 +269,16 @@ def _bootstrap_schema(conn) -> None:
             )
         # Migrate pre-Phase-10 deployments that have the BYTEA column.
         # Idempotent: IF EXISTS makes it a no-op on new installs.
+        # Pre-Phase-10 rows kept their image ONLY in jpeg_bytes, never in the
+        # blobstore. Dropping the column but keeping the rows would leave fresh
+        # metadata naming objects that never existed — with a CDN configured,
+        # every hit a redirect to a 404. Drop those rows with the bytes.
+        cur.execute("""
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'final_poster_cache' AND column_name = 'jpeg_bytes'
+        """)
+        if cur.fetchone():
+            cur.execute("DELETE FROM final_poster_cache")
         cur.execute("""
             ALTER TABLE final_poster_cache DROP COLUMN IF EXISTS jpeg_bytes
         """)
@@ -382,19 +398,29 @@ def init_db() -> None:
 # Final composite poster cache
 # ---------------------------------------------------------------------------
 
-def _peek_final_poster(cache_key: str) -> int | None:
-    """Row-only TTL check. Returns the row's expires_at if a fresh row exists,
-    else None; deletes the row on expiry. Caller handles blob cleanup."""
+def _new_blob_key(cache_key: str) -> str:
+    """A blob identity that is never reused — see the SQLite backend's
+    _new_blob_key for why versioning, rather than locking, is what makes
+    deferred blob deletes safe across pods."""
+    return f"{cache_key}~{uuid.uuid4().hex[:16]}"
+
+
+def _peek_final_poster(cache_key: str) -> "tuple[int, str] | None":
+    """Row-only TTL check against the SHARED metadata row. Returns
+    (expires_at, blob_key) for a fresh row, else None; an expired row is
+    deleted and its blob version queued."""
     with _get_pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT cached_at, expires_at FROM final_poster_cache WHERE cache_key = %s",
+                "SELECT cached_at, expires_at, blob_key FROM final_poster_cache "
+                "WHERE cache_key = %s",
                 (cache_key,),
             )
             row = cur.fetchone()
             if not row:
                 return None
-            cached_at, expires_at = row
+            cached_at, expires_at, blob_key = row
+            blob_key = blob_key or cache_key
             if expires_at is None:
                 expires_at = _composite_expiry(cache_key, cached_at)
             now = time.time()
@@ -403,88 +429,93 @@ def _peek_final_poster(cache_key: str) -> int | None:
                     f"Final poster cache expired for {cache_key} "
                     f"({(now - cached_at)/86400:.1f}d old)"
                 )
+                # Conditional on the version, so a concurrent rewrite survives.
                 cur.execute(
-                    "DELETE FROM final_poster_cache WHERE cache_key = %s",
-                    (cache_key,),
+                    "DELETE FROM final_poster_cache WHERE cache_key = %s AND "
+                    "COALESCE(blob_key, cache_key) = %s RETURNING cache_key",
+                    (cache_key, blob_key),
                 )
+                deleted = cur.fetchall()
                 conn.commit()
+                if deleted:
+                    blobstore.delete_later(blobstore.BUCKET_COMPOSITES, blob_key)
                 return None
-            return int(expires_at)
-
-
-def _composite_row_is_live(bucket: str, cache_key: str) -> bool:
-    """True when a fresh metadata row still names this blob.
-
-    The drain's authority: the row lives in the shared database, so this answer
-    holds across workers and replicas, where the process-local generation map
-    cannot. Expired rows are swept by the peek, so they correctly read as not
-    live and their blobs are collected.
-    """
-    if bucket != blobstore.BUCKET_COMPOSITES:
-        return False
-    return _peek_final_poster(cache_key) is not None
+            return int(expires_at), blob_key
 
 
 async def is_cached_final_poster_fresh(cache_key: str) -> int | None:
-    """Lightweight freshness probe — checks L1, then the metadata row + TTL,
-    never touches the blobstore. Lets /poster emit a 302 to the CDN without
-    pulling the bytes through the app pod.
-
-    Returns the composite's expires_at when fresh, else None. Callers may keep
-    treating it as a boolean — a unix timestamp is always truthy — but the
-    redirect path needs the deadline to set an honest max-age, because with
-    CDN_CACHE_TTL=auto there is no flat TTL to fall back on.
-    """
+    """Lightweight freshness probe — L1, then the metadata row + TTL, never the
+    bytes. Returns expires_at when fresh, else None. NOT for authorising a CDN
+    redirect (L1 is process-local); use get_cached_final_poster_redirect."""
     try:
         hit = _l1_get(cache_key, time.time())
         if hit is not None:
             return hit[1]
-        expires_at = _peek_final_poster(cache_key)
-        if expires_at is not None:
-            return expires_at
-        blobstore.delete_later(blobstore.BUCKET_COMPOSITES, cache_key)
-        return None
+        peek = _peek_final_poster(cache_key)
+        return None if peek is None else peek[0]
     except Exception as exc:
         logger.error(f"Final poster freshness probe error: {exc}")
         return None
 
 
+async def get_cached_final_poster_redirect(cache_key: str) -> "tuple[str, int] | None":
+    """(public_url, expires_at) when a CDN redirect is safe, else None.
+
+    Reads the shared row, never L1: another pod may have invalidated or
+    replaced the composite, and only the row names the current blob version."""
+    if blobstore.url_for(blobstore.BUCKET_COMPOSITES, cache_key) is None:
+        return None
+    try:
+        peek = _peek_final_poster(cache_key)
+        if peek is None:
+            return None
+        expires_at, blob_key = peek
+        url = blobstore.url_for(blobstore.BUCKET_COMPOSITES, blob_key)
+        return None if url is None else (url, expires_at)
+    except Exception as exc:
+        logger.error(f"Final poster redirect probe error: {exc}")
+        return None
+
+
 async def get_cached_final_poster(cache_key: str) -> bytes | None:
-    """Return cached JPEG bytes for a fully composited poster, or None on
+    """Return cached image bytes for a fully composited poster, or None on
     miss/expiry."""
     entry = await get_cached_final_poster_entry(cache_key)
     return None if entry is None else entry[0]
 
 
 async def get_cached_final_poster_entry(cache_key: str) -> "tuple[bytes, int] | None":
-    """Return (jpeg_bytes, expires_at) for a composited poster, or None on miss.
+    """Return (image_bytes, expires_at) for a composited poster, or None on miss.
 
     L1 (process-local RAM, shared with the SQLite backend) first, then the
-    metadata row plus a blobstore fetch. Used as the inline-serve fallback
-    when no CDN URL is configured.
-    """
+    metadata row plus a blobstore fetch of the version that row names."""
     try:
         hit = _l1_get(cache_key, time.time())
         if hit is not None:
             return hit
 
-        expires_at = _peek_final_poster(cache_key)
-        if expires_at is None:
-            # Queue rather than delete inline: this read can interleave with
-            # another request mid-write for the same key, and an inline delete
-            # would remove the blob it had just published. The drain re-checks
-            # the row first, which is the check that makes it safe.
-            blobstore.delete_later(blobstore.BUCKET_COMPOSITES, cache_key)
+        peek = _peek_final_poster(cache_key)
+        if peek is None:
             return None
+        expires_at, blob_key = peek
 
+        # The row's deadline governs freshness; the blob age check only has to
+        # be loose enough never to undercut it (positive jitter included).
         data = await blobstore.get(
-            blobstore.BUCKET_COMPOSITES, cache_key, max_age_seconds=COMPOSITE_CACHE_TTL,
+            blobstore.BUCKET_COMPOSITES, blob_key,
+            max_age_seconds=COMPOSITE_CACHE_TTL + COMPOSITE_CACHE_TTL_JITTER,
         )
         if data is None:
-            # Metadata row without a blob — the blob was evicted or the write
-            # was interrupted. Drop the row so the next request re-renders
-            # rather than looping on a permanent phantom hit.
-            delete_cached_final_poster(cache_key)
+            # Row without its blob. Drop the row only if it still names this
+            # version, so a concurrent rewrite is left alone.
+            with _get_pool().connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM final_poster_cache WHERE cache_key = %s AND "
+                        "COALESCE(blob_key, cache_key) = %s",
+                        (cache_key, blob_key),
+                    )
+                conn.commit()
             return None
 
         _l1_put(cache_key, data, expires_at)
@@ -495,7 +526,8 @@ async def get_cached_final_poster_entry(cache_key: str) -> "tuple[bytes, int] | 
 
 
 def get_cached_final_poster_url(cache_key: str) -> str | None:
-    """Public CDN URL for the composite, or None when no URL is configured."""
+    """Whether the blobstore serves public URLs at all. The URL for a specific
+    composite comes from get_cached_final_poster_redirect."""
     return blobstore.url_for(blobstore.BUCKET_COMPOSITES, cache_key)
 
 
@@ -505,8 +537,9 @@ async def set_cached_final_poster(
     request_params: str = None,
     ttl_override: int = None,
 ) -> int:
-    """Store a composited JPEG: bytes to the blobstore, metadata row to
-    Postgres, bytes into L1. Returns the unix time this composite expires.
+    """Store a composited image: bytes to the blobstore under a fresh version
+    key, the metadata row (naming that version) to Postgres, bytes into L1.
+    Returns the unix time this composite expires.
 
     *ttl_override* caps the jittered lifetime for a render derived from
     something shorter-lived than COMPOSITE_CACHE_TTL.
@@ -516,76 +549,65 @@ async def set_cached_final_poster(
     if ttl_override is not None:
         ttl = min(ttl, ttl_override)
     expires_at = now + int(ttl)
+    blob_key = _new_blob_key(cache_key)
 
     try:
-        # Write bytes first so the metadata row is never present without
-        # a backing blob.
-        # The composite is encoded in config.IMAGE_FORMAT (webp by default),
-        # not necessarily JPEG. Hardcoding image/jpeg here put the wrong
-        # Content-Type on every object, which the app never noticed because it
-        # re-serves the bytes itself — but a CDN redirect hands the object
-        # straight to the browser with whatever type S3 stored.
-        # The key lock is held across the put and the note_write so a drain
-        # cannot delete this blob between the two. note_write cancels any
-        # delete an earlier invalidation queued for this key — the trending
-        # refresh invalidates and immediately re-renders, and without it the
-        # next drain would remove the replacement.
-        async with blobstore.key_lock(blobstore.BUCKET_COMPOSITES, cache_key):
-            await blobstore.put(
-                blobstore.BUCKET_COMPOSITES, cache_key, jpeg_bytes,
-                content_type=f"image/{_IMAGE_FORMAT}",
-            )
-            blobstore.note_write(blobstore.BUCKET_COMPOSITES, cache_key)
-
-        # L1 only after the durable write succeeds: an L1 entry whose blob
-        # never landed would serve this replica a poster the rest of the fleet
-        # cannot see, and would mask the failure until it aged out.
+        # Upload first, publish second: the row never names a missing blob.
+        await blobstore.put(
+            blobstore.BUCKET_COMPOSITES, blob_key, jpeg_bytes,
+            content_type=f"image/{_IMAGE_FORMAT}",
+        )
         _l1_put(cache_key, jpeg_bytes, expires_at)
 
-        evict_keys: list[str] = []
+        superseded: list[str] = []
         with _get_pool().connection() as conn:
             with conn.cursor() as cur:
+                # FOR UPDATE serialises two replicas replacing the same key, so
+                # each sees the other's version as the one it supersedes.
+                cur.execute(
+                    "SELECT COALESCE(blob_key, cache_key) FROM final_poster_cache "
+                    "WHERE cache_key = %s FOR UPDATE",
+                    (cache_key,),
+                )
+                prev = cur.fetchone()
                 cur.execute(
                     """
                     INSERT INTO final_poster_cache
-                        (cache_key, cached_at, request_params, expires_at)
-                    VALUES (%s, %s, %s, %s)
+                        (cache_key, cached_at, request_params, expires_at, blob_key)
+                    VALUES (%s, %s, %s, %s, %s)
                     ON CONFLICT (cache_key) DO UPDATE SET
                         cached_at      = EXCLUDED.cached_at,
                         request_params = EXCLUDED.request_params,
-                        expires_at     = EXCLUDED.expires_at
+                        expires_at     = EXCLUDED.expires_at,
+                        blob_key       = EXCLUDED.blob_key
                     """,
-                    (cache_key, now, request_params, expires_at),
+                    (cache_key, now, request_params, expires_at, blob_key),
                 )
+                if prev is not None:
+                    superseded.append(prev[0])
                 if COMPOSITE_MAX_ENTRIES > 0:
                     cur.execute("SELECT COUNT(*) FROM final_poster_cache")
                     (count,) = cur.fetchone()
                     overflow = count - COMPOSITE_MAX_ENTRIES
                     if overflow > 0:
                         cur.execute(
-                            "SELECT cache_key FROM final_poster_cache "
-                            "ORDER BY cached_at ASC LIMIT %s",
+                            "DELETE FROM final_poster_cache WHERE cache_key IN "
+                            "(SELECT cache_key FROM final_poster_cache "
+                            " ORDER BY cached_at ASC LIMIT %s) "
+                            "RETURNING cache_key, COALESCE(blob_key, cache_key)",
                             (overflow,),
                         )
-                        evict_keys = [r[0] for r in cur.fetchall()]
-                        cur.execute(
-                            """
-                            DELETE FROM final_poster_cache WHERE cache_key = ANY(%s)
-                            """,
-                            (evict_keys,),
-                        )
+                        for k, bk in cur.fetchall():
+                            superseded.append(bk)
+                            if COMPOSITE_MEM_ENTRIES > 0:
+                                with _composite_l1_lock:
+                                    _composite_l1.pop(k, None)
                         logger.info(f"Composite cache cap: evicted {overflow} oldest entries")
             conn.commit()
 
-        # Best-effort blob + L1 cleanup for evicted keys, outside the pool ctx.
-        for k in evict_keys:
-            if COMPOSITE_MEM_ENTRIES > 0:
-                with _composite_l1_lock:
-                    _composite_l1.pop(k, None)
-            # Queued, not deleted inline: the eviction and a competing
-            # re-render of the same key can interleave, and the drain's row
-            # check is what tells the two apart.
-            blobstore.delete_later(blobstore.BUCKET_COMPOSITES, k)
+        for bk in superseded:
+            if bk != blob_key:
+                blobstore.delete_later(blobstore.BUCKET_COMPOSITES, bk)
     except Exception as exc:
         logger.error(f"Final poster cache write error: {exc}")
 
@@ -593,13 +615,8 @@ async def set_cached_final_poster(
 
 
 def delete_cached_final_poster(cache_key: str) -> None:
-    """Remove a composited poster from L1 and the metadata row, and queue its
-    blob for deletion.
-
-    Sync, like upstream: the blob delete is an object-store round trip, so it
-    goes on blobstore's deferred queue rather than forcing every caller of this
-    onto the event loop. See blobstore.delete_later.
-    """
+    """Remove a composited poster from L1 and the metadata row, and queue the
+    blob version that row named. Sync, like upstream."""
     if COMPOSITE_MEM_ENTRIES > 0:
         with _composite_l1_lock:
             _composite_l1.pop(cache_key, None)
@@ -607,20 +624,21 @@ def delete_cached_final_poster(cache_key: str) -> None:
         with _get_pool().connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "DELETE FROM final_poster_cache WHERE cache_key = %s", (cache_key,)
+                    "DELETE FROM final_poster_cache WHERE cache_key = %s "
+                    "RETURNING COALESCE(blob_key, cache_key)",
+                    (cache_key,),
                 )
+                gone = cur.fetchall()
             conn.commit()
+        for (bk,) in gone:
+            blobstore.delete_later(blobstore.BUCKET_COMPOSITES, bk)
     except Exception as exc:
         logger.error(f"Final poster cache delete error: {exc}")
-    blobstore.delete_later(blobstore.BUCKET_COMPOSITES, cache_key)
 
 
 def invalidate_final_posters(tmdb_id: str, media_type: str | None = None) -> None:
     """Invalidate all composited posters for a specific TMDB ID, so the next
     request re-renders with updated badges."""
-    # TV posters are cached under either "tv" or "series" (Stremio requests use
-    # "series"), so treat the two as equivalent when filtering by media type —
-    # otherwise a trending/status change leaves half the cache stale.
     if media_type in ("tv", "series"):
         type_variants: tuple[str, ...] | None = ("tv", "series")
     elif media_type:
@@ -644,27 +662,23 @@ def invalidate_final_posters(tmdb_id: str, media_type: str | None = None) -> Non
     else:
         patterns = [f"%:{tmdb_id}:{_tv}:%" for _tv in type_variants]
 
-    # DELETE ... RETURNING gives us the keys and removes the rows in one
-    # statement, so there is no window in which another replica could insert a
-    # row between our SELECT and our DELETE and have it silently dropped.
-    blob_keys: list[str] = []
     try:
+        blob_keys: list[str] = []
         with _get_pool().connection() as conn:
             with conn.cursor() as cur:
                 for pattern in patterns:
                     cur.execute(
                         "DELETE FROM final_poster_cache WHERE cache_key LIKE %s "
-                        "RETURNING cache_key",
+                        "RETURNING COALESCE(blob_key, cache_key)",
                         (pattern,),
                     )
                     blob_keys.extend(r[0] for r in cur.fetchall())
             conn.commit()
+        for bk in blob_keys:
+            blobstore.delete_later(blobstore.BUCKET_COMPOSITES, bk)
         logger.info(f"Invalidated final poster cache for tmdb_id={tmdb_id}")
     except Exception as exc:
         logger.error(f"Final poster cache invalidate error: {exc}")
-
-    for k in blob_keys:
-        blobstore.delete_later(blobstore.BUCKET_COMPOSITES, k)
 
 
 def list_composite_request_params() -> list[tuple[str, str]]:
@@ -701,13 +715,11 @@ async def prune_caches() -> None:
 
     # Best-effort blob deletion for the expired composite rows, plus anything
     # the synchronous delete/invalidate paths queued since the last sweep.
-    # Through the same queue rather than deleted here, so they get the same
-    # row check: a title re-rendered between the prune's DELETE and this line
-    # has a live row again, and its blob must survive.
+    # Blob keys are versioned and never reused, so none of these can belong
+    # to a live row.
     for k in expired_composite_keys:
         blobstore.delete_later(blobstore.BUCKET_COMPOSITES, k)
-    await blobstore.drain_deferred_deletes(is_live=_composite_row_is_live)
-    blobstore._forget_generations_if_idle()
+    await blobstore.drain_deferred_deletes()
 
 
 async def prune_local_caches() -> None:
@@ -719,8 +731,7 @@ async def prune_local_caches() -> None:
     artwork for every title it ever rendered, ignoring the configured TTLs.
     Being pod-local, this has to run on followers as well as the prune leader.
     """
-    await blobstore.drain_deferred_deletes(is_live=_composite_row_is_live)
-    blobstore._forget_generations_if_idle()
+    await blobstore.drain_deferred_deletes()
     await asyncio.to_thread(_prune_local_files)
 
 
@@ -757,7 +768,7 @@ def _prune_sync() -> list[str]:
                     "DELETE FROM final_poster_cache WHERE "
                     "(expires_at IS NOT NULL AND expires_at < %s) OR "
                     "(expires_at IS NULL AND cached_at < %s) "
-                    "RETURNING cache_key",
+                    "RETURNING COALESCE(blob_key, cache_key)",
                     (now, now - COMPOSITE_CACHE_TTL - COMPOSITE_CACHE_TTL_JITTER // 2),
                 )
                 expired_composite_keys = [r[0] for r in cur.fetchall()]

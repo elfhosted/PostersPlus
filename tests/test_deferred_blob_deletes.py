@@ -1,14 +1,15 @@
-"""Deferred blob-delete queue invariants (ElfHosted fork).
+"""Composite blob lifecycle invariants (ElfHosted fork).
 
-Composite BYTES live in the blobstore, but upstream deletes composites from
-synchronous code. Those call sites queue the blob instead of awaiting an
-object-store round trip, and the periodic prune drains the queue.
+Composite BYTES live in the blobstore under a VERSIONED key the metadata row
+records; upstream deletes composites from synchronous code, so those call
+sites queue the old version and the periodic drain deletes it.
 
-The hazard that buys is ordering: _run_trending_fetch_cycle invalidates a
-composite and immediately re-renders it under the SAME key, so a naive queue
-deletes the replacement. The inline read path survives that (it drops the
-orphaned row), but the CDN redirect path does not — it 302s on the strength of
-the row alone, sending clients to an object that is not there.
+The hazard that design exists to remove: _run_trending_fetch_cycle
+invalidates a composite and immediately re-renders it under the same cache
+key, often on a different worker or pod than the one that queued the delete.
+With the blob stored under the cache key itself, the queued delete landed on
+the replacement — a fresh row pointing at nothing, which a CDN redirect turns
+into a 404 for every client until the row expires.
 """
 import asyncio
 import os
@@ -37,159 +38,127 @@ import cache
 KEY = "tt1:99:movie:hash"
 
 
-class DeferredBlobDeleteTests(unittest.IsolatedAsyncioTestCase):
+class CompositeBlobLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         cache.init_db()
         await blobstore.init()
         with blobstore._deferred_lock:
             blobstore._deferred_deletes.clear()
-            blobstore._blob_generation.clear()
         self._drop_l1()
-
-    @staticmethod
-    def _drop_l1():
-        """Empty the composite L1.
-
-        Every write populates it, so a read straight after one is answered from
-        RAM and never touches the blobstore — which is the thing these tests are
-        about. Without this the assertions below pass whether or not the blob
-        still exists, which is how the first version of this file managed to
-        stay green with the fix removed.
-        """
-        with sb._composite_l1_lock:
-            sb._composite_l1.clear()
-
-    async def _blob(self):
-        return await blobstore.get(
-            blobstore.BUCKET_COMPOSITES, KEY, max_age_seconds=10_000
-        )
 
     async def asyncTearDown(self):
         await blobstore.close()
         cache.close()
 
-    async def test_a_regenerated_blob_survives_the_queued_delete(self):
-        await cache.set_cached_final_poster(KEY, b"FIRST")
+    @staticmethod
+    def _drop_l1():
+        """Empty the composite L1. Every write populates it, so a read straight
+        after one is answered from RAM and never touches the blobstore — which
+        is the thing under test. Without this, assertions pass whether or not
+        the blob still exists."""
+        with sb._composite_l1_lock:
+            sb._composite_l1.clear()
 
+    @staticmethod
+    def _blob_key(cache_key=KEY):
+        row = sb.get_db().execute(
+            "SELECT blob_key FROM final_poster_cache WHERE cache_key = ?",
+            (cache_key,),
+        ).fetchone()
+        return None if row is None else row[0]
+
+    async def _blob(self, blob_key):
+        return await blobstore.get(
+            blobstore.BUCKET_COMPOSITES, blob_key, max_age_seconds=10_000
+        )
+
+    async def _read(self):
+        self._drop_l1()
+        entry = await cache.get_cached_final_poster_entry(KEY)
+        return None if entry is None else entry[0]
+
+    async def test_every_write_gets_a_new_blob_version(self):
+        await cache.set_cached_final_poster(KEY, b"FIRST")
+        first = self._blob_key()
+        await cache.set_cached_final_poster(KEY, b"SECOND")
+        second = self._blob_key()
+        self.assertTrue(first and second)
+        self.assertNotEqual(first, second)
+        self.assertNotEqual(second, KEY, "blob stored under the reusable cache key")
+
+    async def test_a_regenerated_composite_survives_the_queued_delete(self):
+        await cache.set_cached_final_poster(KEY, b"FIRST")
         # Trending refresh: invalidate, then re-render under the same key.
         cache.invalidate_final_posters("99", "movie")
-        self.assertEqual(blobstore.deferred_delete_stats()["queued"], 1)
         await cache.set_cached_final_poster(KEY, b"SECOND")
 
         await blobstore.drain_deferred_deletes()
 
-        # Assert on the BLOB, not on a read that L1 could answer from RAM.
-        self.assertEqual(
-            await self._blob(), b"SECOND",
-            "the drain deleted the regenerated blob",
-        )
-        self._drop_l1()
-        entry = await cache.get_cached_final_poster_entry(KEY)
-        self.assertIsNotNone(entry, "regenerated composite was deleted by the drain")
-        self.assertEqual(entry[0], b"SECOND")
-        self._drop_l1()
-        self.assertIsNotNone(
-            await cache.is_cached_final_poster_fresh(KEY),
-            "row survived but the blob behind it did not — a CDN redirect "
-            "would 302 to a missing object",
-        )
+        self.assertEqual(await self._blob(self._blob_key()), b"SECOND")
+        self.assertEqual(await self._read(), b"SECOND")
 
-    async def test_an_invalidated_blob_that_is_not_rewritten_is_deleted(self):
+    async def test_a_delete_queued_on_another_worker_spares_the_replacement(self):
+        """Worker A invalidates and queues; worker B regenerates. Nothing is
+        shared between their processes except the row, and A's drain runs
+        after B's write. The replacement must survive."""
         await cache.set_cached_final_poster(KEY, b"FIRST")
+        old_version = self._blob_key()
         cache.invalidate_final_posters("99", "movie")
+        queued = dict(blobstore._deferred_deletes)          # worker A's queue
+
+        with blobstore._deferred_lock:
+            blobstore._deferred_deletes.clear()
+        await cache.set_cached_final_poster(KEY, b"SECOND")  # worker B
+
+        with blobstore._deferred_lock:                       # A drains later
+            blobstore._deferred_deletes.clear()
+            blobstore._deferred_deletes.update(queued)
         await blobstore.drain_deferred_deletes()
 
-        self.assertIsNone(
-            await self._blob(),
-            "the whole point of the queue is that this blob does get removed",
-        )
+        self.assertIsNone(await self._blob(old_version), "old version not collected")
+        self.assertEqual(await self._blob(self._blob_key()), b"SECOND")
+        self.assertEqual(await self._read(), b"SECOND")
 
-    async def test_a_write_concurrent_with_a_drain_is_not_clobbered(self):
-        """The same race, with the write landing while a drain is running.
-
-        The drain now holds a per-key lock across its generation check and its
-        delete, so the write either completes first (and cancels the queued
-        delete) or waits for the delete and rewrites afterwards. Either
-        ordering has to end with the blob present — what must not happen is a
-        delete landing on top of a completed write.
-
-        The delay goes on an unrelated key so the drain is genuinely mid-loop
-        when the write is issued. Blocking inside the delete of THIS key would
-        just deadlock against the lock that makes the fix work, which is a
-        statement about the test, not about the code.
-        """
+    async def test_an_invalidated_composite_that_is_not_rewritten_is_deleted(self):
         await cache.set_cached_final_poster(KEY, b"FIRST")
-        await cache.set_cached_final_poster("tt2:98:movie:other", b"OTHER")
+        version = self._blob_key()
         cache.invalidate_final_posters("99", "movie")
-        cache.invalidate_final_posters("98", "movie")
-        self.assertEqual(blobstore.deferred_delete_stats()["queued"], 2)
+        await blobstore.drain_deferred_deletes()
+        self.assertIsNone(await self._blob(version))
+        self.assertIsNone(await self._read())
 
-        real_delete = blobstore.delete
+    async def test_a_rewrite_queues_the_version_it_replaces(self):
+        """No orphans: overwriting a composite must not leave the old version
+        in object storage forever."""
+        await cache.set_cached_final_poster(KEY, b"FIRST")
+        first = self._blob_key()
+        await cache.set_cached_final_poster(KEY, b"SECOND")
+        await blobstore.drain_deferred_deletes()
+        self.assertIsNone(await self._blob(first))
+        self.assertEqual(await self._read(), b"SECOND")
 
-        async def _slow_delete(bucket, key):
-            if key != KEY:
-                await asyncio.sleep(0.05)
-            return await real_delete(bucket, key)
-
-        blobstore.delete = _slow_delete
+    async def test_the_redirect_resolves_the_current_version_not_l1(self):
+        """A CDN redirect must follow the shared row. Simulate another pod
+        replacing the composite while this process still holds the old bytes
+        in L1: the redirect must name the new version."""
+        prev = _bl.url_for
+        _bl.url_for = lambda bucket, key: f"https://cdn.test/{bucket}/{key}"
+        blobstore.url_for = _bl.url_for
         try:
-            drain = asyncio.create_task(blobstore.drain_deferred_deletes())
-            await asyncio.sleep(0)
+            await cache.set_cached_final_poster(KEY, b"FIRST")
+            # Another pod's write: new row, new version; our L1 is untouched.
+            with sb._composite_l1_lock:
+                l1_before = dict(sb._composite_l1)
             await cache.set_cached_final_poster(KEY, b"SECOND")
-            await drain
+            current = self._blob_key()
+            with sb._composite_l1_lock:
+                sb._composite_l1.clear()
+                sb._composite_l1.update(l1_before)
+            url, _exp = await cache.get_cached_final_poster_redirect(KEY)
+            self.assertTrue(url.endswith(current), url)
         finally:
-            blobstore.delete = real_delete
-
-        self.assertEqual(
-            await self._blob(), b"SECOND", "write during drain lost its blob"
-        )
-        self._drop_l1()
-        entry = await cache.get_cached_final_poster_entry(KEY)
-        self.assertIsNotNone(entry, "write during drain lost its blob")
-        self.assertEqual(entry[0], b"SECOND")
-
-    async def test_a_delete_queued_by_another_worker_spares_a_live_row(self):
-        """The cross-process case the generation map cannot see.
-
-        Worker A invalidates a composite and queues its blob. Worker B — a
-        different process, so a different generation map and a different key
-        lock — regenerates it under the same key. A's drain must still not
-        delete B's blob.
-
-        Simulated by clearing this process's generation bookkeeping between the
-        queue and the write, which is exactly what A would observe: a queued
-        delete and no local record of the write. What saves the blob is the
-        metadata row, which both workers share.
-        """
-        await cache.set_cached_final_poster(KEY, b"FIRST")
-        cache.invalidate_final_posters("99", "movie")
-        with blobstore._deferred_lock:
-            queued_at = blobstore._deferred_deletes[
-                (blobstore.BUCKET_COMPOSITES, KEY)
-            ]
-
-        # Worker B's write. In one process this cancels the queued delete; in
-        # another process it cannot, so put the entry back exactly as worker A
-        # still holds it — queued, with no local record of B's write.
-        await cache.set_cached_final_poster(KEY, b"SECOND")
-        with blobstore._deferred_lock:
-            blobstore._blob_generation.clear()
-            blobstore._deferred_deletes[
-                (blobstore.BUCKET_COMPOSITES, KEY)
-            ] = queued_at
-
-        await blobstore.drain_deferred_deletes(is_live=sb._composite_row_is_live)
-
-        self.assertEqual(
-            await self._blob(), b"SECOND",
-            "a delete queued in another process deleted a live composite",
-        )
-        self._drop_l1()
-        self.assertIsNotNone(
-            await cache.is_cached_final_poster_fresh(KEY),
-            "row survived but its blob did not — a CDN redirect would 302 to "
-            "a missing object",
-        )
+            _bl.url_for = prev
+            blobstore.url_for = prev
 
     async def test_the_queue_is_bounded_and_says_so(self):
         original = blobstore.DEFERRED_DELETE_MAX

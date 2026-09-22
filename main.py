@@ -710,6 +710,7 @@ from cache import (
     get_cached_final_poster,
     get_cached_final_poster_entry,
     get_cached_final_poster_url,
+    get_cached_final_poster_redirect,
     is_cached_final_poster_fresh,
     set_cached_final_poster,
     delete_cached_final_poster,
@@ -718,6 +719,7 @@ from cache import (
     get_cached_text_detection,
     set_cached_text_detection,
     get_cached_release_status,
+    get_cached_imdb_to_tmdb,
     init_db,
     is_digital_release,
     set_cached_rating,
@@ -776,7 +778,7 @@ from ratings import (
     _score_color_alt,
     _score_color_metal,
 )
-from tmdb import composite_logo, logo_centre_y, fetch_logo, image_language_order, fetch_poster_metadata, resolve_imdb_to_tmdb, fetch_poster_image, fetch_backdrop_image, fetch_landscape_image, fetch_trending_rank, fetch_trending_candidates, fetch_popular_candidates, fetch_supplemental_candidates, fetch_catalog_candidates, fetch_release_status, fetch_upcoming_movie_release, fetch_recent_movie_digital_release_date, svg_logo_supported, tmdb_metadata_cache_key, _CROP_VERSION, _fetch_metahub_logo, LOGO_ABS_MAX_H, TEXT_FORWARD_PRIORITIES as _TEXT_FORWARD_LOGO_PRIORITIES
+from tmdb import composite_logo, logo_centre_y, fetch_logo, image_language_order, fetch_poster_metadata, resolve_imdb_to_tmdb, fetch_poster_image, fetch_backdrop_image, fetch_landscape_image, fetch_trending_rank, fetch_trending_candidates, fetch_popular_candidates, fetch_supplemental_candidates, fetch_catalog_candidates, fetch_release_status, fetch_upcoming_movie_release, fetch_recent_movie_digital_release_date, recent_digital_release_from_cache, svg_logo_supported, tmdb_metadata_cache_key, _CROP_VERSION, _fetch_metahub_logo, LOGO_ABS_MAX_H, TEXT_FORWARD_PRIORITIES as _TEXT_FORWARD_LOGO_PRIORITIES
 
 # Logo priorities that consult the secondary preferred language ("custom").
 # Elsewhere the secondary language is inert and must be kept out of the image
@@ -5396,7 +5398,30 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
         raise HTTPException(status_code=503, detail="Service unavailable")
     client = _HTTP_CLIENT
 
-    tmdb_id = await resolve_imdb_to_tmdb(client, imdb_id, effective_tmdb_key, type)
+    # A cold imdb->tmdb resolution is a TMDB /find call, made before the
+    # render slot below is taken — and a miss returns 404 without ever reaching
+    # it. Unbounded, an anonymous burst of unknown ids would drain the shared
+    # HTTP pool that the render cap exists to protect, so a cold lookup takes a
+    # slot of its own. Warm lookups are a local read and skip this.
+    if get_cached_imdb_to_tmdb(imdb_id, type) is None:
+        _resolve_sem = _get_render_semaphore()
+        try:
+            if _cfg.RENDER_QUEUE_TIMEOUT > 0:
+                await asyncio.wait_for(
+                    _resolve_sem.acquire(), timeout=_cfg.RENDER_QUEUE_TIMEOUT
+                )
+            else:
+                await _resolve_sem.acquire()
+        except asyncio.TimeoutError:
+            _metrics.render_saturated_total.inc()
+            raise HTTPException(status_code=503, detail="Server saturated — try again shortly",
+                                headers={"Retry-After": "5"})
+        try:
+            tmdb_id = await resolve_imdb_to_tmdb(client, imdb_id, effective_tmdb_key, type)
+        finally:
+            _resolve_sem.release()
+    else:
+        tmdb_id = await resolve_imdb_to_tmdb(client, imdb_id, effective_tmdb_key, type)
     if not tmdb_id:
         raise HTTPException(status_code=404, detail="Title not found on TMDB")
 
@@ -5416,6 +5441,12 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
     )
 
     def _preset_header(persisted: bool, expires_at: int | None = None) -> dict:
+        # The operator's development switch: nothing is cached, anywhere, so
+        # rendering changes show up immediately — including through the
+        # locked configurator's preview, which renders via this route.
+        if _cfg.DISABLE_COMPOSITE_CACHE:
+            return {"Cache-Control": "no-store, no-cache, must-revalidate",
+                    "Pragma": "no-cache"}
         ttl = _cfg.PRESET_CDN_CACHE_TTL if persisted else _PRESET_INCOMPLETE_TTL
         # Never outlive the composite being pointed at. PRESET_CDN_CACHE_TTL is
         # a day by default, and a render pinned to a trending rank or a release
@@ -5428,9 +5459,13 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
     # Cache hit: prefer a 302 to the CDN when a public URL is configured,
     # else serve the bytes inline.
     cdn_url = get_cached_final_poster_url(final_cache_key)
-    if cdn_url is not None:
-        _cdn_expires_at = await is_cached_final_poster_fresh(final_cache_key)
-        if _cdn_expires_at is not None:
+    if _cfg.DISABLE_COMPOSITE_CACHE:
+        pass
+    elif cdn_url is not None:
+        # From the shared row, never L1 — see get_cached_final_poster_redirect.
+        _redirect = await get_cached_final_poster_redirect(final_cache_key)
+        if _redirect is not None:
+            cdn_url, _cdn_expires_at = _redirect
             logger.info(f"Preset {preset} cache hit (CDN redirect) for {final_cache_key}")
             resp = Response(status_code=302)
             resp.headers["Location"] = cdn_url
@@ -5569,7 +5604,20 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             genre = cached_genre or "Unknown"
             rel = cached_release_date
         else:
-            ratings_dict, score, genre, rel = {}, "N/A", "Unknown", None
+            # No MDBList row. The IMDb dataset is still a local table, so a
+            # dataset-sourced score is allowed here exactly as /poster uses it.
+            ratings_dict = _merge_imdb_dataset_rating({}, imdb_id, rcfg)
+            if ratings_dict:
+                weights = (
+                    (rcfg.tv_weights or _cfg.TV_WEIGHTS) if type in ("tv", "series")
+                    else (rcfg.movie_weights or _cfg.MOVIE_WEIGHTS)
+                )
+                score = calculate_weighted_score(
+                    ratings_dict, weights, fallback_to_imdb=rcfg.fallback_to_imdb
+                )
+            else:
+                score = "N/A"
+            genre, rel = "Unknown", None
             award_wins, award_noms = [], []
             festival_keyword = age_rating = None
             is_cult = is_true_story = is_metacritic = False
@@ -5624,6 +5672,21 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
 
         _vc = tmdb_data.get("vote_count")
         _vote_detection_ok = _detection_vote_ok(_vc)
+
+        # A text-bearing poster under the vote gate is where /poster tries its
+        # rescues — a text-aware crop of a text-bearing backdrop, then TVDB art
+        # — each needing OCR or a request the moat forbids. The official
+        # poster is a fine anonymous answer, but may not be the image /poster
+        # stores under this key, so don't share it.
+        _orig_mode = bool(rcfg.use_original_art and _orig_art)
+        if (not use_backdrop and not is_no_poster and not is_textless
+                and not _orig_mode and _vote_detection_ok):
+            _tmdb_rescue = (_cfg.TEXTLESS_TEXT_DETECTION
+                            and bool(tmdb_data.get("text_backdrop_path")))
+            _tvdb_rescue = (tvdb.tvdb_enabled()
+                            and (_cfg.TVDB_USE_BACKDROPS or _cfg.TVDB_USE_POSTERS))
+            if _tmdb_rescue or _tvdb_rescue:
+                _art_undetermined = True
         if use_backdrop:
             # /poster crops a backdrop text-aware when detection is on and the
             # title is under the vote gate — and that crop runs OCR, which this
@@ -5729,8 +5792,17 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
                     and type not in ("tv", "series")):
                 _release_undetermined = True
 
+        # "Just added" for films reads TMDB's release dates — cached-only here,
+        # like the status above. Unknown means don't share the render.
+        _recent_digital_release_date: str | None = None
+        if type not in ("tv", "series") and "just_added" in rcfg.sash_priority:
+            _known, _recent_digital_release_date = recent_digital_release_from_cache(tmdb_id)
+            if not _known:
+                _release_undetermined = True
+
         will_persist = (
-            cached_rating is not None
+            not _cfg.DISABLE_COMPOSITE_CACHE
+            and cached_rating is not None
             and not quality_missing
             and not _ocr_undetermined
             and not _release_undetermined
@@ -5771,6 +5843,7 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             is_metacritic_override=is_metacritic,
             is_digital_release_override=is_digital_release(imdb_id),
             release_status_override=_release_status,
+            recent_digital_release_date=_recent_digital_release_date,
         )
 
         _bp_args = dict(
@@ -6264,24 +6337,26 @@ async def get_poster(
         # lifetime the CDN manages; the inline path below still uses the
         # per-composite deadline.
         if not _force_refresh:
-            _cdn_url = get_cached_final_poster_url(final_cache_key)
-            if _cdn_url is not None:
-                _cdn_expires_at = await is_cached_final_poster_fresh(final_cache_key)
-                if _cdn_expires_at is not None:
-                    logger.info(
-                        f"Final poster cache hit (CDN redirect) for {final_cache_key}"
-                    )
-                    _redir = Response(status_code=302)
-                    _redir.headers["Location"] = _cdn_url
-                    # Same header policy as the inline hit below, rather than a
-                    # flat CDN_CACHE_TTL: with CDN_CACHE_TTL=auto (v1.2.0's
-                    # per-composite mode) there is no flat TTL, and hardcoding
-                    # one here would let a redirect outlive the composite it
-                    # points at — the case that mode exists to prevent.
-                    _apply_poster_cache_headers(
-                        _redir, provisional=False, expires_at=_cdn_expires_at
-                    )
-                    return _redir
+            # Resolved from the SHARED row, never this process's L1: another
+            # pod may have replaced the composite, and only the row names the
+            # current (versioned) blob the CDN should be sent to.
+            _redirect = await get_cached_final_poster_redirect(final_cache_key)
+            if _redirect is not None:
+                _cdn_url, _cdn_expires_at = _redirect
+                logger.info(
+                    f"Final poster cache hit (CDN redirect) for {final_cache_key}"
+                )
+                _redir = Response(status_code=302)
+                _redir.headers["Location"] = _cdn_url
+                # Same header policy as the inline hit below, rather than a
+                # flat CDN_CACHE_TTL: with CDN_CACHE_TTL=auto (v1.2.0's
+                # per-composite mode) there is no flat TTL, and hardcoding
+                # one here would let a redirect outlive the composite it
+                # points at — the case that mode exists to prevent.
+                _apply_poster_cache_headers(
+                    _redir, provisional=False, expires_at=_cdn_expires_at
+                )
+                return _redir
         # ElfHosted fork: composite bytes live in the blobstore, so the read
         # and the write are awaited (see cache.py).
         _cached_entry = (

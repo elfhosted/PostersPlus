@@ -27,6 +27,7 @@ _PUBLIC_API = (
     "get_cached_final_poster",
     "get_cached_final_poster_url",
     "is_cached_final_poster_fresh",
+    "get_cached_final_poster_redirect",
     "set_cached_final_poster",
     "get_cached_rating",
     "set_cached_rating",

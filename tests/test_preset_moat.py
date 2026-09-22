@@ -74,6 +74,15 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
         cache.init_db()
         await blobstore.init()
         main._HTTP_CLIENT = object()  # sentinel; network helpers are stubbed
+        # Every test resolves to tmdb 278, so warmed facts would leak between
+        # them and make "unwarmed" cases pass or fail by run order.
+        db = sb.get_db()
+        for table in ("release_status_cache", "movie_release_info_cache",
+                      "rating_cache", "final_poster_cache", "imdb_to_tmdb_cache"):
+            db.execute(f"DELETE FROM {table}")
+        db.commit()
+        with sb._composite_l1_lock:
+            sb._composite_l1.clear()
 
     async def asyncTearDown(self):
         await blobstore.close()
@@ -184,6 +193,10 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
             imdb_id=imdb,
         )
 
+        # Someone is already rendering this title, so its imdb->tmdb mapping is
+        # warm; a cold lookup would (correctly) queue for a slot of its own.
+        cache.set_cached_imdb_to_tmdb(imdb, "movie", "278")
+
         prev_cap = config.POSTER_RENDER_CONCURRENCY
         prev_sem = main._render_semaphore
         config.POSTER_RENDER_CONCURRENCY = 1
@@ -239,6 +252,53 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
         backdrop.assert_awaited()
         poster.assert_not_awaited()
 
+    async def test_disable_composite_cache_is_honoured(self):
+        """The operator's dev switch must reach /p too: no persistence and a
+        non-cacheable response, even for a fully warmed title."""
+        imdb = "tt7777777"
+        cache.set_cached_rating(
+            imdb, {"letterboxd": 80}, "Action", "1994-01-01",
+            [], [], 1, None, None, False, False, False,
+        )
+        cache.set_cached_release_status("movie_278", "Streaming")
+        cache.set_cached_movie_release_info("movie_278", {"status": "Streaming"})
+        prev = config.DISABLE_COMPOSITE_CACHE
+        config.DISABLE_COMPOSITE_CACHE = True
+        try:
+            resp = await self._call(imdb=imdb)
+        finally:
+            config.DISABLE_COMPOSITE_CACHE = prev
+        self.assertIn("no-store", resp.headers.get("Cache-Control", ""))
+        key = main._composite_cache_key(
+            imdb, "278", "movie",
+            dict(main.get_preset("clean_notch")),
+            main.build_request_config(dict(main.get_preset("clean_notch"))).fallback_to_imdb,
+            imdb_id=imdb,
+        )
+        self.assertIsNone(await cache.get_cached_final_poster(key))
+
+    async def test_a_cold_id_lookup_waits_for_a_render_slot(self):
+        """An uncached imdb->tmdb lookup is a TMDB request, so it is admitted
+        like a render: with the only slot taken it gives up with a 503 instead
+        of hitting TMDB anyway."""
+        prev_cap, prev_sem = config.POSTER_RENDER_CONCURRENCY, main._render_semaphore
+        prev_to = config.RENDER_QUEUE_TIMEOUT
+        config.POSTER_RENDER_CONCURRENCY, main._render_semaphore = 1, None
+        config.RENDER_QUEUE_TIMEOUT = 0.05
+        sem = main._get_render_semaphore()
+        await sem.acquire()
+        resolver = mock.AsyncMock(return_value="278")
+        try:
+            with mock.patch.object(main, "resolve_imdb_to_tmdb", resolver):
+                with self.assertRaises(HTTPException) as ctx:
+                    await main.get_preset_poster("clean_notch", "movie", "tt8888888")
+        finally:
+            sem.release()
+            config.POSTER_RENDER_CONCURRENCY, main._render_semaphore = prev_cap, prev_sem
+            config.RENDER_QUEUE_TIMEOUT = prev_to
+        self.assertEqual(ctx.exception.status_code, 503)
+        resolver.assert_not_awaited()
+
     async def test_unwarmed_release_status_is_not_persisted(self):
         """A film with a cached rating but no cached release status is still
         incomplete.
@@ -283,6 +343,8 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
         # whose status has never been resolved is not fully warmed — see
         # test_unwarmed_release_status_is_not_persisted.
         cache.set_cached_release_status("movie_278", "Streaming")
+        # "Just added" reads the cached release dates the same way.
+        cache.set_cached_movie_release_info("movie_278", {"status": "Streaming"})
         ctxs = self._patches(_META_NON_TEXTLESS)
         for c in ctxs:
             c.start()

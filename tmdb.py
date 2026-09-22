@@ -2145,6 +2145,26 @@ async def fetch_recent_movie_digital_release_date(
     return digital.isoformat() if 0 <= age <= max_age_days else None
 
 
+def recent_digital_release_from_cache(
+    tmdb_id: str, *, max_age_days: int = 14
+) -> "tuple[bool, str | None]":
+    """ElfHosted fork: fetch_recent_movie_digital_release_date without the fetch.
+
+    For the anonymous /p route, which may read TMDB-derived caches but never
+    call TMDB. Returns (known, date): known is False when the release info has
+    not been cached yet, so the caller can tell "no recent digital release"
+    from "haven't looked".
+    """
+    info = get_cached_movie_release_info(f"movie_{tmdb_id}")
+    if not info:
+        return False, None
+    digital = _parse_tmdb_date(info.get("digital_latest_date") or info.get("digital_date"))
+    if digital is None:
+        return True, None
+    age = (_date.today() - digital).days
+    return True, (digital.isoformat() if 0 <= age <= max_age_days else None)
+
+
 # The status a movie moves to when each dated window opens — the second half
 # of a dated sash ("Oct 16 Cinema"), so a viewer can tell a theatrical date
 # from one they can actually watch at home.
