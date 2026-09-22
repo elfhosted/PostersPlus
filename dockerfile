@@ -19,12 +19,14 @@ RUN find /wheels -type f -name 'opencv_python-*.whl' -delete
 FROM python:3.11-slim
 WORKDIR /app
 
-# libcairo2 (runtime only — no -dev headers needed) for pycairo/cairosvg.
+# libcairo2 (runtime only — no -dev headers needed) for pycairo/cairosvg;
+# tini as PID 1 so orphaned processes get reaped (see CMD below).
 # ElfHosted fork: no gosu — the container runs as a fixed non-root uid (see
 # below); on Kubernetes the deployment SecurityContext (runAsNonRoot/fsGroup)
 # owns user + volume-permission policy, so there's no root-startup drop dance.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libcairo2 \
+    tini \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /wheels /wheels
@@ -74,6 +76,23 @@ RUN mkdir -p /app/cache/tmdb_posters /app/cache/tmdb_logos /app/cache/composites
 # Numeric so kubelet can verify runAsNonRoot without /etc/passwd.
 USER 568
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/live', timeout=4)" || exit 1
-CMD ["/bin/sh", "entrypoint.sh"]
+# Exec form on purpose: the shell form ran `sh -c "python3 ... || exit 1"`, and
+# when the probe overran its timeout Docker SIGKILLed only the sh it exec'd.
+# The python3 child survived, was reparented to PID 1, and sat there as a
+# root-owned `[python3] <defunct>` once it finished — uvicorn was PID 1 and
+# never reaps children it didn't spawn. One zombie per overrun, which on a
+# small VPS mid-render was every few probes. With no shell in between the
+# probe process is the one Docker kills. A non-zero exit already marks the
+# container unhealthy, so the `|| exit 1` bought nothing.
+#
+# The probe uses http.client rather than urllib.request: it imports a
+# fraction as much, which matters when the CPU is busy compositing and the
+# interpreter start-up is most of the probe's budget. The 10s timeout gives
+# that start-up room on a loaded 1-vCPU host.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+  CMD ["python3", "-c", "import http.client; c = http.client.HTTPConnection('localhost', 8000, timeout=8); c.request('GET', '/health'); r = c.getresponse(); raise SystemExit(0 if r.status == 200 else 1)"]
+# tini as PID 1: reaps any orphan that lands on it and forwards signals, so a
+# process Docker leaves behind (an exec'd shell's child, a killed probe) can
+# never accumulate as a zombie. entrypoint.sh still execs into uvicorn — in
+# this fork already as uid 568, with no gosu drop.
+CMD ["/usr/bin/tini", "--", "/bin/sh", "entrypoint.sh"]

@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 import unittest
 
 
@@ -7,18 +8,33 @@ class ConfiguratorPreviewLayoutTests(unittest.TestCase):
     def setUpClass(cls):
         cls.html = Path("configurator.html").read_text(encoding="utf-8")
 
-    def test_preview_tail_contains_console_without_label_or_recipe(self):
-        self.assertIn('class="preview-console"', self.html)
+    def test_preview_tail_is_an_error_only_notice(self):
+        # The console strip that used to print progress and success is gone —
+        # the action buttons carry their own tooltips — so the only thing left
+        # under the poster is a failure notice. These assertions are the guard
+        # against the strip, its heading or the recipe row coming back.
+        self.assertIn('id="preview-error"', self.html)
+        self.assertNotIn('class="preview-console"', self.html)
+        self.assertNotIn('id="preview-log"', self.html)
         self.assertNotIn('preview-console-head', self.html)
         self.assertNotIn('System Output', self.html)
-        self.assertIn('id="preview-log"', self.html)
         self.assertNotIn('class="preview-recipe"', self.html)
         self.assertNotIn("updatePreviewRecipe", self.html)
 
-    def test_form_controls_are_square_across_browsers(self):
+    def test_form_controls_share_one_radius_across_browsers(self):
+        # The redesign rounded the controls, so the value is no longer 0 — but
+        # the point of the rule is unchanged: every control takes the same
+        # radius from one token, and the UA's own styling is suppressed so
+        # Safari and Firefox can't substitute their defaults.
         self.assertRegex(
             self.html,
-            r"input\[type=\"text\"\],\s*input\[type=\"number\"\],\s*select\s*\{[^}]*border-radius:\s*0;",
+            r"input\[type=\"text\"\],\s*input\[type=\"number\"\],\s*(?:textarea,\s*)?select\s*\{"
+            r"[^}]*border-radius:\s*var\(--radius-sm\);",
+        )
+        self.assertRegex(
+            self.html,
+            r"input\[type=\"text\"\],\s*input\[type=\"number\"\],\s*(?:textarea,\s*)?select\s*\{"
+            r"[^}]*appearance:\s*none;\s*-webkit-appearance:\s*none;",
         )
 
     def test_select_focus_preserves_dropdown_arrow(self):
@@ -32,26 +48,42 @@ class ConfiguratorPreviewLayoutTests(unittest.TestCase):
             r"select:focus\s*\{[^}]*\bbackground:\s*var\(--black3\)",
         )
 
-    def test_system_output_matches_preview_background(self):
+    def test_error_notice_sits_on_the_preview_background(self):
+        # The console strip painted its own background so it read as a separate
+        # panel. Its replacement must not: the failure text belongs on the
+        # preview surface, directly under where the poster renders.
+        match = re.search(r"\.preview-error\s*\{([^}]*)\}", self.html)
+        self.assertIsNotNone(match, ".preview-error rule not found")
+        self.assertNotRegex(match.group(1), r"\bbackground(-color)?\s*:")
+
+    def test_error_notice_takes_no_space_when_empty(self):
+        # It used to reserve two lines so the layout didn't jump when a message
+        # arrived. The notice now collapses entirely instead, which is why it
+        # ships with the hidden attribute set.
         self.assertRegex(
-            self.html,
-            r"\.preview-console\s*\{[^}]*background:\s*var\(--black2\)",
+            self.html, r'<div class="preview-error" id="preview-error" hidden>'
+        )
+        self.assertRegex(
+            self.html, r"\.preview-error\[hidden\]\s*\{\s*display:\s*none;\s*\}"
         )
 
-    def test_preview_actions_share_the_metadata_row(self):
-        self.assertIn('class="preview-meta-items"', self.html)
-        self.assertIn('aria-label="Copy URL"', self.html)
-        self.assertIn('aria-label="Load Preset"', self.html)
-        self.assertIn('aria-label="Reset"', self.html)
-        meta = self.html.index('<div class="preview-meta">')
-        controls = self.html.index('<div class="preview-controls">', meta)
-        actions = self.html.index('<div class="console-actions">', meta)
-        self.assertLess(actions, controls)
+    def test_preview_actions_sit_between_the_notice_and_the_url_row(self):
+        # The three actions moved out of the old metadata row into their own
+        # equal-thirds row. Order still matters: the buttons come after the
+        # failure notice and before the URL field.
+        for handler in ("copyUrl()", "openPresetModal()", "resetDefaults()"):
+            with self.subTest(handler=handler):
+                self.assertIn(handler, self.html)
+        for label in ("Copy config", "Load preset", "Reset config"):
+            with self.subTest(label=label):
+                self.assertIn(f">{label}</button>", self.html)
 
-    def test_console_reserves_two_lines(self):
-        self.assertIn("-webkit-line-clamp: 2;", self.html)
-        self.assertIn("white-space: normal;", self.html)
-        self.assertIn("min-height: calc(2 * 1.65em + 12px);", self.html)
+        frame = self.html.index('<div class="preview-frame"')
+        error = self.html.index('<div class="preview-error"', frame)
+        actions = self.html.index('<div class="preview-actions">', frame)
+        controls = self.html.index('<div class="preview-controls">', frame)
+        self.assertLess(error, actions)
+        self.assertLess(actions, controls)
 
     def test_panels_use_the_available_desktop_height(self):
         self.assertIn("height: max(680px, calc(100vh - 144px));", self.html)

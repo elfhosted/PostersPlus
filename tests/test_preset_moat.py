@@ -12,8 +12,10 @@ helpers in main's namespace:
     under the SAME composite key /poster would use, with the long preset TTL
 """
 import asyncio
+import io
 import os
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -27,9 +29,12 @@ config.TMDB_POSTER_CACHE_DIR = os.path.join(_TMP, "p")
 config.TMDB_LOGO_CACHE_DIR = os.path.join(_TMP, "l")
 config.COMPOSITE_BLOB_DIR = os.path.join(_TMP, "comp")
 config.SERVER_TMDB_KEY = "test-server-key"
-config.PRESET_ENABLED = True
 config.PRESET_CDN_CACHE_TTL = 86400
 config.TEXTLESS_TEXT_DETECTION = True
+# /p and /poster share composite keys, so they must agree on the encoding.
+# Pinned to the non-default here so a regression back to hardcoded JPEG shows
+# up as a failure rather than passing by coincidence.
+config.IMAGE_FORMAT = "webp"
 
 import storage.sqlite_backend as sb
 sb.DB_PATH = config.DB_PATH
@@ -39,6 +44,7 @@ sb.TMDB_LOGO_CACHE_DIR = config.TMDB_LOGO_CACHE_DIR
 import blobstore
 import cache
 import main
+from discovery import DiscoveryMeta
 from fastapi import HTTPException
 
 # A non-textless poster so the OCR branch is skipped on the happy path; a
@@ -64,11 +70,26 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
         # happened — with the real /app path — before this module set config.)
         from blobstore import local as _bl
         _bl._BUCKETS["composites"] = config.COMPOSITE_BLOB_DIR
+        # Scoped to this class, not set at import: PRESET_ENABLED closes
+        # /poster, and leaking it would 403 every upstream test that runs after
+        # this module.
+        self._prev_preset_enabled = config.PRESET_ENABLED
+        config.PRESET_ENABLED = True
         cache.init_db()
         await blobstore.init()
         main._HTTP_CLIENT = object()  # sentinel; network helpers are stubbed
+        # Every test resolves to tmdb 278, so warmed facts would leak between
+        # them and make "unwarmed" cases pass or fail by run order.
+        db = sb.get_db()
+        for table in ("release_status_cache", "movie_release_info_cache",
+                      "rating_cache", "final_poster_cache", "imdb_to_tmdb_cache"):
+            db.execute(f"DELETE FROM {table}")
+        db.commit()
+        with sb._composite_l1_lock:
+            sb._composite_l1.clear()
 
     async def asyncTearDown(self):
+        config.PRESET_ENABLED = self._prev_preset_enabled
         await blobstore.close()
         cache.close()
 
@@ -85,7 +106,15 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(main, "fetch_trending_rank",
                               mock.AsyncMock(return_value=None)),
             mock.patch.object(main, "build_poster", lambda *a, **k: _img()),
-            mock.patch.object(main, "extract_discovery_meta", lambda **k: {}),
+            # A real (empty) DiscoveryMeta, not {}: the persist path runs
+            # pick_sash on it to cap the composite's lifetime.
+            mock.patch.object(
+                main, "extract_discovery_meta",
+                lambda **k: DiscoveryMeta(
+                    award_wins=[], award_noms=[], trending_rank=None,
+                    original_language="en",
+                ),
+            ),
             mock.patch.object(main, "is_digital_release", lambda _i: False),
             # If the foreground OCR scanner is ever invoked from /p, fail loudly.
             mock.patch.object(main, "_start_text_detection",
@@ -119,8 +148,15 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_uncached_not_persisted_short_ttl(self):
         resp = await self._call(imdb="tt1111111")
-        # Rendered (200 inline JPEG), short Cache-Control, NOT persisted.
-        self.assertEqual(resp.media_type, "image/jpeg")
+        # Rendered inline in the CONFIGURED format, short Cache-Control, NOT
+        # persisted. The format matters beyond the header: /p writes into the
+        # same composite key /poster reads, so a JPEG written here would later
+        # be served as image/webp by /poster.
+        self.assertEqual(resp.media_type, f"image/{config.IMAGE_FORMAT}")
+        self.assertEqual(
+            Image.open(io.BytesIO(resp.body)).format,
+            config.IMAGE_FORMAT.upper(),
+        )
         self.assertIn("max-age=60", resp.headers.get("Cache-Control", ""))
         key = main._composite_cache_key(
             "tt1111111", "278", "movie",
@@ -137,8 +173,325 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
             c.start()
         try:
             resp = await main.get_preset_poster("clean_notch", "movie", "tt2222222")
-            self.assertEqual(resp.media_type, "image/jpeg")
+            self.assertEqual(resp.media_type, f"image/{config.IMAGE_FORMAT}")
             self.assertIn("max-age=60", resp.headers.get("Cache-Control", ""))
+        finally:
+            for c in ctxs:
+                c.stop()
+
+    async def test_coalescing_does_not_hold_a_render_slot(self):
+        """Joining an in-flight render must not occupy an admission slot.
+
+        With the cap at one, a /poster request can publish its future and then
+        queue for a slot. If /p waits for that future while holding the only
+        slot, neither can proceed: RENDER_QUEUE_TIMEOUT turns it into a 503 and
+        with the timeout disabled it hangs forever. So the join has to happen
+        before admission — with the cap at one and a slot already taken, this
+        request must still return the coalesced bytes promptly.
+        """
+        imdb = "tt5555555"
+        preset = "clean_notch"
+        key = main._composite_cache_key(
+            imdb, "278", "movie",
+            dict(main.get_preset(preset)),
+            main.build_request_config(dict(main.get_preset(preset))).fallback_to_imdb,
+            imdb_id=imdb,
+        )
+
+        # Someone is already rendering this title, so its imdb->tmdb mapping is
+        # warm; a cold lookup would (correctly) queue for a slot of its own.
+        cache.set_cached_imdb_to_tmdb(imdb, "movie", "278")
+
+        prev_cap = config.POSTER_RENDER_CONCURRENCY
+        prev_sem = main._render_semaphore
+        config.POSTER_RENDER_CONCURRENCY = 1
+        main._render_semaphore = None
+        sem = main._get_render_semaphore()
+        await sem.acquire()          # the only slot, held by someone else
+        try:
+            fut = asyncio.get_running_loop().create_future()
+            fut.set_result((b"COALESCED", False, int(time.time()) + 3600))
+            main._render_inflight[key] = fut
+            try:
+                ctxs = self._patches(_META_NON_TEXTLESS)
+                for c in ctxs:
+                    c.start()
+                try:
+                    resp = await asyncio.wait_for(
+                        main.get_preset_poster(preset, "movie", imdb), timeout=5
+                    )
+                finally:
+                    for c in ctxs:
+                        c.stop()
+            finally:
+                main._render_inflight.pop(key, None)
+        finally:
+            sem.release()
+            config.POSTER_RENDER_CONCURRENCY = prev_cap
+            main._render_semaphore = prev_sem
+
+        self.assertEqual(resp.body, b"COALESCED")
+
+    async def test_a_titled_poster_is_swapped_for_the_backdrop_like_poster(self):
+        """/poster replaces a poster with its title burned in by a backdrop
+        crop. /p must pick the same art: the two share a composite key, and a
+        preset that rendered the titled poster would store a different image
+        under the key /poster reads."""
+        meta = (
+            [28], False, [], "1994", "Test Title", "/titled.jpg", "/backdrop.jpg",
+            {"vote_count": 1234, "original_language": "en"},
+        )
+        backdrop = mock.AsyncMock(return_value=_img())
+        poster = mock.AsyncMock(return_value=_img())
+        ctxs = self._patches(meta) + [
+            mock.patch.object(main, "fetch_backdrop_image", backdrop),
+            mock.patch.object(main, "fetch_poster_image", poster),
+        ]
+        for c in ctxs:
+            c.start()
+        try:
+            await main.get_preset_poster("clean_notch", "movie", "tt6666666")
+        finally:
+            for c in ctxs:
+                c.stop()
+        backdrop.assert_awaited()
+        poster.assert_not_awaited()
+
+    async def test_disable_composite_cache_is_honoured(self):
+        """The operator's dev switch must reach /p too: no persistence and a
+        non-cacheable response, even for a fully warmed title."""
+        imdb = "tt7777777"
+        cache.set_cached_rating(
+            imdb, {"letterboxd": 80}, "Action", "1994-01-01",
+            [], [], 1, None, None, False, False, False,
+        )
+        cache.set_cached_release_status("movie_278", "Streaming")
+        cache.set_cached_movie_release_info("movie_278", {"status": "Streaming"})
+        prev = config.DISABLE_COMPOSITE_CACHE
+        config.DISABLE_COMPOSITE_CACHE = True
+        try:
+            resp = await self._call(imdb=imdb)
+        finally:
+            config.DISABLE_COMPOSITE_CACHE = prev
+        self.assertIn("no-store", resp.headers.get("Cache-Control", ""))
+        key = main._composite_cache_key(
+            imdb, "278", "movie",
+            dict(main.get_preset("clean_notch")),
+            main.build_request_config(dict(main.get_preset("clean_notch"))).fallback_to_imdb,
+            imdb_id=imdb,
+        )
+        self.assertIsNone(await cache.get_cached_final_poster(key))
+
+    async def test_a_cold_id_lookup_waits_for_a_render_slot(self):
+        """An uncached imdb->tmdb lookup is a TMDB request, so it is admitted
+        like a render: with the only slot taken it gives up with a 503 instead
+        of hitting TMDB anyway."""
+        prev_cap, prev_sem = config.POSTER_RENDER_CONCURRENCY, main._render_semaphore
+        prev_to = config.RENDER_QUEUE_TIMEOUT
+        config.POSTER_RENDER_CONCURRENCY, main._render_semaphore = 1, None
+        config.RENDER_QUEUE_TIMEOUT = 0.05
+        sem = main._get_render_semaphore()
+        await sem.acquire()
+        resolver = mock.AsyncMock(return_value="278")
+        try:
+            with mock.patch.object(main, "resolve_imdb_to_tmdb", resolver):
+                with self.assertRaises(HTTPException) as ctx:
+                    await main.get_preset_poster("clean_notch", "movie", "tt8888888")
+        finally:
+            sem.release()
+            config.POSTER_RENDER_CONCURRENCY, main._render_semaphore = prev_cap, prev_sem
+            config.RENDER_QUEUE_TIMEOUT = prev_to
+        self.assertEqual(ctx.exception.status_code, 503)
+        resolver.assert_not_awaited()
+
+    async def test_an_unwarmed_film_warms_itself_in_the_background(self):
+        """Nothing else fetches film release facts on a /p-only instance, so
+        without background warming a film would never become persistable and
+        would re-render on every hit. The first hit queues the fetch; once it
+        lands, the next hit is persisted under the long preset TTL."""
+        imdb = "tt9999999"
+        cache.set_cached_rating(
+            imdb, {"letterboxd": 80}, "Action", "1994-01-01",
+            [], [], 1, None, None, False, False, False,
+        )
+
+        async def _fake_status(client, tmdb_id, key, media_type, status):
+            cache.set_cached_release_status(f"movie_{tmdb_id}", "Streaming")
+            cache.set_cached_movie_release_info(f"movie_{tmdb_id}", {"status": "Streaming"})
+            return "Streaming"
+
+        prev_key = config.SERVER_TMDB_KEY
+        with mock.patch.object(main, "fetch_release_status", _fake_status):
+            first = await self._call(imdb=imdb)
+            self.assertIn("max-age=60", first.headers.get("Cache-Control", ""))
+            # Let the queued background warm run.
+            await asyncio.gather(*list(main._release_warm_tasks))
+            second = await self._call(imdb=imdb)
+        config.SERVER_TMDB_KEY = prev_key
+        self.assertIn("max-age=86400", second.headers.get("Cache-Control", ""))
+
+    async def test_preset_mdblist_fetch_warms_the_rating_in_the_background(self):
+        """On a preset-only instance /poster is closed, so /p has to warm its
+        own ratings or every preset renders N/A forever. With
+        PRESET_MDBLIST_FETCH, a miss queues a background MDBList fetch (never
+        a foreground one) and the next hit carries the rating."""
+        imdb = "tt1212121"
+        cache.set_cached_release_status("movie_278", "Streaming")
+        cache.set_cached_movie_release_info("movie_278", {"status": "Streaming"})
+        fetch = mock.AsyncMock(return_value=(
+            {"letterboxd": 81}, "Action", "1994-01-01", [], None,
+        ))
+        saved = (config.PRESET_MDBLIST_FETCH, config.SERVER_MDBLIST_KEYS)
+        config.PRESET_MDBLIST_FETCH, config.SERVER_MDBLIST_KEYS = True, ["mdb-key"]
+        try:
+            with mock.patch.object(main, "fetch_rating", fetch):
+                first = await self._call(imdb=imdb)
+                self.assertIn("max-age=60", first.headers.get("Cache-Control", ""))
+                await asyncio.gather(*list(main._rating_warm_tasks))
+                self.assertIsNotNone(cache.get_cached_rating(imdb))
+                second = await self._call(imdb=imdb)
+        finally:
+            config.PRESET_MDBLIST_FETCH, config.SERVER_MDBLIST_KEYS = saved
+        fetch.assert_awaited_once()
+        self.assertIn("max-age=86400", second.headers.get("Cache-Control", ""))
+
+    async def test_preset_mdblist_fetch_off_spends_no_quota(self):
+        fetch = mock.AsyncMock()
+        saved = (config.PRESET_MDBLIST_FETCH, config.SERVER_MDBLIST_KEYS)
+        config.PRESET_MDBLIST_FETCH, config.SERVER_MDBLIST_KEYS = False, ["mdb-key"]
+        try:
+            with mock.patch.object(main, "fetch_rating", fetch):
+                await self._call(imdb="tt1313131")
+                await asyncio.gather(*list(main._rating_warm_tasks))
+        finally:
+            config.PRESET_MDBLIST_FETCH, config.SERVER_MDBLIST_KEYS = saved
+        fetch.assert_not_awaited()
+
+    async def test_landscape_shape_renders_the_landscape_layout(self):
+        """Nuvio sends ?shape={shape}; landscape must use the landscape art and
+        renderer, and live under its own composite key so it can never be
+        served for a portrait request (or vice versa)."""
+        meta = (
+            [28], True, [], "1994", "Test Title", "/poster.jpg", "/backdrop.jpg",
+            {"vote_count": 1234, "original_language": "en"},
+        )
+        landscape_art = mock.AsyncMock(return_value=_img())
+        poster_art = mock.AsyncMock(return_value=_img())
+        renderer = mock.Mock(return_value=_img())
+        ctxs = self._patches(meta) + [
+            mock.patch.object(main, "fetch_landscape_image", landscape_art),
+            mock.patch.object(main, "fetch_poster_image", poster_art),
+            mock.patch.object(main, "build_landscape", renderer),
+        ]
+        for c in ctxs:
+            c.start()
+        try:
+            await main.get_preset_poster("clean_notch", "movie", "tt0111161",
+                                         shape="landscape")
+        finally:
+            for c in ctxs:
+                c.stop()
+        landscape_art.assert_awaited()
+        poster_art.assert_not_awaited()
+        renderer.assert_called_once()
+
+        base = dict(main.get_preset("clean_notch"))
+        fb = main.build_request_config(base).fallback_to_imdb
+        portrait_key = main._composite_cache_key("tt0111161", "278", "movie", base, fb)
+        landscape_key = main._composite_cache_key(
+            "tt0111161", "278", "movie", {**base, "shape": "landscape"}, fb)
+        self.assertNotEqual(portrait_key, landscape_key)
+
+    async def test_poster_and_square_shapes_keep_the_portrait_key(self):
+        """Adding ?shape= must not fork the cache for existing portrait URLs."""
+        seen = []
+        real = main._composite_cache_key
+
+        def _spy(*a, **k):
+            key = real(*a, **k)
+            seen.append(key)
+            return key
+
+        with mock.patch.object(main, "_composite_cache_key", _spy):
+            for shape in ("", "poster", "square"):
+                ctxs = self._patches(_META_NON_TEXTLESS)
+                for c in ctxs:
+                    c.start()
+                try:
+                    await main.get_preset_poster("clean_notch", "movie", "tt0111161",
+                                                 shape=shape)
+                finally:
+                    for c in ctxs:
+                        c.stop()
+        self.assertEqual(len(set(seen)), 1, seen)
+
+    async def test_a_tmdb_namespaced_id_skips_imdb_resolution(self):
+        resolver = mock.AsyncMock(return_value="999")
+        ctxs = self._patches(_META_NON_TEXTLESS)
+        for c in ctxs:
+            c.start()
+        try:
+            with mock.patch.object(main, "resolve_imdb_to_tmdb", resolver):
+                for tmdb_form in ("tmdb:278", "278"):
+                    resp = await main.get_preset_poster("clean_notch", "movie", tmdb_form)
+                    self.assertEqual(resp.status_code, 200, tmdb_form)
+        finally:
+            for c in ctxs:
+                c.stop()
+        resolver.assert_not_awaited()
+
+    async def test_a_tmdb_keyed_badge_preset_reads_quality_by_the_found_imdb_id(self):
+        """Quality is IMDb-keyed. A tmdb:<id> request has no IMDb id until
+        TMDB supplies one, so quality has to be read again with that id, or a
+        badge preset never shows badges and never persists."""
+        meta = (
+            [28], False, [], "1994", "Test Title", "/poster.jpg", None,
+            {"vote_count": 1234, "original_language": "en", "imdb_id": "tt0111161"},
+        )
+        cache.set_cached_quality("tt0111161", ["4K", "HDR"], "1994-01-01")
+        seen = []
+        real = main.get_cached_quality
+
+        def _spy(imdb, rel=None):
+            seen.append(imdb)
+            return real(imdb, rel)
+        ctxs = self._patches(meta) + [mock.patch.object(main, "get_cached_quality", _spy)]
+        for c in ctxs:
+            c.start()
+        try:
+            await main.get_preset_poster("prestige_rating_bar", "movie", "tmdb:278")
+        finally:
+            for c in ctxs:
+                c.stop()
+        self.assertIn("tt0111161", seen)
+
+    async def test_unwarmed_release_status_is_not_persisted(self):
+        """A film with a cached rating but no cached release status is still
+        incomplete.
+
+        /poster would draw a status sash here (and grey a Cinema title); /p
+        cannot resolve the status without a TMDB request the moat forbids. The
+        render is therefore not the one /poster would produce, so it must not
+        go into the composite both routes read, nor be advertised for a day.
+        """
+        imdb = "tt4444444"
+        cache.set_cached_rating(
+            imdb, {"letterboxd": 80}, "Action", "1994-01-01",
+            [], [], 1, None, None, False, False, False,
+        )
+        ctxs = self._patches(_META_NON_TEXTLESS)
+        for c in ctxs:
+            c.start()
+        try:
+            resp = await main.get_preset_poster("clean_notch", "movie", imdb)
+            self.assertIn("max-age=60", resp.headers.get("Cache-Control", ""))
+            key = main._composite_cache_key(
+                imdb, "278", "movie",
+                dict(main.get_preset("clean_notch")),
+                main.build_request_config(dict(main.get_preset("clean_notch"))).fallback_to_imdb,
+                imdb_id=imdb,
+            )
+            self.assertIsNone(await cache.get_cached_final_poster(key))
         finally:
             for c in ctxs:
                 c.stop()
@@ -151,6 +504,13 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
             imdb, {"letterboxd": 80}, "Action", "1994-01-01",
             [], [], 1, None, None, False, False, False,
         )
+        # ...and the release status. Every gallery preset asks for a release
+        # slot, and /p may not call TMDB's /release_dates itself, so a film
+        # whose status has never been resolved is not fully warmed — see
+        # test_unwarmed_release_status_is_not_persisted.
+        cache.set_cached_release_status("movie_278", "Streaming")
+        # "Just added" reads the cached release dates the same way.
+        cache.set_cached_movie_release_info("movie_278", {"status": "Streaming"})
         ctxs = self._patches(_META_NON_TEXTLESS)
         for c in ctxs:
             c.start()

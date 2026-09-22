@@ -1,20 +1,29 @@
 #main.py
 import asyncio
+import dataclasses
 import hashlib
+from html import escape as _html_escape
+import urllib.parse
 import hmac
 import io
 import logging
 import os
 import re
+import time
 import httpx
 import numpy as np
+from datetime import datetime, timedelta, timezone
+import zoneinfo
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
+from functools import lru_cache
+from urllib.parse import parse_qsl, urlencode
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 logging.basicConfig(
     level=logging.INFO,
@@ -141,11 +150,55 @@ logger = logging.getLogger(__name__)
 # This dict is per-worker-process — cross-process deduplication would require
 # a shared store like Redis, but intra-process coalescing handles the common
 # burst pattern well enough at this scale.
-_render_inflight: dict[str, "asyncio.Future[bytes]"] = {}
+# The future carries (jpeg_bytes, provisional): a coalesced request has to know
+# whether the render it is riding on was one the pipeline refused to persist, or
+# it would hand out a validator for a poster the server never committed to.
+_render_inflight: dict[str, "asyncio.Future[tuple[bytes, bool]]"] = {}
 
-# ElfHosted fork: bounds Pillow renders in flight (config.RENDER_CONCURRENCY).
-# Created lazily inside the event loop on first /poster (or /p) render.
-_render_semaphore: "asyncio.Semaphore | None" = None
+# Coalesces concurrent fetch_poster_metadata calls for the same (tmdb_id,
+# media_type, language) tuple.  Without this, simultaneous /poster + /logo
+# requests for the same cold title each fire their own TMDB API call.
+_metadata_inflight: dict[str, "asyncio.Future[tuple]"] = {}
+
+
+async def _coalesced_fetch_poster_metadata(
+    client: "httpx.AsyncClient",
+    tmdb_id: str,
+    tmdb_key: str,
+    media_type: str,
+    lang: str,
+    secondary_lang: str = "",
+) -> tuple:
+    endpoint = "tv" if media_type in ("tv", "series") else "movie"
+    inflight_key = tmdb_metadata_cache_key(endpoint, tmdb_id, lang, secondary_lang)
+
+    existing = _metadata_inflight.get(inflight_key)
+    if existing is not None:
+        logger.debug(f"Coalescing metadata fetch for {media_type}/{tmdb_id} ({lang})")
+        return await existing
+
+    fut: "asyncio.Future[tuple]" = asyncio.get_running_loop().create_future()
+    fut.add_done_callback(
+        lambda f: f.exception() if not f.cancelled() and f.exception() else None
+    )
+    _metadata_inflight[inflight_key] = fut
+    try:
+        result = await fetch_poster_metadata(
+            client, tmdb_id, tmdb_key, media_type, lang, secondary_lang
+        )
+        fut.set_result(result)
+        return result
+    except Exception as exc:
+        if not fut.done():
+            fut.set_exception(exc)
+        raise
+    except BaseException:
+        if not fut.done():
+            fut.cancel()
+        raise
+    finally:
+        _metadata_inflight.pop(inflight_key, None)
+
 
 # ---------------------------------------------------------------------------
 # Background quality fetching
@@ -179,7 +232,8 @@ _quality_source_fail_count: dict[str, int] = {}
 # _rating_backoff: maps (imdb_id, API key) -> loop-time after which a new
 #   attempt is allowed. Scoping by key lets a rotated or replaced key retry
 #   the same title immediately. Network failures use an escalating ladder
-#   (30s/2m/8m/1h); rate-limit responses use Retry-After or 1h flat.
+#   (30s/2m/8m/1h); rate-limit responses use Retry-After, else the key's
+#   daily-quota reset (X-RateLimit-Reset), else 1h flat.
 
 _rating_fetch_inflight:         dict[str, asyncio.Event] = {}
 _rating_backoff:                dict[tuple[str, str], float] = {}
@@ -196,6 +250,11 @@ _detect_executor:               "ThreadPoolExecutor | None" = None
 _text_detection_inflight:       dict[str, "asyncio.Task[bool | None]"] = {}
 _foreground_detection_count = 0
 _active_poster_renders = 0
+# Admission control for fresh renders (POSTER_RENDER_CONCURRENCY). Cache hits and
+# coalesced waiters bypass it; see _get_render_semaphore(). Created inside the
+# event loop. _renders_queued counts requests parked on it, for /stats.
+_render_semaphore:              "asyncio.Semaphore | None" = None
+_renders_queued = 0
 _background_detection_queue: "asyncio.Queue[_DeferredTextDetection] | None" = None
 _background_detection_keys: set[str] = set()
 _background_detection_task: "asyncio.Task[None] | None" = None
@@ -238,6 +297,24 @@ def _shutdown_detect_executor() -> None:
     if _detect_executor is not None:
         _detect_executor.shutdown(wait=True, cancel_futures=True)
         _detect_executor = None
+
+
+def _get_render_semaphore() -> "asyncio.Semaphore":
+    """Lazily create the render-admission semaphore inside the event loop.
+
+    Bounds how many uncached /poster renders run at once so a burst from a cold
+    catalog grid queues here, in order, instead of oversubscribing the shared
+    HTTP pool and failing with PoolTimeout. Only the render pipeline itself is
+    gated: a composite cache hit returns before this is touched, and a request
+    coalesced onto an in-flight render waits on that render's future, never on a
+    slot of its own. A slot is also not held while waiting on another request's
+    MDBList fetch (the rating-coalescing event), so a holder can never be
+    blocked on a request that is itself queued for a slot.
+    """
+    global _render_semaphore
+    if _render_semaphore is None:
+        _render_semaphore = asyncio.Semaphore(_cfg.POSTER_RENDER_CONCURRENCY)
+    return _render_semaphore
 
 
 def _reserve_foreground_detection() -> None:
@@ -416,18 +493,19 @@ _mdblist_key_cooldown: dict[str, float] = {}
 _mdblist_active_key_idx: int = 0
 
 
-def _quality_source_name() -> str:
-    return "scraper" if _cfg.QUALITY_SOURCE == "scraper" else "aiostreams"
-
-
 def _quality_backoff_remaining(now: float | None = None) -> float:
     if now is None:
         now = asyncio.get_running_loop().time()
-    return max(0.0, _quality_source_backoff_until.get(_quality_source_name(), 0.0) - now)
+    return max(0.0, _quality_source_backoff_until.get(active_quality_source(), 0.0) - now)
 
 
 def _record_quality_result(result) -> None:
-    source = _quality_source_name()
+    # QUALITY_PENDING means the source answered and is healthy — it just has no
+    # value for this title yet. It is neither a success to reset the failure
+    # count on nor a failure to count, so the backoff state is left untouched.
+    if result is QUALITY_PENDING:
+        return
+    source = active_quality_source()
     if result is not FETCH_FAILED:
         _quality_source_backoff_until.pop(source, None)
         _quality_source_fail_count.pop(source, None)
@@ -460,22 +538,131 @@ def _next_mdblist_server_key(current_key: str, now: float | None = None) -> str 
     return None
 
 
+def _mdblist_server_key_number(key: str | None) -> int | None:
+    if not key:
+        return None
+    for idx, candidate in enumerate(_cfg.SERVER_MDBLIST_KEYS):
+        if candidate == key:
+            return idx + 1
+    return None
+
+
+def _mdblist_server_key_label(key: str | None) -> str:
+    number = _mdblist_server_key_number(key)
+    if number is None:
+        return "request-supplied key"
+    return f"configured key #{number}"
+
+
 def _mark_mdblist_rate_limit(
-    imdb_id: str, key: str, result
+    canonical_id: str, key: str, result
 ) -> tuple[float, str | None]:
-    """Cool down a rate-limited key and select a healthy configured fallback."""
+    """Cool down a rate-limited key and select a healthy configured fallback.
+
+    MDBList's limit is a daily quota, and a quota 429 carries no Retry-After —
+    only X-RateLimit-Reset. Retrying hourly until then just burns log lines,
+    so the key sleeps until the reset (capped at a day in case the header is
+    nonsense) and the fallback key takes over meanwhile.
+    """
+    reset_at = getattr(result, "reset_at", None)
     if result.retry_after:
         backoff_secs = min(float(result.retry_after), 3600.0)
+    elif reset_at:
+        backoff_secs = min(max(float(reset_at) - time.time(), 60.0), 86400.0)
     else:
         backoff_secs = 3600.0
     now = asyncio.get_running_loop().time()
     _mdblist_key_cooldown[key] = now + backoff_secs
-    _rating_backoff[_rating_retry_key(imdb_id, key)] = now + backoff_secs
+    _rating_backoff[_rating_retry_key(canonical_id, key)] = now + backoff_secs
     return backoff_secs, _next_mdblist_server_key(key, now)
 
 
+def _fleet_cooldown_id(mdblist_key: str) -> str | None:
+    """Coordination key for a credential's shared cooldown, or None if it has
+    no fleet-wide meaning.
+
+    Only the OPERATOR's configured keys are shared across replicas, so only
+    they get one. A request-supplied key belongs to one tenant: its quota
+    running out says nothing about anyone else's, and cooling the fleet on it
+    would let any user with an exhausted key stop rating lookups for everyone.
+
+    The identity is hashed so the credential never reaches Redis in clear.
+    """
+    if not mdblist_key or mdblist_key not in _cfg.SERVER_MDBLIST_KEYS:
+        return None
+    return hashlib.sha256(mdblist_key.encode("utf-8")).hexdigest()[:16]
+
+
+async def _publish_fleet_mdblist_cooldown(mdblist_key: str, backoff_secs: float) -> None:
+    """ElfHosted fork: raise a fleet-wide cooldown for ONE MDBList credential.
+
+    _mark_mdblist_rate_limit records the 429 in this process's dicts, which is
+    all a single-instance deploy needs. Across replicas sharing the same keys,
+    every replica would otherwise have to discover the same 429 for itself —
+    one wasted MDBList call each, against a key that has already asked us to
+    stop. Publishing it means the first replica to be refused backs the rest
+    off too.
+
+    Per credential, not fleet-wide-for-everything: MDBList quota is per key and
+    v1.2.0 rotates between several. A single shared flag would let one
+    exhausted key disable the healthy siblings rotation had just selected —
+    turning a working failover into a fleet-wide outage for up to the 24h a
+    quota cooldown can last.
+
+    A no-op beyond the per-process cooldown on the in-process coordinator, and
+    never fatal: failing to publish a cooldown must not fail the request that
+    was merely unlucky enough to hit the 429.
+    """
+    cooldown_id = _fleet_cooldown_id(mdblist_key)
+    if cooldown_id is None:
+        return
+    with suppress(Exception):
+        await coord.set_backoff(
+            coord.NS_MDBLIST_GLOBAL_COOLDOWN, cooldown_id,
+            ttl_seconds=backoff_secs,
+        )
+
+
+async def _fleet_mdblist_cooling(mdblist_key: str) -> bool:
+    """True when a sibling replica has already been 429'd on this credential."""
+    cooldown_id = _fleet_cooldown_id(mdblist_key)
+    if cooldown_id is None:
+        return False
+    try:
+        return await coord.is_backoff_active(
+            coord.NS_MDBLIST_GLOBAL_COOLDOWN, cooldown_id
+        )
+    except Exception:
+        return False
+
+
+def _warm_mdblist_key_with_quota(current_key: str, now: float, reserve: int) -> str | None:
+    """
+    Pick a configured key the cache warmer may still spend: not cooling down,
+    and with unknown or above-reserve daily quota. Tries *current_key* first,
+    then its siblings in order.
+
+    Deliberately does not touch _mdblist_active_key_idx: a key at the reserve
+    floor is fine for live requests (that is what the reserve is for), so the
+    warmer moving on to a sibling must not drag live traffic along with it.
+    """
+    keys = _cfg.SERVER_MDBLIST_KEYS
+    if current_key not in keys:
+        return current_key if now >= _mdblist_key_cooldown.get(current_key, 0.0) else None
+    start = keys.index(current_key)
+    for offset in range(len(keys)):
+        candidate = keys[(start + offset) % len(keys)]
+        if now < _mdblist_key_cooldown.get(candidate, 0.0):
+            continue
+        remaining = mdblist_quota_remaining(candidate)
+        if remaining is not None and remaining <= reserve:
+            continue
+        return candidate
+    return None
+
+
 async def _background_quality_fetch(
-    imdb_id: str,
+    quality_id: str,
     media_type: str,
     season: int,
     episode: int,
@@ -492,76 +679,118 @@ async def _background_quality_fetch(
             remaining = _quality_backoff_remaining()
             if remaining > 0:
                 logger.debug(
-                    f"Quality fetch skipped for {imdb_id}; source cooldown has {remaining:.0f}s remaining"
+                    f"Quality fetch skipped for {quality_id}; source cooldown has {remaining:.0f}s remaining"
                 )
                 return
-            if _cfg.QUALITY_SOURCE == "scraper" and _cfg.SCRAPER_URL:
-                result = await _with_retry(
-                    fetch_quality_from_scraper,
-                    _HTTP_CLIENT, _cfg.SCRAPER_URL, imdb_id, media_type, season, episode, release_date,
-                )
-            else:
-                result = await _with_retry(
-                    fetch_quality_from_aiostreams,
-                    _HTTP_CLIENT, imdb_id, media_type, season, episode, release_date,
-                )
+            result = await _with_retry(
+                fetch_quality,
+                _HTTP_CLIENT, quality_id, media_type, season, episode, release_date,
+            )
             _record_quality_result(result)
-            if result is not FETCH_FAILED:
-                logger.info(f"Background quality fetch complete for {imdb_id}")
+            if result is QUALITY_PENDING:
+                # QualiCache is collecting in the background; the next request
+                # for this title picks up the value once it lands.
+                logger.info(f"Background quality fetch pending for {quality_id}")
+            elif result is not FETCH_FAILED:
+                logger.info(f"Background quality fetch complete for {quality_id}")
     except Exception as exc:
         _record_quality_result(FETCH_FAILED)
-        logger.warning(f"Background quality fetch failed for {imdb_id}: {exc}")
+        logger.warning(f"Background quality fetch failed for {quality_id}: {exc}")
     finally:
-        _quality_bg_inflight.discard(imdb_id)
+        _quality_bg_inflight.discard(quality_id)
 
 # Local imports
-from age_badge import draw_quality_age_badge, draw_tier_bar, _score_points
-from awards import sample_frosted_notch_rgb, sample_frosted_sash_rgb
-from ratings import sample_frosted_bar_rgb
-from awards import FETCH_FAILED, _RateLimited, draw_award_badge, draw_award_sash, parse_mdblist_awards, _STAR_WIN_AWARDS
+from age_badge import draw_quality_age_badge, draw_quality_corner_bookmark, draw_tier_bar, _score_points
+from landscape import build_landscape
+from awards import _dominant_cluster, _is_skin_tone, dominant_frost_rgb
+from awards import FETCH_FAILED, _RateLimited, draw_award_badge, draw_award_sash, parse_mdblist_awards, reconcile_cached_awards
+from festivals import match_festival_keyword
 from i18n import load_languages, translate_genre, translate_sash
 from cache import (
     get_cached_quality,
     get_cached_rating,
     get_cached_final_poster,
+    get_cached_final_poster_entry,
     get_cached_final_poster_url,
+    get_cached_final_poster_redirect,
     is_cached_final_poster_fresh,
-    get_cached_tmdb_poster,
     set_cached_final_poster,
+    delete_cached_final_poster,
+    get_cached_tmdb_poster,
+    get_cached_tmdb_metadata,
     get_cached_text_detection,
     set_cached_text_detection,
+    get_cached_release_status,
+    get_cached_imdb_to_tmdb,
     init_db,
-    close as close_db,
-    BACKEND_KIND as _STORAGE_KIND,
     is_digital_release,
     set_cached_rating,
     delete_cached_tmdb_metadata,
     prune_caches,
+    prune_local_caches,
+    release_status_ttl_seconds,
     get_cache_stats,
+    get_app_state,
+    set_app_state,
+    # ElfHosted fork: upstream reaches for cache.get_db() here and runs the
+    # composite request_params SELECT inline, which only works against SQLite.
+    # The query lives behind a backend function so it works on Postgres too.
+    list_composite_request_params,
+    close as close_db,
+    BACKEND_KIND as _STORAGE_KIND,
 )
 import blobstore
 import coordination as coord
 import metrics as _metrics
 from digital_release import digital_release_poll_loop
+import imdb_dataset
+from imdb_dataset import imdb_dataset_refresh_loop
 import config as _cfg
 from discovery import (
     ALL_PRIORITY_SLOTS,
-    FESTIVAL_KEYWORDS,
     DiscoveryMeta,
     extract_discovery_meta,
     pick_sash,
 )
 from quality import (
+    QUALITY_PENDING,
+    QUALITY_SOURCES,
     BadgeItem,
-    fetch_quality_from_aiostreams,
-    fetch_quality_from_scraper,
+    active_quality_source,
+    fetch_quality,
     get_resized_badge,
     parse_quality,
+    quality_source_configured,
     render_badges_left,
 )
-from ratings import calculate_weighted_score, draw_score_bar, fetch_rating, draw_score_bar_vertical, _draw_solid_pip, draw_frosted_bar, _score_color, _score_color_alt, _score_color_metal
-from tmdb import composite_logo, logo_centre_y, fetch_logo, image_language_order, fetch_poster_metadata, fetch_poster_image, fetch_backdrop_image, fetch_trending_rank, fetch_release_status, svg_logo_supported, tmdb_metadata_cache_key, _CROP_VERSION, resolve_imdb_to_tmdb
 from presets import get_preset, preset_names, preset_catalog
+from ratings import (
+    CustomScorePalette,
+    MDBLIST_QUOTA,
+    calculate_weighted_score,
+    draw_frosted_bar,
+    draw_score_bar,
+    fetch_rating,
+    is_anime_rated,
+    mdblist_quota_remaining,
+    parse_custom_score_palette,
+    score_color_for_mode,
+    _draw_solid_pip,
+    _score_color,
+    _score_color_alt,
+    _score_color_metal,
+)
+from tmdb import composite_logo, logo_centre_y, fetch_logo, image_language_order, fetch_poster_metadata, resolve_imdb_to_tmdb, fetch_poster_image, fetch_backdrop_image, fetch_landscape_image, fetch_trending_rank, fetch_trending_candidates, fetch_popular_candidates, fetch_supplemental_candidates, fetch_catalog_candidates, fetch_release_status, fetch_upcoming_movie_release, fetch_recent_movie_digital_release_date, recent_digital_release_from_cache, svg_logo_supported, tmdb_metadata_cache_key, _CROP_VERSION, _fetch_metahub_logo, LOGO_ABS_MAX_H, TEXT_FORWARD_PRIORITIES as _TEXT_FORWARD_LOGO_PRIORITIES
+
+# Logo priorities that consult the secondary preferred language ("custom").
+# Elsewhere the secondary language is inert and must be kept out of the image
+# fetch / cache key so single-language requests keep their existing cache entry.
+_SECONDARY_LANGUAGE_PRIORITIES = frozenset({
+    "native_custom_text",
+    "native_custom_original_text",
+})
+import tvdb
+import anime
 
 # ---------------------------------------------------------------------------
 # Persistent HTTP client
@@ -574,16 +803,41 @@ from presets import get_preset, preset_names, preset_catalog
 # Timeouts are split:
 #   connect=5s  — fail fast when a host is unreachable
 #   read=12s    — allow slow responses from external APIs
-#   pool=5s     — don't block forever waiting for a pool slot
+#   pool=10s    — don't block forever waiting for a pool slot, but do wait:
+#                 a request that queues a few seconds behind a burst still
+#                 renders, one that gives up is a 504 the client may cache
+#
+# The pool is sized from POSTER_RENDER_CONCURRENCY so an operator who raises
+# the render cap doesn't silently reintroduce pool exhaustion: each render
+# fans out to ~4 upstream calls at its peak, and the background loops
+# (quality fetches, TVDB, trending, warm cycles) share the same pool.
 
 _HTTP_CLIENT: httpx.AsyncClient | None = None
 
+# Peak concurrent upstream calls per render (art + logo + rating + trending).
+_HTTP_CALLS_PER_RENDER = 4
+_HTTP_POOL_MIN_CONNECTIONS = 40
+# Connections left for the loops that don't go through /poster: TVDB, trending,
+# digital-release sync, the IMDb dataset refresh.
+_HTTP_POOL_BACKGROUND_HEADROOM = 8
+
+
+def _http_pool_size(render_concurrency: int) -> int:
+    return max(
+        _HTTP_POOL_MIN_CONNECTIONS,
+        render_concurrency * _HTTP_CALLS_PER_RENDER
+        + _cfg.QUALITY_BG_CONCURRENCY
+        + _HTTP_POOL_BACKGROUND_HEADROOM,
+    )
+
+
 def _make_http_client() -> httpx.AsyncClient:
+    _max_connections = _http_pool_size(_cfg.POSTER_RENDER_CONCURRENCY)
     return httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=5.0, read=12.0, write=5.0, pool=5.0),
+        timeout=httpx.Timeout(connect=5.0, read=12.0, write=5.0, pool=10.0),
         limits=httpx.Limits(
-            max_connections=40,
-            max_keepalive_connections=20,
+            max_connections=_max_connections,
+            max_keepalive_connections=max(20, _max_connections // 2),
             keepalive_expiry=30,
         ),
         headers={
@@ -617,9 +871,240 @@ def _check_imdb_id(val: str) -> None:
         raise HTTPException(status_code=400, detail="Invalid imdb_id")
 
 
+def _normalise_optional_id(raw: str | None, name: str) -> str:
+    """Trim an optional id param, reading an unsubstituted placeholder as absent.
+
+    A template pasted into a metadata provider arrives with the placeholder
+    still in it when that provider has no id for the title — AIOMetadata's
+    optional "{name?}" form is left verbatim by older builds, and some addons
+    reject the "?" syntax outright so operators write the plain form. Either way
+    the value is "no id", not a malformed one, and 400ing it would take down
+    every poster served through that template.
+
+    Deliberately narrow: only this parameter's own two literals. Accepting any
+    brace-wrapped value would silently swallow genuine typos.
+    """
+    value = (raw or "").strip()
+    if value in ("{" + name + "}", "{" + name + "?}"):
+        return ""
+    return value
+
+
+def _canonical_rating_id(imdb_id: str, anime_key: str, tmdb_id: str) -> str:
+    """The immutable cache/coalescing identity for a request.
+
+    Chosen once, before any metadata is fetched, and never revised: it keys the
+    rating cache read, the rating cache write, the coalescing map and the
+    back-off tables, so a value that changed mid-request would read one row and
+    write another — turning every subsequent request for that title into a fresh
+    MDBList call, permanently.
+
+    An IMDb id discovered later from TMDB metadata therefore never lands here.
+    See _quality_identity() for the identity that may use it.
+
+    The "tmdb:" form can't collide with a bare TMDB id or a tt-prefixed IMDb id,
+    and matches the namespacing the anime path already stores in these columns —
+    so no migration is needed.
+    """
+    return imdb_id or anime_key or f"tmdb:{tmdb_id}"
+
+
+def _merge_imdb_dataset_rating(
+    ratings_dict, effective_imdb_id: str | None, rcfg: "RequestConfig"
+):
+    """Supply the "imdb" entry in *ratings_dict* from the local IMDb dataset.
+
+    Three modes, per rcfg.imdb_rating_source:
+
+      "mdblist"  (default) — no-op. The IMDb weight comes from MDBList like
+                             every other source.
+      "dataset"            — always override. MDBList is not consulted for
+                             this one source at all, so the weight works
+                             with no MDBList key configured.
+      "fallback"           — backfill only. MDBList's answer wins whenever
+                             it has one; the dataset fills the gap when it
+                             does not.
+
+    "fallback" is the mode that pays off for operators who do use MDBList,
+    and it covers two distinct gaps with one rule. A hard gap: MDBList was
+    rate-limited, timed out, or every configured key is cooling down, so
+    the failure path arrives here with an empty dict. And a soft gap:
+    MDBList answered fine but carried no IMDb score for this title, or
+    carried one that RATING_MIN_VOTES filtered out. Both look identical
+    from here — "imdb" is absent — so both are covered by testing for its
+    absence rather than by inspecting how the fetch went.
+
+    Note the deliberate asymmetry with fallback_to_imdb, which is a
+    *scoring* fallback: it fires when no weighted source scored at all and
+    reaches for whatever "imdb" value is present. This one fires earlier,
+    at the point the ratings are assembled, and is what puts a value there
+    for it to find. The two compose: dataset backfill, then weighting,
+    then fallback_to_imdb if the weights still produced nothing.
+
+    In every no-op case the existing MDBList behaviour is left exactly as
+    it was — this only ever adds or replaces the single "imdb" key, and
+    only when it has something to put there.
+    """
+    if not isinstance(ratings_dict, dict):
+        return ratings_dict
+    mode = rcfg.imdb_rating_source
+    if mode not in ("dataset", "fallback"):
+        return ratings_dict
+    if mode == "fallback" and ratings_dict.get("imdb") is not None:
+        return ratings_dict
+    if not effective_imdb_id:
+        return ratings_dict
+    value = imdb_dataset.get_rating(effective_imdb_id)
+    if value is None:
+        return ratings_dict
+    return {**ratings_dict, "imdb": value}
+
+
+def _ratings_base(ratings_dict):
+    """Normalise "MDBList was never asked" to an empty dict.
+
+    An instance with no MDBList key and no cached rating row resolves its
+    rating tuple from cached_ratings_dict, which is None rather than {}.
+    That is precisely the configuration the dataset / direct-TMDB sources
+    exist to serve, so it has to reach the merge helpers as a dict —
+    otherwise they are skipped, no MDBList-free source is ever consulted,
+    and the score is left as None (which the debug JSON then fails to
+    int()).
+
+    Anything that is already a dict, and any non-None sentinel such as the
+    "N/A" string, is passed through untouched: those are real answers, not
+    an absence of one.
+    """
+    return {} if ratings_dict is None else ratings_dict
+
+
+def _merge_direct_tmdb_rating(ratings_dict, tmdb_data: dict, rcfg: "RequestConfig"):
+    """Supply the "tmdb" entry in *ratings_dict* from TMDB's own vote_average.
+
+    Same three modes as _merge_imdb_dataset_rating, per
+    rcfg.tmdb_rating_source: "mdblist" (default, no-op), "direct" (always
+    override), "fallback" (backfill only when MDBList has no "tmdb" value,
+    whether because the fetch failed or because it simply carried none).
+    See that function for why absence is the right thing to test.
+
+    "fallback" is close to free here in a way it is not for the IMDb
+    dataset: there is no download, no table and no readiness window, so an
+    MDBList outage is covered for this source on an instance that has
+    opted into nothing else.
+
+    Unlike the IMDb dataset, this costs nothing extra: vote_average rides
+    along in the same TMDB details call already made for genre, year and
+    credits, so this is a pure re-use of data already in hand — no schedule,
+    no local storage, no separate opt-in infrastructure. It works with no
+    MDBList key configured at all, same rationale as the IMDb dataset source.
+
+    SCORE_NORMALISERS["tmdb"] is the identity function because MDBList's own
+    "tmdb" source is already expressed on a 0-100 scale; TMDB's API reports
+    vote_average on a 0-10 scale, so it is rescaled here to match.
+
+    RATING_MIN_VOTES applies here exactly as it does to every MDBList-sourced
+    rating (see ratings.fetch_mdblist_data), including MDBList's own "tmdb".
+    Without it this path would be the one rating source in the app with no
+    vote floor, and a single 10/10 vote on an obscure title would render a
+    score of 100.
+    """
+    if not isinstance(ratings_dict, dict):
+        return ratings_dict
+    mode = rcfg.tmdb_rating_source
+    if mode not in ("direct", "fallback"):
+        return ratings_dict
+    if mode == "fallback" and ratings_dict.get("tmdb") is not None:
+        return ratings_dict
+    vote_average = tmdb_data.get("vote_average") if tmdb_data else None
+    if vote_average is None:
+        return ratings_dict
+    try:
+        vote_average = float(vote_average)
+    except (TypeError, ValueError):
+        return ratings_dict
+    if vote_average <= 0:
+        return ratings_dict
+    vote_count = tmdb_data.get("vote_count")
+    try:
+        vote_count = int(vote_count) if vote_count is not None else None
+    except (TypeError, ValueError):
+        vote_count = None
+    if vote_count is not None and vote_count < _cfg.RATING_MIN_VOTES:
+        logger.info(
+            f"Skipping direct TMDB rating: vote_count={vote_count} < "
+            f"{_cfg.RATING_MIN_VOTES}"
+        )
+        return ratings_dict
+    return {**ratings_dict, "tmdb": vote_average * 10}
+
+
+def _quality_identity(
+    imdb_id: str, anime_key: str, effective_imdb_id: str | None
+) -> str | None:
+    """The id sent to the configured quality source, or None to skip the lookup.
+
+    Unlike the rating identity this is an *upstream* identity — Torrentio, Comet,
+    AIOStreams and QualiCache have to recognise it — so it is resolved after
+    metadata, and may use an IMDb id that only TMDB knew about.
+
+    Precedence is load-bearing. The anime-native id outranks a TMDB-discovered
+    IMDb id because it is what Stremio itself sends those addons for anime, and
+    because promoting the tt id would orphan every quality row already cached
+    under "kitsu:…". A title with no IMDb id at all yields None: there is no
+    accepted "tmdb:<id>" stream id for the ordinary sources, so the lookup is
+    skipped rather than issued in a form nothing answers.
+    """
+    return imdb_id or anime_key or effective_imdb_id or None
+
+
 def _check_type(val: str) -> None:
     if val not in _VALID_TYPES:
         raise HTTPException(status_code=400, detail="Invalid type")
+
+
+def _resolve_anime_request(
+    anilist_id: str, kitsu_id: str, stremio_id: str = ""
+) -> "tuple[str | None, int | None]":
+    """Select the anime provider for this request, or (None, None) for the
+    ordinary TMDB path.
+
+    *stremio_id* is the preferred input: it carries the raw Stremio meta id
+    ("kitsu:7442", "tt0903747", "tmdb:1396"), so a client can send it with a
+    plain, always-populated placeholder and never needs the optional "{name?}"
+    syntax that some addons reject. Non-anime ids simply yield the TMDB path.
+
+    The per-namespace params remain accepted so URLs generated before this
+    existed keep working.
+
+    A malformed per-namespace id raises 400 rather than falling through to the
+    TMDB path, where it would surface as a confusing "Invalid tmdb_id".  AniList
+    wins when both are supplied — arbitrary, but deterministic, so a client that
+    sends both always lands on the same cache entry.
+    """
+    if not _cfg.ANIME_SOURCES_ENABLED:
+        return None, None
+
+    # A raw Stremio id is never malformed from our point of view — anything we
+    # don't recognise is just a non-anime title — so it never raises.
+    namespace, parsed = anime.parse_stremio_id(stremio_id)
+    if namespace is not None:
+        return namespace, parsed
+    for namespace, raw in (("anilist", anilist_id), ("kitsu", kitsu_id)):
+        raw = (raw or "").strip()
+        if not raw:
+            continue
+        # A template pasted into a metadata provider may arrive with the
+        # placeholder unsubstituted ("{kitsu_id}") when that provider has no id
+        # for the title. Treat it as absent rather than malformed — otherwise a
+        # single anime placeholder in the URL would 400 every live-action
+        # poster served through the same template.
+        if raw.startswith("{") and raw.endswith("}"):
+            continue
+        parsed = anime.parse_anime_id(namespace, raw)
+        if parsed is None:
+            raise HTTPException(status_code=400, detail=f"Invalid {namespace}_id")
+        return namespace, parsed
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -642,9 +1127,9 @@ def _resolve_mdblist_key(query_key: str) -> str | None:
     return None
 
 
-def _rating_retry_key(imdb_id: str, mdblist_key: str) -> tuple[str, str]:
+def _rating_retry_key(canonical_id: str, mdblist_key: str) -> tuple[str, str]:
     """Identify retry state for one title on one MDBList API key."""
-    return imdb_id, mdblist_key
+    return canonical_id, mdblist_key
 
 
 def _detection_vote_ok(vote_count: int | None) -> bool:
@@ -679,7 +1164,8 @@ class RequestConfig:
     sash_poster_color:   bool = False   # diagonal sash colour derived from poster art
     cinema_greyscale:    bool = True    # greyscale art when release_status == "Cinema"
     cinema_greyscale_skip_if_available: bool = False  # keep colour if Web/Remux source found
-    release_status_cinema_only: bool = True   # only show release status when "Cinema"
+    release_status_cinema_only: bool = False  # only show release status when "Cinema"
+    release_status_dates: bool = True   # "Oct 16 Cinema" instead of Cinema / Production when TMDB has dated it
     badge_display_mode:  int  = field(default_factory=lambda: _cfg.BADGE_DISPLAY_MODE)
     rating_display_mode: int  = field(default_factory=lambda: _cfg.SHOW_RATING_DISPLAY_MODE)
 
@@ -699,6 +1185,9 @@ class RequestConfig:
     score_glow_threshold:          int   = field(default_factory=lambda: _cfg.SCORE_GLOW_THRESHOLD)
     score_glow_blur:               int   = field(default_factory=lambda: _cfg.SCORE_GLOW_BLUR)
     score_glow_alpha:              int   = field(default_factory=lambda: _cfg.SCORE_GLOW_ALPHA)
+    # Glow colour: "" = white (default), "match" = the score bar's own colour, or
+    # a 6-digit hex string for a custom colour.
+    score_glow_color:              str   = ""
     minimalist_mode_font_size_ratio:  float = field(default_factory=lambda: _cfg.MINIMALIST_MODE_FONT_SIZE_RATIO)
     minimalist_mode_font_x_offset: float = field(default_factory=lambda: _cfg.MINIMALIST_MODE_FONT_X_OFFSET)
     minimalist_mode_font_y_offset: float = field(default_factory=lambda: _cfg.MINIMALIST_MODE_FONT_Y_OFFSET)
@@ -706,22 +1195,38 @@ class RequestConfig:
     #   0 = Year (Genre + year, rating as a colour-coded pip — the original look)
     #   1 = Rating (Genre | Score, score printed as text)
     #   2 = Year + Rating (Genre | Year | Score)
+    #   3 = Split (the mode-2 group split across both margins)
     minimalist_append_mode: int = 0
+    minimalist_score_out_of_10: bool = False
+    # Centre the strip on the poster instead of hanging it off the right margin,
+    # so it sits under the logo (which is centred).  No effect under Split,
+    # whose two groups are defined by the margins they sit on.
+    minimalist_center: bool = False
+    # Separator glyphs.  The field separator (genre | year) is "pip" — the
+    # silver bar — or "bullet"; it covers Year mode's score-coloured separator
+    # too, which takes the same shape in the score's colour.  The rating
+    # separator, immediately before a printed score, adds "star" and defaults
+    # to it.  Both default to what the mode already drew, so nothing changes
+    # for anyone who doesn't ask.
+    minimalist_separator: str = "pip"
+    minimalist_rating_separator: str = "star"
 
     # Frosted bar (rating_display_mode == 4)
     bar_height_ratio:        float = 0.080
     bar_font_size_ratio:     float = 0.55
     bar_frost_opacity:       float = 0.85
+    bar_frost_saturation:    float = 1.2   # frosted colour-cast strength (0 = grey)
     bar_bottom_inset:        float = 0.0
     bar_style:               str   = "frosted"  # "frosted"|"silver"|"gold"|"rating_black"|"rating_frosted"
-    bar_accent:              str   = "silver"   # "silver"|"gold"|"palette_0"|"palette_1"|"palette_2"
+    bar_accent:              str   = "silver"   # "silver"|"gold"|"palette_0"|"palette_1"|"palette_2"|"palette_custom"
     bar_score_out_of_10:     bool  = False
-    bar_match_notch:         bool  = False  # share one frosted tint with the sash notch
     bar_append:              str   = "rating_year"  # "rating_year"|"rating"|"year"|"sash"
 
-    logo_max_w_ratio:  float = field(default_factory=lambda: _cfg.LOGO_MAX_W_RATIO)
-    logo_max_h_ratio:  float = field(default_factory=lambda: _cfg.LOGO_MAX_H_RATIO)
-    logo_bottom_ratio: float = field(default_factory=lambda: _cfg.LOGO_BOTTOM_RATIO)
+    logo_max_w_ratio:   float = field(default_factory=lambda: _cfg.LOGO_MAX_W_RATIO)
+    logo_max_h_ratio:   float = field(default_factory=lambda: _cfg.LOGO_MAX_H_RATIO)
+    logo_bottom_ratio:  float = field(default_factory=lambda: _cfg.LOGO_BOTTOM_RATIO)
+    logo_bottom_anchor:  bool  = False
+    sash_winner_star:    bool  = False
 
     badge_height:            int   = field(default_factory=lambda: _cfg.BADGE_HEIGHT)
     badge_gap:               int   = field(default_factory=lambda: _cfg.BADGE_GAP)
@@ -732,17 +1237,45 @@ class RequestConfig:
 
     movie_weights: dict | None = None
     tv_weights:    dict | None = None
+    # Opt-in weights for titles carrying an anime rating (see is_anime_rated).
+    # None means "same as movie_weights / tv_weights", which is what every URL
+    # from before these existed gets.
+    anime_movie_weights: dict | None = None
+    anime_tv_weights:    dict | None = None
     fallback_to_imdb: bool = False
+    # Where the "imdb" weight comes from. "mdblist" (default) is the MDBList
+    # response, same as every other weighted source. "dataset" looks it up
+    # locally from IMDb's own free non-commercial dataset (imdb_dataset.py),
+    # bypassing MDBList for this source entirely. "fallback" keeps MDBList as
+    # the source of truth and only consults the dataset when MDBList has no
+    # IMDb value — an outage, an exhausted key, or simply a title it has no
+    # score for. See _merge_imdb_dataset_rating.
+    imdb_rating_source: str = "mdblist"
+    # Same three modes for the "tmdb" weight, against TMDB's own vote_average
+    # from the metadata call PostersPlus already makes for genre/year/credits:
+    # "mdblist" (default), "direct" (always), "fallback" (only when MDBList
+    # has no tmdb value). Zero extra requests in every mode.
+    # See _merge_direct_tmdb_rating.
+    tmdb_rating_source: str = "mdblist"
 
     logo_language: str = field(default_factory=lambda: _cfg.DEFAULT_LOGO_LANGUAGE)
+    # Secondary preferred language ("custom").  Only consulted by the
+    # native_custom_* priorities below; blank elsewhere (and blank there degrades
+    # those modes to their non-custom equivalents).
+    logo_language_secondary: str = ""
     # Logo resolution priority.  "native" = the viewer's chosen logo_language
-    # (e.g. en); "original" = the content's own original language (e.g. ja for
-    # an anime).  "text" = render the translated title as text.
+    # (e.g. en); "custom" = logo_language_secondary; "original" = the content's
+    # own original language (e.g. ja for an anime).  "text" = render the
+    # translated title as text.
     #   "native_original" (default): native → original → text
     #   "original_native":           original → native → text
     #   "native_if_original_english": native if content is native, else English
     #                                 → original → text
-    #   "native_text":               native → text (no original-language logo)
+    #   "native_text":               native → English → neutral → text
+    #                                 (no original-language logo)
+    #   "native_custom_text":         native → custom → English → neutral → text
+    #   "native_custom_original_text": native → custom → original → English
+    #                                 → neutral → text
     logo_priority: str = "native_original"
     # Fallback-poster style for titles with no art: "minimal" (procedural textured
     # backdrop) or "photoreal" (hand-made photographic art that blends with real
@@ -759,27 +1292,110 @@ class RequestConfig:
     sash_priority: list[str] = field(default_factory=lambda: list(_cfg.SASH_PRIORITY))
     muted: bool = False
     textless: bool = False
+    top_gradient:    str = "high"   # off | low | medium | high | custom - strength of the top vignette
+    bottom_gradient: str = "high"   # off | low | medium | high | custom - strength of the bottom vignette
+    top_vignette_sash_only: bool = False
+    # Tint a vignette from the poster art instead of painting it black.  Chosen per
+    # band: the top sits under sashes, badges and the age rating while the bottom
+    # sits under the logo and rating bar, so they are not one decision.  Both draw
+    # the same whole-poster colour sample the frosted bar / notch / sash use, so a
+    # tinted vignette always agrees with them.  (Legacy `vignette_poster_color`
+    # sets both — see build_request_config.)
+    vignette_poster_color_top: bool = False
+    vignette_poster_color_bottom: bool = False
+    # Defaults for the sliders and their two toggles are what the tuning settled
+    # on; the two per-band toggles above stay off because tinting a vignette is a
+    # transformative change to every poster on a shelf and belongs opted into.
+    vignette_color_saturation: float = 2.5  # chroma of the tint (0 = plain black vignette)
+    vignette_color_lightness: float = 1.3   # scales the tint's Value (1.0 = the tuned base)
+    vignette_color_blur: float = 1.0        # 0 = follows the art, 1 = flat dominant colour
+    vignette_color_ramp: bool = True        # ramp between the poster's two colours, not one flat tint
+    vignette_color_local: bool = True       # weigh the band's own seam against the whole poster
+    top_gradient_opacity: float | None = None
+    top_gradient_height: float | None = None
+    bottom_gradient_opacity: float | None = None
+    bottom_gradient_height: float | None = None
+    hide_genre: bool = False
+    # --- Landscape (16:9) rendering -------------------------------------
+    # "portrait" (default, unchanged) | "landscape".  Landscape is a separate
+    # renderer, not a variant of the portrait layout — see landscape.py.
+    shape: str = "portrait"
+    # Which art the landscape renderer draws on:
+    #   "textless" — the language-neutral backdrop, with our logo composited
+    #   "original" — the highest-voted language-tagged backdrop (title treatment
+    #                already baked in), served as-is with no logo of ours
+    landscape_art: str = "textless"
+    # Where the info badge sits: "top_left" | "top_right" | "logo".  "logo"
+    # stacks it above the logo in textless mode; in original-art mode there is
+    # no logo of ours to stack on, so it takes the bottom-left slot itself.
+    landscape_badge_pos: str = "top_left"
     score_color_mode: int = 2
-    top_gradient:    str = "high"   # off | low | medium | high — strength of the top vignette
-    bottom_gradient: str = "high"   # off | low | medium | high — strength of the bottom vignette
+    score_custom_palette: CustomScorePalette | None = None
     sash_badge: bool = False              # legacy; superseded by sash_mode (kept for back-compat parsing)
     sash_mode: str = "sash"               # "sash" (diagonal) | "notch"
     sash_badge_style:  str   = "frosted" # "silver" | "gold" | "frosted"
     sash_badge_size_w: float = 1.05      # horizontal scale of badge
     sash_badge_size_h: float = 1.05      # vertical scale of badge
     sash_badge_inset: float = 0.0          # top-edge offset as fraction of poster height (± small)
+    sash_badge_pad:   float = 1.0          # vertical padding scale (<1 tightens top/bottom space)
     sash_badge_font_ratio:   float = 0.43  # font size as fraction of badge height
     sash_badge_frost_opacity: float = 0.75 # frosted overlay opacity (0.0–1.0)
+    sash_badge_frost_saturation: float = 1.2 # frosted colour-cast strength (0 = grey)
+    # Take the frosted notch's colour from whatever a tinted vignette landed on,
+    # instead of from its own whole-poster sample.  Ignored when neither band is
+    # tinted, or when the band that is came out too near black to have a colour.
+    notch_vignette_color: bool = False
+    # Reference colour mode: match the frosted tint to the poster's true colour
+    # (bolder, un-pastel) instead of the saturation-scaled frosted tint. Global.
+    frost_reference:         bool  = False
     sash_length_ratio: float = 1.15  # diagonal sash length as fraction of poster width
     sash_height_ratio: float = 0.12  # diagonal sash height (thickness) as fraction of poster width
     wait_for_quality: bool = False  # block response until quality is fetched (for poster-warm workflows)
     greyscale_no_quality: bool = False  # greyscale art when no quality found (needs wait_for_quality)
+    rating_text_color: tuple[int, int, int] | None = None
+    sash_text_color:   tuple[int, int, int] | None = None
 
 
 def _parse_bool(val: str | None, default: bool) -> bool:
     if val is None:
         return default
     return val.strip().lower() not in ("0", "false", "no")
+
+
+def _parse_hex_color(val: str | None) -> tuple[int, int, int] | None:
+    if not val:
+        return None
+    v = val.strip().lstrip("#")
+    if len(v) != 6:
+        return None
+    try:
+        return (int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16))
+    except ValueError:
+        return None
+
+
+def _select_rating_weights(
+    ratings: dict,
+    media_type: str,
+    *,
+    anime_native: bool,
+    movie_weights: dict,
+    tv_weights: dict,
+    anime_movie_weights: dict,
+    anime_tv_weights: dict,
+) -> dict:
+    """The weight set a title scores with.
+
+    A title is anime when it carries a rating from an anime source, or was
+    requested by anime id — the same fact known before the fetch, and the one
+    that still holds when the provider returned no score. The caller passes
+    the movie/TV set again as the anime set when the request named no anime
+    weights, which is what keeps pre-existing URLs scoring as they always did.
+    """
+    anime = anime_native or is_anime_rated(ratings)
+    if media_type in ("tv", "series"):
+        return anime_tv_weights if anime else tv_weights
+    return anime_movie_weights if anime else movie_weights
 
 
 def _parse_weights(raw: str | None, sources: list[str]) -> dict | None:
@@ -800,20 +1416,82 @@ def _parse_weights(raw: str | None, sources: list[str]) -> dict | None:
     return out if out else None
 
 
+# A sash_priority value that opens with this token is a *diff* against the
+# default order rather than a replacement for it.  Spelling it out keeps the
+# legacy form untouched: an all-exclusions value like "-cult" still means "only
+# these slots", which is how the configurator says "every sash off", and
+# quietly reinterpreting that as "default minus cult" would switch sashes back
+# on for anyone who had turned them all off.
+_SASH_DIFF_SEED = "default"
+
+
+def _apply_sash_diff(tokens: list[str]) -> list[str]:
+    """Default order, with "-slot" removals and "slot@N" moves applied in order.
+
+    Written for URL length: the full order is 30 slots and ~350 characters, and
+    a URL carrying it is most of the way to the 2000-character ceiling some
+    metadata clients enforce.  Most people move one or two slots, which this
+    says in a dozen characters.
+
+    Unknown slots and unparseable positions are skipped rather than rejected, on
+    the same principle as the legacy branch — a URL that half-parses still
+    renders a poster, where a 400 renders nothing.
+    """
+    order = list(_cfg.SASH_PRIORITY)
+    for token in tokens:
+        if token == _SASH_DIFF_SEED:
+            continue
+        if token.startswith("-"):
+            slot = token[1:]
+            if slot in order:
+                order.remove(slot)
+            continue
+        slot, _, position = token.partition("@")
+        if slot not in ALL_PRIORITY_SLOTS:
+            continue
+        if position:
+            try:
+                index = int(position)
+            except ValueError:
+                continue
+            if slot in order:
+                order.remove(slot)
+            order.insert(max(0, min(index, len(order))), slot)
+        elif slot not in order:
+            order.append(slot)
+    return order
+
+
 def _parse_sash_priority(raw: str | None) -> list[str]:
     if not raw:
         return list(_cfg.SASH_PRIORITY)
     tokens = [s.strip() for s in raw.split(",") if s.strip()]
+
+    if tokens and tokens[0] == _SASH_DIFF_SEED:
+        return _apply_sash_diff(tokens[1:])
     # Tokens prefixed with "-" are explicit exclusions
     excluded  = {t[1:] for t in tokens if t.startswith("-") and t[1:] in ALL_PRIORITY_SLOTS}
     active    = [t      for t in tokens if not t.startswith("-") and t in ALL_PRIORITY_SLOTS]
+
+    # Back-compat: the legacy combined "structural" / "release_status" tokens
+    # expand in place to their granular slots so older saved URLs keep working.
+    if "structural" in active:
+        idx = active.index("structural")
+        expanded = [s for s in ["short_film", "mini_series", "binge_ready"] if s not in excluded and s not in active]
+        active = active[:idx] + expanded + active[idx+1:]
+        
+    if "release_status" in active:
+        idx = active.index("release_status")
+        expanded = [s for s in ["cinema", "streaming", "physical", "production", "ended", "cancelled", "airing"] if s not in excluded and s not in active]
+        active = active[:idx] + expanded + active[idx+1:]
+        
+    # An empty, exclusion-free selection means no real sash config was supplied,
+    # so fall back to the full default set. Otherwise the explicit selection is
+    # authoritative: slots the user did not list are omitted rather than
+    # force-appended, so sashes added in a newer version stay off until the user
+    # opts in (re-import the old URL, then enable the new sashes).
     if not active and not excluded:
         return list(_cfg.SASH_PRIORITY)
-    # Append any default slots that weren't explicitly listed or excluded
-    active_set = set(active)
-    for slot in _cfg.SASH_PRIORITY:
-        if slot not in active_set and slot not in excluded:
-            active.append(slot)
     return active
 
 
@@ -858,6 +1536,7 @@ def build_request_config(params: dict) -> RequestConfig:
     cfg.cinema_greyscale        = _b("cinema_greyscale",       cfg.cinema_greyscale)
     cfg.cinema_greyscale_skip_if_available = _b("cinema_greyscale_skip_if_available", cfg.cinema_greyscale_skip_if_available)
     cfg.release_status_cinema_only = _b("release_status_cinema_only", cfg.release_status_cinema_only)
+    cfg.release_status_dates    = _b("release_status_dates",   cfg.release_status_dates)
     cfg.muted                   = _b("muted",                  cfg.muted)
     cfg.score_out_of_10         = _b("score_out_of_10",        cfg.score_out_of_10)
     cfg.textless                = _b("textless",               cfg.textless)
@@ -871,6 +1550,8 @@ def build_request_config(params: dict) -> RequestConfig:
         cfg.top_gradient = "high"
     elif _tg_raw in ("false", "0", "no"):
         cfg.top_gradient = "off"
+    elif _tg_raw == "custom":
+        cfg.top_gradient = "custom"
     # else: leave RequestConfig default ("high")
 
     # bottom_gradient — same four-level enum as top.  Brand-new param so no
@@ -879,6 +1560,50 @@ def build_request_config(params: dict) -> RequestConfig:
     _bg_raw = (params.get("bottom_gradient") or "").strip().lower()
     if _bg_raw in _BOTTOM_GRADIENT_LEVELS:
         cfg.bottom_gradient = _bg_raw
+    elif _bg_raw == "custom":
+        cfg.bottom_gradient = "custom"
+
+    cfg.top_vignette_sash_only = _b("top_vignette_sash_only", cfg.top_vignette_sash_only)
+    # vignette_poster_color was a single toggle covering both bands before they were
+    # split. Honour it as the default for each side so existing URLs and presets
+    # keep rendering identically; an explicit per-band param wins over it.
+    _vpc_legacy = _b("vignette_poster_color", False)
+    cfg.vignette_poster_color_top    = _b("vignette_poster_color_top",    _vpc_legacy)
+    cfg.vignette_poster_color_bottom = _b("vignette_poster_color_bottom", _vpc_legacy)
+    cfg.vignette_color_saturation = _f("vignette_color_saturation", cfg.vignette_color_saturation, 0.0, 3.0)
+    cfg.vignette_color_blur       = _f("vignette_color_blur",       cfg.vignette_color_blur,       0.0, 1.0)
+    cfg.vignette_color_lightness  = _f("vignette_color_lightness",  cfg.vignette_color_lightness,
+                                       _VIGNETTE_LIGHT_MIN, _VIGNETTE_LIGHT_MAX)
+    cfg.vignette_color_ramp    = _b("vignette_color_ramp",    cfg.vignette_color_ramp)
+    cfg.vignette_color_local   = _b("vignette_color_local",   cfg.vignette_color_local)
+    val_tgo = params.get("top_gradient_opacity")
+    if val_tgo is not None:
+        try: cfg.top_gradient_opacity = float(val_tgo)
+        except ValueError: pass
+    val_tgh = params.get("top_gradient_height")
+    if val_tgh is not None:
+        try: cfg.top_gradient_height = float(val_tgh)
+        except ValueError: pass
+    val_bgo = params.get("bottom_gradient_opacity")
+    if val_bgo is not None:
+        try: cfg.bottom_gradient_opacity = float(val_bgo)
+        except ValueError: pass
+    val_bgh = params.get("bottom_gradient_height")
+    if val_bgh is not None:
+        try: cfg.bottom_gradient_height = float(val_bgh)
+        except ValueError: pass
+    cfg.hide_genre = _b("hide_genre", cfg.hide_genre)
+
+    _shape = (params.get("shape") or "").strip().lower()
+    if _shape in ("portrait", "landscape"):
+        cfg.shape = _shape
+    _ls_art = (params.get("landscape_art") or "").strip().lower()
+    if _ls_art in ("textless", "original"):
+        cfg.landscape_art = _ls_art
+    _ls_badge = (params.get("badge_pos") or "").strip().lower()
+    if _ls_badge in ("top_left", "top_right", "logo"):
+        cfg.landscape_badge_pos = _ls_badge
+
     cfg.sash_badge              = _b("sash_badge",              cfg.sash_badge)
     # sash_mode supersedes the legacy sash_badge bool; fall back to it for old
     # URLs/presets (sash_badge=true → notch, false → diagonal sash).
@@ -890,8 +1615,11 @@ def build_request_config(params: dict) -> RequestConfig:
     elif "sash_badge" in params:
         cfg.sash_mode = "notch" if cfg.sash_badge else "sash"
     cfg.sash_badge_inset         = _f("sash_badge_inset",         cfg.sash_badge_inset,         -0.02, 0.02)
+    cfg.sash_badge_pad           = _f("sash_badge_pad",           cfg.sash_badge_pad,           0.5, 1.5)
     cfg.sash_badge_font_ratio    = _f("sash_badge_font_ratio",    cfg.sash_badge_font_ratio,    0.10, 1.0)
     cfg.sash_badge_frost_opacity = _f("sash_badge_frost_opacity", cfg.sash_badge_frost_opacity, 0.0, 1.0)
+    cfg.sash_badge_frost_saturation = _f("sash_badge_frost_saturation", cfg.sash_badge_frost_saturation, 0.0, 2.0)
+    cfg.notch_vignette_color        = _b("notch_vignette_color", cfg.notch_vignette_color)
     cfg.sash_badge_size_w       = _f("sash_badge_size_w",       cfg.sash_badge_size_w,       0.5, 2.0)
     cfg.sash_badge_size_h       = _f("sash_badge_size_h",       cfg.sash_badge_size_h,       0.5, 2.0)
     _style_raw = params.get("sash_badge_style", cfg.sash_badge_style)
@@ -901,8 +1629,9 @@ def build_request_config(params: dict) -> RequestConfig:
     cfg.sash_height_ratio       = _f("sash_height_ratio",      cfg.sash_height_ratio,      0.06, 0.20)
     cfg.wait_for_quality        = _b("wait_for_quality",        cfg.wait_for_quality)
     cfg.greyscale_no_quality    = _b("greyscale_no_quality",    cfg.greyscale_no_quality)
-    cfg.score_color_mode        = _i("score_color_mode",       cfg.score_color_mode,       0,   2)
-    cfg.badge_display_mode      = _i("badge_display_mode",     cfg.badge_display_mode,     0,   5)
+    cfg.score_color_mode        = _i("score_color_mode",       cfg.score_color_mode,       0,   3)
+    cfg.score_custom_palette    = parse_custom_score_palette(params.get("score_custom_palette"))
+    cfg.badge_display_mode      = _i("badge_display_mode",     cfg.badge_display_mode,     0,   6)
     cfg.rating_display_mode     = _i("rating_display_mode",    cfg.rating_display_mode,    0,   4)
 
     if "show_quality_badges" in params and "badge_display_mode" not in params:
@@ -924,30 +1653,50 @@ def build_request_config(params: dict) -> RequestConfig:
     # above ~50 starts measurably slowing the render.  Hard cap at 50.
     cfg.score_glow_blur               = _i("score_glow_blur",               cfg.score_glow_blur,               0,   50)
     cfg.score_glow_alpha              = _i("score_glow_alpha",              cfg.score_glow_alpha,              0,   255)
+    _gc_raw = (params.get("score_glow_color") or "").strip().lstrip("#").lower()
+    if _gc_raw == "match":
+        cfg.score_glow_color = "match"
+    elif len(_gc_raw) == 6 and all(ch in "0123456789abcdef" for ch in _gc_raw):
+        cfg.score_glow_color = _gc_raw
+    else:
+        cfg.score_glow_color = ""
     cfg.minimalist_mode_font_size_ratio = _f("minimalist_mode_font_size_ratio", cfg.minimalist_mode_font_size_ratio, 0.0, 0.5)
     cfg.minimalist_mode_font_x_offset = _f("minimalist_mode_font_x_offset", cfg.minimalist_mode_font_x_offset, 0.0, 1.0)
     cfg.minimalist_mode_font_y_offset = _f("minimalist_mode_font_y_offset", cfg.minimalist_mode_font_y_offset, 0.0, 1.0)
-    cfg.minimalist_append_mode = _i("minimalist_append_mode", cfg.minimalist_append_mode, 0, 2)
+    cfg.minimalist_append_mode = _i("minimalist_append_mode", cfg.minimalist_append_mode, 0, 3)
+    cfg.minimalist_score_out_of_10 = _b("minimalist_score_out_of_10", cfg.minimalist_score_out_of_10)
+    cfg.minimalist_center = _b("minimalist_center", cfg.minimalist_center)
+    _msep = (params.get("minimalist_separator") or "").strip().lower()
+    if _msep in ("pip", "bullet"):
+        cfg.minimalist_separator = _msep
+    # "star" only here: it labels the score it sits in front of, so it has
+    # nothing to say between a genre and a year.
+    _mrsep = (params.get("minimalist_rating_separator") or "").strip().lower()
+    if _mrsep in ("pip", "bullet", "star"):
+        cfg.minimalist_rating_separator = _mrsep
 
     cfg.bar_height_ratio        = _f("bar_height_ratio",        cfg.bar_height_ratio,        0.04, 0.20)
     cfg.bar_font_size_ratio     = _f("bar_font_size_ratio",     cfg.bar_font_size_ratio,     0.15, 0.70)
     cfg.bar_frost_opacity       = _f("bar_frost_opacity",       cfg.bar_frost_opacity,       0.0,  1.0)
+    cfg.bar_frost_saturation    = _f("bar_frost_saturation",    cfg.bar_frost_saturation,    0.0,  2.0)
+    cfg.frost_reference         = _b("frost_reference",         cfg.frost_reference)
     cfg.bar_bottom_inset        = _f("bar_bottom_inset",        cfg.bar_bottom_inset,        0.0,  0.10)
     _bst = (params.get("bar_style") or "").strip().lower()
     if _bst in ("frosted", "pure_black", "silver", "gold", "rating_black", "rating_frosted"):
         cfg.bar_style = _bst
     _bac = (params.get("bar_accent") or "").strip().lower()
-    if _bac in ("silver", "gold", "sample", "palette_0", "palette_1", "palette_2"):
+    if _bac in ("silver", "gold", "sample", "palette_0", "palette_1", "palette_2", "palette_custom"):
         cfg.bar_accent = _bac
     cfg.bar_score_out_of_10     = _b("bar_score_out_of_10",     cfg.bar_score_out_of_10)
-    cfg.bar_match_notch         = _b("bar_match_notch",         cfg.bar_match_notch)
     _bap = (params.get("bar_append") or "").strip().lower()
     if _bap in ("rating_year", "rating", "year", "sash"):
         cfg.bar_append = _bap
 
-    cfg.logo_max_w_ratio  = _f("logo_max_w_ratio",  cfg.logo_max_w_ratio,  0.0, 1.5)
-    cfg.logo_max_h_ratio  = _f("logo_max_h_ratio",  cfg.logo_max_h_ratio,  0.0, 1.0)
-    cfg.logo_bottom_ratio = _f("logo_bottom_ratio", cfg.logo_bottom_ratio, 0.0, 1.0)
+    cfg.logo_max_w_ratio   = _f("logo_max_w_ratio",   cfg.logo_max_w_ratio,  0.0, 1.5)
+    cfg.logo_max_h_ratio   = _f("logo_max_h_ratio",   cfg.logo_max_h_ratio,  0.0, 1.0)
+    cfg.logo_bottom_ratio  = _f("logo_bottom_ratio",  cfg.logo_bottom_ratio, 0.0, 1.0)
+    cfg.logo_bottom_anchor = _b("logo_bottom_anchor", cfg.logo_bottom_anchor)
+    cfg.sash_winner_star   = _b("sash_winner_star",   cfg.sash_winner_star)
 
     # badge_height in pixels — generous enough to cover any reasonable customisation
     # but well below the size that would cost real memory on resize.
@@ -965,15 +1714,34 @@ def build_request_config(params: dict) -> RequestConfig:
 
     tv_sources = list(_cfg.TV_WEIGHTS.keys())
     cfg.tv_weights = _parse_weights(params.get("tv_weights"), tv_sources)
+    cfg.anime_movie_weights = _parse_weights(
+        params.get("anime_movie_weights"), list(_cfg.ANIME_MOVIE_SOURCES)
+    )
+    cfg.anime_tv_weights = _parse_weights(
+        params.get("anime_tv_weights"), list(_cfg.ANIME_TV_SOURCES)
+    )
     cfg.fallback_to_imdb = _b("fallback_to_imdb", cfg.fallback_to_imdb)
+    _irs = params.get("imdb_rating_source", cfg.imdb_rating_source).strip().lower()
+    cfg.imdb_rating_source = (
+        _irs if _irs in ("mdblist", "dataset", "fallback") else cfg.imdb_rating_source
+    )
+    _trs = params.get("tmdb_rating_source", cfg.tmdb_rating_source).strip().lower()
+    cfg.tmdb_rating_source = (
+        _trs if _trs in ("mdblist", "direct", "fallback") else cfg.tmdb_rating_source
+    )
 
     cfg.logo_language        = (params.get("logo_language", cfg.logo_language).strip().lower())
+    cfg.logo_language_secondary = (
+        params.get("logo_language_secondary", cfg.logo_language_secondary).strip().lower()
+    )
     _lp = params.get("logo_priority")
     if _lp in (
         "native_original",
         "original_native",
         "native_if_original_english",
         "native_text",
+        "native_custom_text",
+        "native_custom_original_text",
     ):
         cfg.logo_priority = _lp
     elif "logo_native_fallback" in params:
@@ -987,6 +1755,8 @@ def build_request_config(params: dict) -> RequestConfig:
     if _oas in ("primary", "top_rated"):
         cfg.original_art_source = _oas
     cfg.sash_priority        = _parse_sash_priority(params.get("sash_priority"))
+    cfg.rating_text_color    = _parse_hex_color(params.get("rating_text_color"))
+    cfg.sash_text_color      = _parse_hex_color(params.get("sash_text_color"))
 
     return cfg
 
@@ -1056,6 +1826,735 @@ _BOTTOM_GRADIENT_LEVELS: dict[str, tuple[float, int] | None] = {
 # other.
 _BOTTOM_GRADIENT_CURVE = 1.5
 
+# --- Poster-coloured vignette ------------------------------------------------
+# HSV Value and Saturation of the tint at full slider strength.  Both are keyed
+# to the *slider*, never to how saturated the source art happens to be: the art
+# contributes hue, the slider contributes intensity.  Deriving intensity from the
+# source instead made output wildly inconsistent across a shelf — a vivid red
+# poster earned both more chroma and more Value and blew out, while a muted one
+# was scaled down twice over and barely showed at the same setting.
+_VIGNETTE_TINT_V = 0.38
+_VIGNETTE_TINT_S = 1.00
+# Slider value at which the tint reaches that full strength.  This is the top of
+# the configurator's range, so the slider maps linearly onto 0 → full.
+_VIGNETTE_SAT_FULL = 3.0
+# The lightness slider scales _VIGNETTE_TINT_V and nothing else, so 1.0 is exactly
+# the tuned value above and the two ends are a near-black band and an airy wash of
+# the same hue.  It deliberately does *not* relax the chroma ceiling: that ceiling
+# exists to stop a band overpowering the art, and a lighter band overpowers more,
+# not less.  Raising lightness alone therefore lifts the band and lets the cap
+# take the colour back out of it — ask for both and you raise saturation too.
+_VIGNETTE_LIGHT_MIN = 0.4
+_VIGNETTE_LIGHT_MAX = 2.5
+# Noise gate on the sampled hue, in chroma (Value × Saturation): below _FLOOR the
+# sample is treated as colourless and the vignette stays black, reaching full
+# trust at _SOLID.  Deliberately generous — this exists only to reject greyscale
+# art and near-black shadow noise, NOT to scale down honestly muted palettes,
+# which is the mistake that made low-saturation posters need a high Value before
+# they read at all.
+_VIGNETTE_HUE_FLOOR = 0.02
+_VIGNETTE_HUE_SOLID = 0.08
+# --- Which hue the poster is "made of" ---------------------------------------
+# The tint's hue is chosen from a chroma-weighted hue histogram of the whole
+# poster rather than from its largest colour cluster.  A cluster pick answers
+# "what is the biggest single colour here", which is the wrong question: it let a
+# red coat covering 1.6% of an otherwise black-and-white Schindler's List beat the
+# greyscale it stands in, and let a saturated 8% brown outrank the pale blue that
+# is half of a hazy landscape.  Summing chroma per hue instead answers "how much
+# of this poster is actually this colour", which is what a whole-band wash needs.
+_VIGNETTE_HUE_BINS = 36
+# Bins either side of a peak that count toward it.  Colour in real art is spread
+# over neighbouring hues — a sunset is not one hue but a band of them — so support
+# is measured over a family (±3 bins ≈ ±30°), not a single slice.
+_VIGNETTE_HUE_SPAN = 3
+# Faces are everywhere in poster art and are nobody's idea of a poster's colour,
+# but they are still part of it — a sepia portrait really is warm.  Half weight
+# keeps skin from *deciding* the hue while letting it corroborate one.
+_VIGNETTE_SKIN_WEIGHT = 0.5
+# ...and a pixel too dark to read as a colour doesn't get a vote at all, however
+# chromatic it measures.  This is where invented reds come from, and why they are
+# nearly always red: black in real artwork is not neutral.  The Wire's lower half
+# is RGB (13, 4, 3) — the eye calls that black, but it is HSV Saturation 0.79 at
+# hue 0.02, and there is enough of it to outvote the poster's actual yellow.  Film
+# stock, colour grading and chroma subsampling all leave warm residue in the
+# shadows; almost nothing leaves green or blue residue there, which is why one
+# colour kept turning up in posters that hadn't got it.  Chroma weighting alone
+# doesn't save you: each pixel counts for little, but half a poster of them adds
+# up to more support than a real colour covering a tenth of it.
+_VIGNETTE_DARK_FLOOR = 0.06   # below this Value a pixel's hue is discarded
+_VIGNETTE_DARK_SOLID = 0.16   # ...and above this it is trusted in full
+# Support (mean chroma per pixel landing in one hue family) at which the tint is
+# fully trusted, and below which it fades to black.  This is the whole
+# black-and-white answer: a poster whose colour is one small prop scores an order
+# of magnitude below one that is genuinely graded, so it keeps the plain black
+# vignette instead of announcing an accent nothing else in the art supports.
+_VIGNETTE_SUPPORT_LOW  = 0.006
+_VIGNETTE_SUPPORT_FULL = 0.028
+# A peak is only worth taking if it actually beat the alternatives.  Where a strip
+# of art is two colours in equal measure — a red jacket against a teal sky, at the
+# depth where the band happens to meet both — the winner is decided by a rounding
+# difference, and the band paints a colour the strip is only half made of.  Worse,
+# it is unstable: the same poster re-encoded picks the other one.  So the tint
+# fades out as its nearest real rival closes in, and a dead heat lands on black,
+# which is the honest answer to "what colour is this" when there are two.
+_VIGNETTE_RIVAL_HUE   = 0.15   # hue distance at which a rival is a *different* colour
+_VIGNETTE_RIVAL_CLEAR = 0.75   # rival/peak below this is a clear win, above it fades
+# Confidence a band has to reach before a frosted notch is allowed to match it.
+# The colour a low-confidence band paints is mostly black however vivid the hue it
+# was found from, and a notch matching that hue would be the one thing on the
+# poster wearing it — the opposite of the agreement the option is asking for.
+_VIGNETTE_MATCH_MIN_CONF = 0.35
+# Perceived brightness of a fully saturated hue swings roughly 8x between blue
+# and yellow at one HSV Value, so matching Value alone still leaves a shelf
+# uneven — it only moves which posters shout.  Pull each hue part of the way
+# toward a common luminance instead: 0.0 would keep raw Value, 1.0 would match
+# luminance exactly and drive blue to a clipped, garish extreme (it cannot be
+# bright without being vivid).  Half cuts the spread from ~8x to under 3x while
+# leaving every hue inside its natural range.
+_VIGNETTE_LUMA_REF     = 0.40
+_VIGNETTE_LUMA_CORRECT = 0.5
+# ...and of that correction, the share taken out of Saturation rather than Value
+# when a hue is *brighter* than the reference.  There is no such thing as a dark
+# yellow: drop a gold's Value far enough to match a blue's luminance and it stops
+# reading as gold and starts reading as olive mud, which is exactly what made
+# yellow and amber posters the worst outputs on a shelf.  Spending half the
+# correction on chroma instead lands the same luminance as a paler, cleaner gold.
+# Only bright hues are affected — a blue or red is already darker than the
+# reference and keeps its full Value boost.
+_VIGNETTE_LUMA_SAT_SHARE = 0.5
+_LUMA_COEFFS = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+# Ceiling on how *colourful* the tint is allowed to be, as CIELAB C* at full
+# slider — the other half of the same job the luma correction above does.  Value
+# and Saturation say nothing about perceived colourfulness: at one luminance a red
+# or a violet carries roughly twice the chroma of a gold or a teal, which is why a
+# shelf matched for brightness still had a few bands that took the poster over
+# while the rest sat under it.  Everything the eye called pleasant measured 15–19,
+# everything called too much measured 29–50, so the budget is set just above the
+# pleasant band and scaled by the slider, leaving the slider live across its range.
+_VIGNETTE_TINT_MAX_CHROMA = 27.0
+_SRGB_TO_XYZ = np.array([[0.4124, 0.3576, 0.1805],
+                         [0.2126, 0.7152, 0.0722],
+                         [0.0193, 0.1192, 0.9505]], dtype=np.float32)
+_D65_WHITE   = np.array([0.95047, 1.0, 1.08883], dtype=np.float32)
+
+
+def _lab_chroma(rgb: np.ndarray) -> np.ndarray:
+    """CIELAB C* of an sRGB array shaped (..., 3) on 0–255.
+
+    Perceptual chroma, not HSV Saturation: the point is to compare how colourful
+    two different hues look, which HSV cannot answer — a fully saturated navy and
+    a fully saturated gold are both S=1 and nowhere near each other on the eye.
+    """
+    c = np.clip(rgb, 0.0, 255.0) / 255.0
+    lin = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+    xyz = (lin @ _SRGB_TO_XYZ.T) / _D65_WHITE
+    f   = np.where(xyz > 0.008856, np.cbrt(xyz), 7.787 * xyz + 16.0 / 116.0)
+    return np.hypot(500.0 * (f[..., 0] - f[..., 1]), 200.0 * (f[..., 1] - f[..., 2]))
+
+
+def _vignette_hue_profile(
+    poster: Image.Image, rows: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """(rgb, hue, weight, support) for a poster, as flat 64x64 fields plus a
+    per-hue-family support curve.
+
+    ``rows`` optionally weights each row of the region before anything else —
+    used to fade out the part of a seam the band will hide (see
+    _vignette_band_colour).  It is resampled to the working height, so it can be
+    given at the region's own resolution.
+
+    ``weight`` is each pixel's chroma — max minus min channel — so neutrals
+    contribute nothing at any brightness, unlike HSV Saturation which explodes on
+    near-black (pure black plus a little warm noise reads S=0.22 and used to hand
+    black-and-white art an invented olive tint).  It is then faded out over the
+    shadows, where a hue is measurable but not visible, and halved over skin; see
+    _VIGNETTE_DARK_FLOOR and _VIGNETTE_SKIN_WEIGHT.
+
+    ``support[i]`` is the mean weight per pixel falling in bin ``i``'s hue family,
+    i.e. how much of the poster is that colour.  It is both how the hue is chosen
+    (the peak) and how far the tint is trusted (the peak's height).
+    """
+    a = np.asarray(poster.convert("RGB").resize((64, 64), Image.Resampling.BOX),
+                   dtype=np.float32) / 255.0
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    maxc = a.max(axis=-1)
+    chroma = maxc - a.min(axis=-1)
+    safe = np.maximum(chroma, 1e-6)
+    hue = np.where(maxc == r, ((g - b) / safe) % 6.0,
+          np.where(maxc == g, (b - r) / safe + 2.0, (r - g) / safe + 4.0)) / 6.0
+    hue = np.where(chroma <= 1e-6, 0.0, hue)
+    sat = np.where(maxc > 0, chroma / np.maximum(maxc, 1e-6), 0.0)
+    # Vectorised _is_skin_tone (awards.py) — same warm R>G>B band, same limits.
+    skin = ((r > g) & (g > b) & (hue >= 0.015) & (hue <= 0.11)
+            & (sat >= 0.20) & (sat <= 0.68) & (maxc >= 0.35))
+    weight = chroma * np.where(skin, _VIGNETTE_SKIN_WEIGHT, 1.0)
+    weight *= np.clip((maxc - _VIGNETTE_DARK_FLOOR)
+                      / (_VIGNETTE_DARK_SOLID - _VIGNETTE_DARK_FLOOR), 0.0, 1.0)
+    if rows is not None and len(rows):
+        n = weight.shape[0]
+        weight = weight * np.interp(
+            np.linspace(0.0, 1.0, n), np.linspace(0.0, 1.0, len(rows)), rows
+        ).astype(np.float32)[:, None]
+    idx = np.minimum((hue * _VIGNETTE_HUE_BINS).astype(np.int32), _VIGNETTE_HUE_BINS - 1)
+    hist = np.bincount(idx.ravel(), weights=weight.ravel(),
+                       minlength=_VIGNETTE_HUE_BINS) / weight.size
+    support = np.zeros(_VIGNETTE_HUE_BINS, dtype=np.float64)
+    for offset in range(-_VIGNETTE_HUE_SPAN, _VIGNETTE_HUE_SPAN + 1):
+        # Triangular window, wrapped: hue is circular, so bin 35 neighbours bin 0.
+        support += (1.0 - abs(offset) / (_VIGNETTE_HUE_SPAN + 1)) * np.roll(hist, -offset)
+    return a, hue, weight, support
+
+
+def _vignette_family_rgb(
+    a: np.ndarray, hue: np.ndarray, weight: np.ndarray, centre: float
+) -> tuple[float, float, float] | None:
+    """The art's own colour at hue ``centre``: the weighted mean of the pixels in
+    that family, pulled back onto the family's hue.
+
+    Averaging alone drifts the hue toward whatever else is nearby, which is how a
+    family's own colour comes back as a slightly different one.  Saturation and
+    Value are kept from the art, so the result is still a colour the poster has.
+    """
+    dh = np.abs(hue - centre)
+    dh = np.minimum(dh, 1.0 - dh)
+    mask = (dh <= (_VIGNETTE_HUE_SPAN + 0.5) / _VIGNETTE_HUE_BINS) * weight
+    total = mask.sum()
+    if total <= 0:
+        return None
+    import colorsys
+    mean = [float((a[..., i] * mask).sum() / total) for i in range(3)]
+    _h, s, v = colorsys.rgb_to_hsv(*mean)
+    return tuple(c * 255.0 for c in colorsys.hsv_to_rgb(centre, s, v))
+
+
+def _vignette_hue_pick(
+    poster: Image.Image, rows: np.ndarray | None = None,
+) -> tuple[tuple[float, float, float] | None, float]:
+    """(tint colour, confidence) for a region — the hue the most of it is made of.
+
+    ``confidence`` answers "is this colour really what the art is", and it is the
+    same number that chose the hue: the support behind the winning family.  A
+    poster that is genuinely graded — a cold war photo, a navy Terminator, a teal
+    landscape — clears _VIGNETTE_SUPPORT_FULL even when muted, because the cast
+    covers it.  A black-and-white one whose only colour is a coat or a face fades
+    to black instead, and both a plain grey and a warm off-white read as no colour
+    at all.  The tint is never invented, only found.
+    """
+    a, hue, weight, support = _vignette_hue_profile(poster, rows)
+    peak = int(np.argmax(support))
+    return (_vignette_family_rgb(a, hue, weight, (peak + 0.5) / _VIGNETTE_HUE_BINS),
+            _vignette_hue_confidence(support, peak))
+
+
+def _vignette_hue_confidence(support: np.ndarray, peak: int) -> float:
+    """How far a hue peak is to be trusted: how much of the art carries it, and
+    how clearly it beat the best rival far enough away to be a different colour
+    rather than its own family's shoulder."""
+    conf = (support[peak] - _VIGNETTE_SUPPORT_LOW) / (_VIGNETTE_SUPPORT_FULL - _VIGNETTE_SUPPORT_LOW)
+    bins  = np.arange(_VIGNETTE_HUE_BINS)
+    apart = np.minimum(np.abs(bins - peak), _VIGNETTE_HUE_BINS - np.abs(bins - peak))
+    rival = support[apart >= _VIGNETTE_RIVAL_HUE * _VIGNETTE_HUE_BINS]
+    if rival.size and support[peak] > 0:
+        margin = 1.0 - rival.max() / support[peak]
+        conf = min(conf, margin / (1.0 - _VIGNETTE_RIVAL_CLEAR))
+    return float(np.clip(conf, 0.0, 1.0))
+
+
+def _vignette_dominant_rgb(
+    poster: Image.Image,
+) -> tuple[tuple[float, float, float], tuple[float, float, float], float]:
+    """Whole-poster colour for the vignette tint → (strict_pick, vignette_pick,
+    confidence).
+
+    ``strict_pick`` is the ordinary cluster pick the frosted bar / notch / sash
+    use, returned so the caller can share it with them rather than quantising
+    twice.  The vignette's own pick comes from _vignette_hue_pick instead: a
+    frosted element is a small patch that wants to match one prominent colour,
+    while a vignette is a wash across the whole width and wants the colour the
+    poster is mostly made of.  The two agree on ordinary art and part company
+    exactly where they should — on a poster with one vivid accent in a neutral
+    field, which the bar may match and the vignette must not.
+    """
+    rgb, _v, _s, _skin = _dominant_cluster(poster)
+    strict = rgb if rgb is not None else (128.0, 128.0, 128.0)
+    pick, conf = _vignette_hue_pick(poster)
+    return strict, (pick if pick is not None else strict), (conf if pick is not None else 0.0)
+
+
+def _vignette_secondary_rgb(
+    poster: Image.Image, primary: tuple[float, float, float]
+) -> tuple[float, float, float] | None:
+    """Second colour for the two-tone ramp, or None if the art hasn't got one.
+
+    The best-scoring chromatic cluster whose hue is far enough from ``primary`` to
+    actually read as a different colour — a ramp between two shades of one hue is
+    just a flat tint with a smudge in it, so it is better to fall back to flat.
+    Scored by population, biased toward chroma, so the two ends are the poster's
+    two real colours rather than its colour and an incidental highlight.
+
+    Deliberately left on clusters rather than moved onto the hue histogram the
+    primary now uses.  Support answers "how much of the poster is this colour",
+    which is the right question for the wash the whole band takes but the wrong one
+    for its far end: it only ever nominates a *distant* hue, and distant hues blend
+    the short way round the wheel, so the ramp sweeps through violets and magentas
+    the art hasn't got.  Picking the nearest real cluster instead keeps the far end
+    somewhere adjacent, which is what makes the ramp read as depth in the colour
+    rather than as a rainbow laid over the poster.
+
+    Skin is excluded outright, and the coverage bar is high.  Both matter: on a
+    poster that is a man against a blue sky, his face and hands are the only thing
+    far enough from blue to qualify, so without these the ramp announced a second
+    colour — red — that is nowhere in the art.
+    """
+    import colorsys
+    small = poster.convert("RGB")
+    if max(small.size) > 64:
+        small = small.resize((48, 48), Image.Resampling.LANCZOS)
+    try:
+        q = small.quantize(colors=12, method=Image.Quantize.FASTOCTREE)
+    except Exception:
+        q = small.quantize(colors=12)
+    palette, counts = q.getpalette() or [], q.getcolors() or []
+    if not palette or not counts:
+        return None
+    p_h = colorsys.rgb_to_hsv(*(c / 255 for c in primary))[0]
+    total = float(sum(c for c, _ in counts)) or 1.0
+    best, best_score = None, -1.0
+    for count, idx in counts:
+        r, g, b = palette[idx * 3:idx * 3 + 3]
+        h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+        if v < _VIGNETTE_RAMP_MIN_V or s < _VIGNETTE_RAMP_MIN_S:
+            continue
+        if v * s < _VIGNETTE_RAMP_MIN_CHROMA:   # a real colour, not compression noise
+            continue
+        if _is_skin_tone(r, g, b):          # a face is not a poster's second colour
+            continue
+        weight = count / total
+        if weight < _VIGNETTE_RAMP_MIN_W:
+            continue
+        dh = abs(h - p_h)
+        dh = min(dh, 1.0 - dh)                           # hue is circular
+        if not _VIGNETTE_RAMP_MIN_HUE <= dh <= _VIGNETTE_RAMP_MAX_HUE:
+            continue
+        score = weight * (0.3 + s * v)
+        if score > best_score:
+            best_score, best = score, (float(r), float(g), float(b))
+    return best
+
+
+def _vignette_level_band(
+    image: Image.Image, box: tuple[int, int, int, int], ramp: Image.Image, amount: float
+) -> None:
+    """Darken over-bright artwork inside one vignette band, in place.
+
+    The tint is composited *over* the art at the vignette's alpha, so whatever the
+    art does at (1 - alpha) lands in the result untouched.  That is the entire
+    reason a poster whose bottom is white cloud reads pale next to one whose bottom
+    is dark, at identical settings — the tint contributes the same to both.  This
+    scales the bright case down so the bleed-through is comparable, weighted by the
+    same alpha ramp so there is no seam, and scaled by ``amount`` — how hard the
+    two sliders are asking for a wash at all — so a faint one doesn't aggressively
+    regrade the poster.
+
+    ``amount`` deliberately does *not* include the tint's confidence.  Hue
+    confidence answers "is this the poster's colour", which has nothing to do with
+    how much art should show through; letting it in meant the posters whose hue was
+    least trusted — the near-monochrome ones — were also the only ones that kept
+    their art legible under the band, which is exactly the inconsistency this
+    function exists to remove.
+
+    Only ever darkens: art already below the bleed budget is left exactly alone.
+    """
+    if amount <= 0:
+        return
+    x0, y0, x1, y1 = box
+    prof = np.asarray(ramp, dtype=np.float32)
+    peak = float(prof.max())
+    if peak <= 0:
+        return
+    band = image.crop(box)
+    art  = np.asarray(band.convert("RGB"), dtype=np.float32)
+    # Alpha-weighted mean luminance of the art, i.e. what actually reaches the eye.
+    w = prof / peak
+    art_luma = float((art @ _LUMA_COEFFS * w).sum() / max(w.sum(), 1e-6))
+    bleed = (1.0 - peak / 255.0) * art_luma
+    if bleed <= _VIGNETTE_ART_BLEED:
+        return
+    k = max(_VIGNETTE_LEVEL_FLOOR, _VIGNETTE_ART_BLEED / bleed)
+    k = 1.0 - (1.0 - k) * min(1.0, amount)
+    mask = ramp.point(lambda a, _p=peak: min(255, int(a * 255 / _p)))
+    # Scale the RGB array rather than Image.point, which on an RGBA band would
+    # scale the alpha channel too.
+    levelled = Image.fromarray(np.clip(art * k, 0, 255).astype(np.uint8), "RGB")
+    image.paste(levelled, (x0, y0), mask=mask)
+
+
+def _vignette_band_colour(
+    poster: Image.Image,
+    seam: tuple[tuple[int, int, int, int], np.ndarray],
+    whole: tuple[tuple[float, float, float], float, tuple[float, float, float] | None,
+                 np.ndarray],
+    local: bool,
+    want_ramp: bool,
+) -> tuple[tuple[float, float, float], float, tuple[float, float, float] | None]:
+    """(tint, confidence, secondary) for one vignette band.
+
+    With ``local`` off this is just the whole-poster pick, so both bands agree and
+    so does every frosted element.
+
+    With it on there are two candidates and a rule for choosing between them.  The
+    seam — the window around the band's inner edge, see _vignette_seam — is where
+    the tint and the artwork are seen together, so a band that matches it reads as
+    the poster's own colour deepening rather than as a different colour arriving.
+    But the seam is a sliver, and a sliver can be unrepresentative: a red coat, a
+    lit shoulder, one lamp.  The whole poster is representative by construction and
+    can be a colour that is nowhere near the join.  Each is right where the other
+    is wrong, and neither is right often enough to use alone.
+
+    So a candidate is scored by the *weaker* of its two supports — how much of the
+    join carries that hue, and how much of the poster does — and the better score
+    wins.  A colour has to be earned twice.  A prop at the join fails on the
+    poster; a poster colour absent from the join fails at the join; a colour that
+    is genuinely both is the one the band should be.  The scores are directly
+    comparable because both curves are in the same units, mean weighted chroma per
+    pixel, and only the two candidates are scored — taking the best hue of the
+    combined curve instead would invent a third colour that neither sample chose.
+
+    Confidence comes from that same combined curve, so a band whose colour only
+    one side supports fades out rather than committing.
+
+    The winner brings its own ramp partner, from the sample that chose it: pairing
+    a seam primary with a secondary from the far end of the poster would ramp
+    toward a colour that isn't anywhere near the join.
+    """
+    if not local:
+        return whole[:3]
+    box, rows = seam
+    region = poster.crop(box)
+    _a, _hue, _w, seam_sup = _vignette_hue_profile(region, rows)
+    both = np.minimum(seam_sup, whole[3])
+    seam_peak, whole_peak = int(np.argmax(seam_sup)), int(np.argmax(whole[3]))
+    peak = seam_peak if both[seam_peak] > both[whole_peak] else whole_peak
+    conf = _vignette_hue_confidence(both, peak)
+    if conf <= 0.0:
+        return whole[:3]
+    if peak == whole_peak and whole[0] is not None:
+        return whole[0], conf, whole[2]
+    tint = _vignette_family_rgb(_a, _hue, _w, (peak + 0.5) / _VIGNETTE_HUE_BINS)
+    if tint is None:
+        return whole[:3]
+    return tint, conf, (_vignette_secondary_rgb(region, tint) if want_ramp else None)
+
+
+def _vignette_hue_gate(field: np.ndarray) -> np.ndarray:
+    """0–1 confidence that each cell of ``field`` carries a usable hue.
+
+    Keyed on chroma — HSV Value x Saturation, which reduces to (max - min) / 255 —
+    so it rejects white, grey and near-black equally, and accepts a dark but vivid
+    hue.  0 means there is nothing there worth tinting from.
+    """
+    maxc = field.max(axis=-1)
+    minc = field.min(axis=-1)
+    chroma = np.where(maxc > 0, (maxc - minc) / 255.0, 0.0)
+    return np.clip(
+        (chroma - _VIGNETTE_HUE_FLOOR) / (_VIGNETTE_HUE_SOLID - _VIGNETTE_HUE_FLOOR), 0.0, 1.0
+    )
+# Horizontal resolution the band is reduced to at blur=0, before being smoothed
+# back up.  High enough that the band visibly follows the art (which is the whole
+# point of the low end of the slider), low enough that faces and title text stay
+# a colour haze rather than a legible ghost.
+_VIGNETTE_TINT_COLUMNS = 64
+# Easing exponents for the blur slider.  Both are front-loaded so the flattening
+# is obvious within the first half of the travel — at a linear ramp the top end
+# was indistinguishable from the bottom, since even a coarse sample is already
+# smooth once it has been scaled back up.
+_VIGNETTE_BLUR_DETAIL_CURVE = 3.0   # how fast the sampled detail collapses
+_VIGNETTE_BLUR_MIX_CURVE    = 0.7   # how fast it commits to the flat dominant colour
+# Peak Gaussian radius applied to the artwork inside the band, as a fraction of
+# poster width so it is resolution-independent.  Flattening the *tint* alone left
+# the art underneath perfectly sharp, which reads as a plain colour cast rather
+# than as blur; frosting the art is what actually sells the top of the slider.
+# The ceiling is what decides whether a busy poster (a spider's legs, a cartoon
+# background) reads as a deliberate wash or as colour sprayed over legible art —
+# at 0.09 even the top of the slider left too much of it standing.  Returns
+# diminish fast above this: a Gaussian takes away detail but not contrast, so
+# doubling the radius again buys a few percent where the bleed budget below buys
+# a third.  Frosting the art is what sells the top of the slider; levelling it is
+# what makes the top of the slider look the same on every poster.
+_VIGNETTE_BLUR_MAX_RATIO = 0.24
+# How much of the artwork's own luminance the band tolerates bleeding through the
+# vignette, in luma units at peak alpha.  The tint's own contribution is already
+# near-constant across posters (~33); what made a bright poster look washed next
+# to a dark one was purely this bleed — a poster whose bottom is white cloud sends
+# ~30 luma through a "high" vignette, a dark one ~3.  Levelling only ever darkens,
+# so dark art is untouched by construction and can never be made worse.
+#
+# This budget, not the blur radius, is what decides whether a band reads as mist
+# or as art seen through a colour cast: blur removes *detail* but keeps contrast,
+# and it is surviving contrast that the eye reads as "the background is still
+# there".  Doubling the radius barely moves that; halving the budget does.
+_VIGNETTE_ART_BLEED  = 3.0
+# ...and the floor has to be low enough for the budget to be reachable on bright
+# art.  At 0.30 a poster whose band is white paper or cloud hit the floor before
+# it hit the budget, so the very posters that showed the most kept showing it.
+_VIGNETTE_LEVEL_FLOOR = 0.12   # never darken the art below this fraction
+# Columns the two-tone ramp is drawn at.  It needs its own floor because the blur
+# slider collapses the sample to a single cell at the top end, which would leave
+# the ramp with nowhere to ramp.
+_VIGNETTE_RAMP_COLUMNS = 24
+# Hue separation (0–1) the ramp's second colour has to sit in.  Below the minimum
+# the two ends are shades of one hue and the ramp reads as a flat tint with a
+# smudge.  Above the maximum they are too far apart to join: the blend takes the
+# short way round the wheel, so a blue reaching for a red goes through violet and
+# magenta, and the band ends up mostly made of colours the poster hasn't got.  A
+# gold to a green is a gradient; a blue to a red is a rainbow.  Flat is the honest
+# fallback for the second case, which is why the window is closed at both ends
+# rather than the minimum simply being raised.
+_VIGNETTE_RAMP_MIN_HUE = 0.08
+_VIGNETTE_RAMP_MAX_HUE = 0.30
+# A ramp endpoint must be a real presence in the art, not a passing accent — it
+# claims half the band.  A 1% highlight promoted to a co-headline colour is a
+# colour the poster does not actually have.
+_VIGNETTE_RAMP_MIN_W = 0.06
+# ...and bright enough to be a colour statement rather than a shadow: a dark brown
+# that is really hair or shading passes a low bar easily and then gets announced
+# as half the poster's palette.
+_VIGNETTE_RAMP_MIN_V = 0.40
+# How chromatic a cluster must be to be a ramp endpoint at all.  Saturation alone
+# is close to meaningless on dark clusters — pure black plus a little warm
+# compression noise reads S=0.22 while its chroma is 0.03 — so both are checked.
+_VIGNETTE_RAMP_MIN_S      = 0.12
+_VIGNETTE_RAMP_MIN_CHROMA = 0.10
+# Depth of the seam window either side of a band's inner edge, as a fraction of
+# the poster.  The window spans both: outside it is the art the band fades into,
+# inside it is the art the band has begun to cover but not yet hidden, and the
+# join the eye actually sees is made of both.  Thin on purpose — reach further and
+# the sample starts answering for content nowhere near the join.
+_VIGNETTE_SEAM_H = 0.08
+
+
+def _vignette_seam(
+    width: int, height: int, edge: int, inward: int, ramp: Image.Image
+) -> tuple[tuple[int, int, int, int], np.ndarray]:
+    """(crop rect, per-row weights) for the seam around a band's inner edge.
+
+    ``edge`` is that edge's y; ``inward`` is +1 when the band lies below it (the
+    bottom vignette) and -1 when it lies above (the top).
+
+    Rows are weighted by how much of the artwork still shows at that height — one
+    minus the band's own alpha — so the window fades out exactly as the art it is
+    reading disappears under the wash.  A flat window would let the first rows
+    inside the band vote as loudly as the untouched art beside them at a shallow
+    setting and be nearly hidden at a deep one, which is what made the tint jump
+    around as the vignette level was changed: the sample was moving over the art
+    without any regard for how much of that art would survive.
+    """
+    depth = max(1, int(height * _VIGNETTE_SEAM_H))
+    y0, y1 = max(0, edge - depth), min(height, edge + depth)
+    if y1 - y0 < 2:                     # degenerate band: read whatever is there
+        y0, y1 = max(0, min(height - 2, y0)), min(height, max(2, y1))
+    alpha = np.asarray(ramp, dtype=np.float32)
+    alpha = alpha.mean(axis=1) if alpha.ndim > 1 else alpha
+    peak  = max(float(alpha.max()), 1.0)
+    # The ramp is stored top-down over the band's own rows, so the band starts at
+    # the edge going down and ends at it going up.
+    start = edge if inward > 0 else edge - len(alpha)
+    into  = np.arange(y0, y1) - start
+    rows  = 1.0 - np.where(
+        (into >= 0) & (into < len(alpha)), alpha[np.clip(into, 0, len(alpha) - 1)], 0.0
+    ) / peak
+    return (0, y0, width, y1), rows.astype(np.float32)
+
+
+def _vignette_tint_band(
+    src: Image.Image,
+    box: tuple[int, int, int, int],
+    dominant: tuple[float, float, float],
+    confidence: float,
+    saturation: float,
+    blur: float,
+    secondary: tuple[float, float, float] | None = None,
+    lightness: float = 1.0,
+) -> Image.Image:
+    """Colour field to paint one vignette band with, sampled from the poster art.
+
+    ``box`` is the band's crop rect in ``src`` — the artwork snapshot taken
+    *before* any gradient darkened it, since sampling the graded image would just
+    return the near-black a previous band already painted.
+
+    ``blur`` (0–1) trades local colour for the whole-poster ``dominant``: at 0 the
+    band follows the art across its width (a red left edge stays red), at 1 it is
+    one flat wash of the dominant colour.  It drives both the coarseness of the
+    downsample and the mix toward the dominant, each on its own front-loaded curve
+    (see _VIGNETTE_BLUR_*_CURVE) so the two ends read as clearly different.  The
+    same slider also frosts the art itself — see _vignette_frost_band, which is
+    what makes the high end read as blur rather than as a flat colour cast.
+
+    ``confidence`` (0–1, from _vignette_hue_pick) is how much of the art actually
+    carries the chosen hue.  It is the only thing besides the slider allowed to
+    affect strength, and it is judged once for the whole region.
+
+    ``saturation`` (0–_VIGNETTE_SAT_FULL) sets the tint's strength on its own; the
+    art supplies only the hue.  Two posters at the same setting therefore land on
+    the same intensity however saturated their art is, differing in hue alone —
+    without that, a shelf of posters is wildly uneven, since a vivid one earns
+    both more chroma and more Value while a muted one is scaled down twice over.
+    0 is exactly black, i.e. the untinted vignette.  Strength moves Value and
+    Saturation together, so the band always darkens the poster as hard as a black
+    vignette would: the slider changes how much hue shows, never how much light
+    the vignette takes away.
+
+    ``lightness`` is the one control that does move it, scaling the tint's Value
+    alone — 1.0 is the tuned default, below it the band tends to black and above
+    it to an airy wash of the same hue.  It cannot lighten a band that has no
+    colour: Value is still multiplied by strength, so saturation 0 stays exactly
+    black however light this is set, and the guarantee that a colourless vignette
+    is pixel-identical to the untinted one survives.
+    """
+    band = src.crop(box).convert("RGB")
+    bw, bh = band.size
+    if bw <= 0 or bh <= 0:
+        return Image.new("RGB", (max(bw, 1), max(bh, 1)), (0, 0, 0))
+
+    # Downsample to a handful of colour cells (BOX = area average, so every pixel
+    # contributes), then let the upscale do the smoothing — far cheaper than a
+    # Gaussian over the full-size band and indistinguishable at this softness.
+    detail = (1.0 - blur) ** _VIGNETTE_BLUR_DETAIL_CURVE
+    cols   = max(1, min(bw, int(round(_VIGNETTE_TINT_COLUMNS * detail))))
+    if secondary is not None:
+        # The ramp needs columns to ramp across, and blur has just taken them away
+        # at the top of its range — give it back a floor of its own.
+        cols = max(1, min(bw, max(cols, _VIGNETTE_RAMP_COLUMNS)))
+    rows   = max(1, min(bh, max(1, cols // 2)))
+    field  = np.asarray(band.resize((cols, rows), Image.Resampling.BOX), dtype=np.float32)
+    if secondary is None:
+        dom = np.asarray(dominant, dtype=np.float32)
+    else:
+        # Two-tone: the poster's two real colours, ramped left to right across the
+        # band, shaped (1, cols, 3) to broadcast over the rows.
+        #
+        # Interpolated along the *hue arc*, not through RGB. A straight RGB lerp
+        # between distant hues passes through desaturated mud — blue to red goes via
+        # grey, which reads as two flat zones butted together rather than a blend.
+        # Walking the short way round the hue wheel keeps every intermediate fully
+        # saturated, so blue to red travels through purple as a gradient should.
+        import colorsys
+        h1, s1, v1 = colorsys.rgb_to_hsv(*(c / 255.0 for c in dominant))
+        h2, s2, v2 = colorsys.rgb_to_hsv(*(c / 255.0 for c in secondary))
+        dh = (h2 - h1 + 0.5) % 1.0 - 0.5          # shortest way round the wheel
+        dom = np.asarray(
+            [
+                [c * 255.0 for c in colorsys.hsv_to_rgb(
+                    (h1 + dh * t) % 1.0, s1 + (s2 - s1) * t, v1 + (v2 - v1) * t)]
+                for t in np.linspace(0.0, 1.0, cols)
+            ],
+            dtype=np.float32,
+        )[None, :, :]
+    if blur > 0:
+        mix   = blur ** _VIGNETTE_BLUR_MIX_CURVE
+        field = field * (1.0 - mix) + dom * mix
+
+    # A cell with no colour of its own borrows the poster's rather than dropping to
+    # black.  White and black are the two things local sampling handles worst — a
+    # snowfield or a shadow has no hue to offer, and leaving those cells black made
+    # whole bands of monochrome posters look untinted.  Borrowing keeps the band
+    # coloured wherever the poster has any colour at all; if the poster has none,
+    # `dominant` is neutral too and the gate below still takes the band to black.
+    borrow = (1.0 - _vignette_hue_gate(field))[..., None]
+    field  = field * (1.0 - borrow) + dom * borrow
+
+    # Per-cell HSV, vectorised.  `full` is the cell's hue at full saturation and
+    # value — i.e. hsv_to_rgb(h, 1, 1) — which lets the tint be rebuilt with the
+    # identity hsv_to_rgb(h, s, v) == v * (1 - s * (1 - full)), no colorsys loop.
+    minc  = field.min(axis=-1)
+    chrom = np.maximum(field.max(axis=-1) - minc, 1e-6)
+    full  = (field - minc[..., None]) / chrom[..., None]
+
+    # Strength comes from the slider and the poster-level `confidence` only — never
+    # from how chromatic this particular cell happens to be.  Cells vary in hue
+    # across the band; they must not vary in intensity, or the band ends up
+    # brighter over the colourful half of the art than the muted half.
+    strength = min(1.0, max(0.0, saturation) / _VIGNETTE_SAT_FULL) * max(0.0, min(1.0, confidence))
+
+    # Equalise across hues as well as across sources: scale each cell's Value by
+    # how far its hue's own luminance sits from the reference, so a yellow band
+    # and a blue band at the same setting land near the same brightness.  A hue
+    # brighter than the reference gives part of that back as chroma instead of
+    # Value (see _VIGNETTE_LUMA_SAT_SHARE), because a gold darkened far enough to
+    # match a navy is no longer gold, it is mud.
+    hue_luma  = np.maximum(full @ _LUMA_COEFFS, 1e-6)
+    hue_ratio = _VIGNETTE_LUMA_REF / hue_luma
+    v_scale   = hue_ratio ** _VIGNETTE_LUMA_CORRECT
+    s_scale   = np.minimum(1.0, hue_ratio) ** _VIGNETTE_LUMA_SAT_SHARE
+    s_eff = _VIGNETTE_TINT_S * strength * s_scale
+    v_eff = np.minimum(
+        1.0,
+        _VIGNETTE_TINT_V * strength * v_scale
+        * min(_VIGNETTE_LIGHT_MAX, max(_VIGNETTE_LIGHT_MIN, lightness)),
+    )
+    # Both stay per-cell: strength is poster-level, but the hue correction varies
+    # with each cell's own hue.
+    tint  = 255.0 * v_eff[..., None] * (1.0 - s_eff[..., None] * (1.0 - full))
+
+    # Clip the result to a perceptual chroma budget, per cell, by pulling it toward
+    # its own luminance — which holds the hue and the brightness and takes only the
+    # colourfulness away.  A clip, not an equalisation: a hue already inside the
+    # budget is left exactly alone, so the quiet posters stay exactly as quiet and
+    # only the ones taking their poster over come down.  Two-tone is clipped end by
+    # end for the same reason, since it is usually one end that goes too far.
+    ceiling = _VIGNETTE_TINT_MAX_CHROMA * strength
+    keep    = np.minimum(1.0, ceiling / np.maximum(_lab_chroma(tint), 1e-6))[..., None]
+    grey    = (tint @ _LUMA_COEFFS)[..., None]
+    tint    = grey + (tint - grey) * keep
+
+    small = Image.fromarray(np.clip(tint, 0, 255).astype(np.uint8), mode="RGB")
+    return small if (cols, rows) == (bw, bh) else small.resize((bw, bh), Image.Resampling.BICUBIC)
+
+
+def _vignette_frost_band(
+    image: Image.Image, box: tuple[int, int, int, int], ramp: Image.Image, blur: float
+) -> None:
+    """Blur the artwork inside one vignette band, in place, before it is tinted.
+
+    ``ramp`` is the band's own alpha gradient.  Reusing it as the paste mask makes
+    the blur strongest exactly where the darkening is and zero where the band
+    fades out, so the frosted area has no visible seam against the sharp art below
+    it.  The ramp is normalised first, so the blur reaches full strength at the
+    poster's edge whatever vignette level is set — the two sliders stay
+    independent rather than "low vignette" quietly capping the blur.
+
+    Runs before the tint is composited so the tint lands on frosted art, and
+    before every badge, logo, label and sash, none of which should be blurred.
+    """
+    if blur <= 0:
+        return
+    x0, y0, x1, y1 = box
+    radius = (x1 - x0) * _VIGNETTE_BLUR_MAX_RATIO * blur
+    if radius < 0.5:
+        return
+    peak = ramp.getextrema()[1]
+    if not peak:
+        return
+    mask = ramp.point(lambda a, _p=peak: min(255, int(a * 255 / _p)))
+
+    # Blur by reduction rather than running a wide Gaussian at full size: a box
+    # downscale, a small Gaussian, then a bicubic upscale is indistinguishable at
+    # these radii (max channel delta ~4/255) and roughly halves the cost at the
+    # default blur.  PIL's Gaussian is a box approximation whose cost barely moves
+    # with radius, so below a 3x reduction the resizes cost more than they save —
+    # hence the threshold rather than always taking this path.
+    band   = image.crop(box)
+    shrink = max(1, int(radius / 4))
+    if shrink > 2:
+        small   = band.resize((max(1, band.width // shrink), max(1, band.height // shrink)),
+                              Image.Resampling.BOX)
+        small   = small.filter(ImageFilter.GaussianBlur(radius / shrink))
+        blurred = small.resize(band.size, Image.Resampling.BICUBIC)
+    else:
+        blurred = band.filter(ImageFilter.GaussianBlur(radius))
+    image.paste(blurred, (x0, y0), mask=mask)
+
+
 # Genre-specific tint multipliers (R, G, B) for the fallback canvas.
 # Applied to a dark base luminance of 10–18, so the dominant channel peaks
 # around 30–55 at canvas midpoint — atmospheric rather than vivid.
@@ -1096,7 +2595,15 @@ _GENRE_LABEL_OVERRIDES: dict[str, str] = {
 }
 
 
-def _make_fallback_canvas(genre_ids: list[int] | None = None) -> Image.Image:
+def _make_landscape_canvas(genre_ids: list[int] | None = None) -> Image.Image:
+    """The no-art canvas at 16:9.  Same genre tint and gradient as the portrait
+    one — only the canvas it is painted on differs."""
+    return _make_fallback_canvas(genre_ids,
+                                 size=(_cfg.LANDSCAPE_WIDTH, _cfg.LANDSCAPE_HEIGHT))
+
+
+def _make_fallback_canvas(genre_ids: list[int] | None = None,
+                          size: tuple[int, int] | None = None) -> Image.Image:
     """
     Dark gradient canvas served when a title has no poster art on TMDB.
 
@@ -1117,7 +2624,7 @@ def _make_fallback_canvas(genre_ids: list[int] | None = None) -> Image.Image:
                     break
 
     r_mult, g_mult, b_mult = tint
-    W, H = _cfg.POSTER_WIDTH, _cfg.POSTER_HEIGHT
+    W, H = size or (_cfg.POSTER_WIDTH, _cfg.POSTER_HEIGHT)
     t    = np.linspace(0, np.pi, H, dtype=np.float32)
     # sin curve: peaks at midheight (~18), dark at top/bottom (~10)
     v    = (10 + 8 * np.sin(t)).astype(np.float32)
@@ -1244,6 +2751,7 @@ def build_poster(
     release_year: str | None = None,
     age_rating: int | None = None,
     no_poster: bool = False,
+    has_burned_in_text: bool = False,
 ) -> Image.Image:
 
     width, height = image.size
@@ -1277,6 +2785,103 @@ def build_poster(
     else:
         genre_label = _GENRE_LABEL_OVERRIDES.get(genre, genre)
 
+    if cfg.hide_genre:
+        genre_label = ""
+        
+    # Resolve the info-sash pick once, regardless of whether the diagonal sash
+    # itself is rendered independently.
+    #
+    # When greyscale is active on an unreleased title (Cinema / Production),
+    # force the release-status slot to the front so its badge always wins — that
+    # tells the user the poster is greyscale because it's unavailable, rather
+    # than a title whose art happens to be black & white.
+    _sash_priority = cfg.sash_priority
+    if (cfg.cinema_greyscale and discovery_meta is not None
+            and discovery_meta.release_status in ("Cinema", "Production")):
+        _status = discovery_meta.release_status.lower()
+        if _status in _sash_priority or "release_status" in _sash_priority:
+            _sash_priority = [s for s in _sash_priority if s in ("release_status", _status)] + [s for s in _sash_priority if s not in ("release_status", _status)]
+    sash_result = (
+        pick_sash(discovery_meta, _sash_priority)
+        if discovery_meta is not None
+        else None
+    )
+    # Resolved here rather than at the draw site because the top vignette needs it
+    # too — see the top gradient below.
+    _sash_shown = cfg.sash_mode != "hidden" and sash_result is not None
+
+    # Snapshot the artwork *before* the vignette gradients darken it. The frosted
+    # bar/notch/sash sample their tint colour from this, not the graded image —
+    # otherwise the near-black top/bottom the gradients paint on drags the sampled
+    # colour to grey (e.g. a blue sky reads as white behind the notch).
+    _frost_color_src = image.copy()
+
+    # Whole-poster colour sample.  The strict pick is shared with every frosted
+    # element further down so they agree without re-quantising; the vignette's own
+    # pick differs only on art where the strict one found no colour at all.
+    _strict_tint: tuple[float, float, float] | None = None
+    _poster_tint: tuple[float, float, float] | None = None
+    _poster_conf = 0.0
+    _poster_tint2: tuple[float, float, float] | None = None
+    _poster_support = np.zeros(_VIGNETTE_HUE_BINS)
+    # Skipped entirely on burned-in-text posters: neither band will be tinted
+    # (see _top_enabled below), so the hue histogram would be thrown away.
+    if ((cfg.vignette_poster_color_top or cfg.vignette_poster_color_bottom)
+            and not has_burned_in_text):
+        _strict_tint, _poster_tint, _poster_conf = _vignette_dominant_rgb(_frost_color_src)
+        if cfg.vignette_color_ramp and _poster_conf > 0:
+            _poster_tint2 = _vignette_secondary_rgb(_frost_color_src, _poster_tint)
+        # Kept whole so a band can weigh its own seam's colour against how much of
+        # the poster carries it — see _vignette_band_colour.
+        _poster_support = _vignette_hue_profile(_frost_color_src)[3]
+    # Whole-poster result, used directly unless a band finds something its seam and
+    # the poster agree on better.
+    _whole_colour = (_poster_tint, _poster_conf, _poster_tint2, _poster_support)
+    _slider_amount = min(1.0, max(0.0, cfg.vignette_color_saturation) / _VIGNETTE_SAT_FULL)
+    # How hard the band is being asked to wash the art out, for the levelling pass.
+    # Both sliders ask for it — colour lays a tint over the art, blur melts it — so
+    # the stronger of the two drives it, and a poster is levelled the same whether
+    # the wash it is under is a vivid tint or a heavy frost.
+    _level_amount  = max(_slider_amount, min(1.0, max(0.0, cfg.vignette_color_blur)))
+
+    # A sash or notch sits on top of the top vignette, and tinting that band lifts
+    # it toward the sash's own colour — which is sampled from the same art, so the
+    # two converge and the label stops reading. The top band therefore stays plain
+    # black whenever one is shown; the bottom band is unaffected. Same reasoning as
+    # the existing "Vignette Only On Sash" option, which also lets the sash decide
+    # what the top of the poster does.
+    #
+    # Burned-in text is the other case that has to opt out. The tinted vignette
+    # frosts the art it sits on (see _vignette_frost_band), and it knows to leave
+    # OUR logo alone because we composite that afterwards — but a poster whose
+    # title is baked into the artwork has no separate layer to protect, so the
+    # blur lands squarely on the title and smears it into an unreadable mush.
+    # Text detection has already told us which posters those are, so when it
+    # confirms burned-in text both bands fall back to plain black. Only a
+    # confirmed detection counts: has_burned_in_text is False both for a clean
+    # poster and for one that was never scanned, and an unscanned poster should
+    # keep the tint it has always had rather than be penalised for the gap.
+    _top_enabled    = (cfg.vignette_poster_color_top and not _sash_shown
+                       and not has_burned_in_text)
+    _bottom_enabled = cfg.vignette_poster_color_bottom and not has_burned_in_text
+    # What colour a tinted band actually *paints*, kept for the frosted notch to
+    # match if it is asked to (see _frost_tint below).  Read off the band's own
+    # tint field at its deepest row rather than taken from the sample the hue was
+    # picked from: those two share a hue and nothing else.  The sample is the art's
+    # own colour — a bright sky blue at V 0.88 — while the band lays down that hue
+    # at the tint's Value and Saturation, which at any setting is a dark shade of
+    # it, and lower saturation makes it darker still.  Matching the sample gave a
+    # notch far brighter and more colourful than the band beside it.  The top
+    # band's is preferred when both are tinted, since that is the one a notch sits
+    # on.
+    _vignette_shown: tuple[float, float, float] | None = None
+
+    def _band_paint(field: Image.Image, deepest_row: int) -> tuple[float, float, float]:
+        """Mean colour along a tint field's peak-alpha edge — what the eye sees
+        where the band is strongest, before the art bleeding through lightens it."""
+        row = np.asarray(field.convert("RGB"), dtype=np.float32)[deepest_row]
+        return tuple(float(c) for c in row.mean(axis=0))
+
     # --- TOP GRADIENT (vectorised) ---
     # Darkens the top of the poster so the age-rating numeral and quality
     # badges stay legible over bright art.  Strength is one of four presets
@@ -1284,15 +2889,45 @@ def build_poster(
     # (height_ratio, max_alpha) tuple each level uses.  Unknown level is
     # treated as "high" rather than skipped so a typo in a URL doesn't
     # silently disable the vignette.
-    _tg_preset = _TOP_GRADIENT_LEVELS.get(cfg.top_gradient, _TOP_GRADIENT_LEVELS["high"])
-    if _tg_preset is not None:
+    _tg_preset: tuple[float, int] | None
+    if cfg.top_gradient == "custom" and cfg.top_gradient_opacity is not None and cfg.top_gradient_height is not None:
+        _tg_preset = (cfg.top_gradient_height, int(cfg.top_gradient_opacity * 255 if cfg.top_gradient_opacity <= 1.0 else cfg.top_gradient_opacity))
+    else:
+        _tg_preset = _TOP_GRADIENT_LEVELS.get(cfg.top_gradient, _TOP_GRADIENT_LEVELS["high"])
+        
+    if _tg_preset is not None and (not cfg.top_vignette_sash_only or sash_result is not None):
         top_height_ratio, top_max_alpha = _tg_preset
-        top_height = int(height * top_height_ratio)
+        top_height = max(1, int(height * top_height_ratio))
         t_top = np.linspace(0, 1, top_height, dtype=np.float32)
         eased_top = ((1 - t_top) * top_max_alpha).astype(np.uint8)
         top_array = np.broadcast_to(eased_top[:, np.newaxis], (top_height, width)).copy()
         top_overlay = Image.fromarray(top_array, mode="L")
-        top_tinted = Image.new("RGBA", (width, top_height), (0, 0, 0, 0))
+        # Black by default; a poster-coloured vignette swaps in a tint field
+        # sampled from the art under this band.  Only the RGB changes — the alpha
+        # ramp, and so how hard the band darkens, is identical either way.
+        if _top_enabled and _poster_tint is not None:
+            # The top band fades out downward, so its seam sits at top_height.
+            _t_tint, _t_conf, _t_second = _vignette_band_colour(
+                _frost_color_src,
+                _vignette_seam(width, height, top_height, -1, top_overlay),
+                _whole_colour, cfg.vignette_color_local, cfg.vignette_color_ramp,
+            )
+            _vignette_frost_band(
+                image, (0, 0, width, top_height), top_overlay, cfg.vignette_color_blur,
+            )
+            _vignette_level_band(
+                image, (0, 0, width, top_height), top_overlay, _level_amount
+            )
+            top_tinted = _vignette_tint_band(
+                _frost_color_src, (0, 0, width, top_height), _t_tint, _t_conf,
+                cfg.vignette_color_saturation, cfg.vignette_color_blur, _t_second,
+                cfg.vignette_color_lightness,
+            ).convert("RGBA")
+            if _t_conf >= _VIGNETTE_MATCH_MIN_CONF and _slider_amount > 0:
+                # Top band: strongest at the poster's edge, so row 0.
+                _vignette_shown = _band_paint(top_tinted, 0)
+        else:
+            top_tinted = Image.new("RGBA", (width, top_height), (0, 0, 0, 0))
         top_tinted.putalpha(top_overlay)
         image.paste(top_tinted, (0, 0), mask=top_tinted)
 
@@ -1304,16 +2939,43 @@ def build_poster(
     # like the lighter fade those modes used to get for free, pick "medium".
     # Unknown level falls back to "high" so a typo can't accidentally turn
     # the fade off entirely (which would break label legibility).
-    _bg_preset = _BOTTOM_GRADIENT_LEVELS.get(cfg.bottom_gradient, _BOTTOM_GRADIENT_LEVELS["high"])
+    if cfg.bottom_gradient == "custom" and cfg.bottom_gradient_opacity is not None and cfg.bottom_gradient_height is not None:
+        _bg_preset = (cfg.bottom_gradient_height, int(cfg.bottom_gradient_opacity * 255 if cfg.bottom_gradient_opacity <= 1.0 else cfg.bottom_gradient_opacity))
+    else:
+        _bg_preset = _BOTTOM_GRADIENT_LEVELS.get(cfg.bottom_gradient, _BOTTOM_GRADIENT_LEVELS["high"])
+        
     if _bg_preset is not None:
         bottom_height_ratio, bottom_max_alpha = _bg_preset
-        bottom_height = int(height * bottom_height_ratio)
+        bottom_height = max(1, int(height * bottom_height_ratio))
         bottom_start  = height - bottom_height
         t_bot         = np.linspace(0, 1, bottom_height, dtype=np.float32)
         eased_bot     = ((1 - (1 - t_bot) ** _BOTTOM_GRADIENT_CURVE) * bottom_max_alpha).astype(np.uint8)
         bottom_array  = np.broadcast_to(eased_bot[:, np.newaxis], (bottom_height, width)).copy()
         bottom_overlay = Image.fromarray(bottom_array, mode="L")
-        bottom_tinted  = Image.new("RGBA", (width, bottom_height), (0, 0, 0, 0))
+        if _bottom_enabled and _poster_tint is not None:
+            # ...and the bottom band fades out upward, so its seam sits at
+            # bottom_start.
+            _b_tint, _b_conf, _b_second = _vignette_band_colour(
+                _frost_color_src,
+                _vignette_seam(width, height, bottom_start, +1, bottom_overlay),
+                _whole_colour, cfg.vignette_color_local, cfg.vignette_color_ramp,
+            )
+            _vignette_frost_band(
+                image, (0, bottom_start, width, height), bottom_overlay, cfg.vignette_color_blur,
+            )
+            _vignette_level_band(
+                image, (0, bottom_start, width, height), bottom_overlay, _level_amount
+            )
+            bottom_tinted = _vignette_tint_band(
+                _frost_color_src, (0, bottom_start, width, height), _b_tint, _b_conf,
+                cfg.vignette_color_saturation, cfg.vignette_color_blur, _b_second,
+                cfg.vignette_color_lightness,
+            ).convert("RGBA")
+            if _vignette_shown is None and _b_conf >= _VIGNETTE_MATCH_MIN_CONF and _slider_amount > 0:
+                # Bottom band: strongest at the poster's edge, so the last row.
+                _vignette_shown = _band_paint(bottom_tinted, -1)
+        else:
+            bottom_tinted = Image.new("RGBA", (width, bottom_height), (0, 0, 0, 0))
         bottom_tinted.putalpha(bottom_overlay)
         image.paste(bottom_tinted, (0, bottom_start), mask=bottom_tinted)
 
@@ -1361,6 +3023,15 @@ def build_poster(
                 bar_height=cfg.badge_height,
             )
 
+    elif mode == 6:
+        # Corner bookmark — fixed to the poster top-left and coloured by tier.
+        if not tokens or _score_points(tokens) >= cfg.badge_min_score:
+            draw_quality_corner_bookmark(
+                image,
+                tokens,
+                bookmark_size=cfg.badge_height,
+            )
+
     elif mode == 2:
         allowed_tokens  = {"4K", "1080P", "REMUX", "WEBDL", "DV", "HDR10+", "HDR10"}
         filtered_tokens = [t for t in tokens if t in allowed_tokens]
@@ -1398,6 +3069,7 @@ def build_poster(
             max_w_ratio=cfg.logo_max_w_ratio,
             max_h_ratio=cfg.logo_max_h_ratio,
             bottom_ratio=cfg.logo_bottom_ratio,
+            bottom_anchor=cfg.logo_bottom_anchor,
         )
     elif fallback_title:
         # ── Genre-aware font selection ────────────────────────────────────────
@@ -1438,14 +3110,15 @@ def build_poster(
         # looks as substantial as a logo would — short titles like "SELF-HELP"
         # grow to fill the width instead of being pinned tiny by a char-count
         # heuristic.  The logo size ratios therefore tune the fallback text too.
-        max_w          = int(width  * cfg.logo_max_w_ratio)
-        max_h          = int(height * cfg.logo_max_h_ratio)
-        # Sit on the exact same vertical centre line composite_logo uses, so a
-        # text-title poster lines up with a logo poster in the same row.
-        title_cy       = logo_centre_y(height, cfg.logo_bottom_ratio)
+        max_w          = max(1, int(width * cfg.logo_max_w_ratio))
+        max_h          = max(1, min(int(height * cfg.logo_max_h_ratio), LOGO_ABS_MAX_H))
         MIN_FONT_SIZE  = 22
         MAX_LINES      = 2
         FONT_PATH      = os.path.join(_FONTS_DIR, _font_file)
+
+        def _line_width(text: str, current_font) -> int:
+            bbox = draw.textbbox((0, 0), text, font=current_font)
+            return int(bbox[2] - bbox[0])
 
         def _wrap_lines(text: str, current_font) -> list[str]:
             """Greedy word-wrap: each line packs as many words as fit within max_w."""
@@ -1456,7 +3129,7 @@ def build_poster(
             current: list[str] = []
             for word in words:
                 candidate = " ".join(current + [word])
-                if draw.textlength(candidate, font=current_font) <= max_w or not current:
+                if _line_width(candidate, current_font) <= max_w or not current:
                     current.append(word)
                 else:
                     lines.append(" ".join(current))
@@ -1465,89 +3138,155 @@ def build_poster(
                 lines.append(" ".join(current))
             return lines
 
+        def _measure_block(lines_to_measure: list[str], current_font, line_gap: int) -> tuple[int, int, list[tuple[str, tuple[int, int, int, int]]]]:
+            line_boxes = [
+                (line, draw.textbbox((0, 0), line, font=current_font))
+                for line in lines_to_measure
+            ]
+            if not line_boxes:
+                return 0, 0, []
+            widths = [bbox[2] - bbox[0] for _, bbox in line_boxes]
+            heights = [bbox[3] - bbox[1] for _, bbox in line_boxes]
+            block_w = max(widths)
+            block_h = sum(heights) + line_gap * (len(line_boxes) - 1)
+            return block_w, block_h, line_boxes
+
         # Pick the largest font whose wrapped block fits the logo envelope: scan
-        # high→low and take the first fit.  A 2-line block gets a taller budget
-        # than a single logo, since two stacked lines read fine a bit beyond one
-        # logo's height.  Falls back to the wrapped layout at MIN_FONT_SIZE.
+        # high to low and take the first fit. Text fallbacks use the same hard
+        # width/height envelope as image logos, including the absolute height cap
+        # and bottom-anchor baseline semantics.
+        _sizes = list(range(int(height * 0.26), 7, -2))
+
+        def _widest_word(current_font) -> int:
+            """Width of the widest single word at this size (0 for empty input)."""
+            return max(
+                (_line_width(word, current_font) for word in fallback_title.split()),
+                default=0,
+            )
+
+        def _first_viable_index() -> int:
+            """Index into _sizes of the largest size not ruled out on width alone.
+
+            _wrap_lines places a word on a line even when it alone exceeds max_w
+            (the `or not current` branch), so any size whose widest word overflows
+            is guaranteed to produce a block wider than max_w and fail the test
+            below.  Unlike the full fit test — which is *not* monotone, because a
+            larger font can push a word onto line two and make the block narrower
+            — single-word width rises monotonically with size, so the first
+            viable size can be found by bisection.  Skipping straight to it avoids
+            measuring dozens of oversized candidates that cannot possibly fit,
+            which used to dominate the cost of rendering a text fallback.
+            """
+            lo, hi, first = 0, len(_sizes) - 1, 0
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                _fs = _sizes[mid]
+                if _widest_word(_load_font(FONT_PATH, _fs)) + max(2, int(_fs * 0.04)) <= max_w:
+                    first, hi = mid, mid - 1
+                else:
+                    lo = mid + 1
+            return first
+
         try:
             font_size = MIN_FONT_SIZE
-            font      = ImageFont.truetype(FONT_PATH, font_size)
+            font      = _load_font(FONT_PATH, font_size)
             lines     = _wrap_lines(fallback_title, font)
-            for _fs in range(int(height * 0.26), MIN_FONT_SIZE - 1, -2):
-                _f  = ImageFont.truetype(FONT_PATH, _fs)
+            shadow_offset = max(2, int(font_size * 0.04))
+            block_w, block_h, line_boxes = _measure_block(
+                lines, font, max(1, int(font_size * 0.12))
+            )
+            for _fs in _sizes[_first_viable_index():]:
+                _f  = _load_font(FONT_PATH, _fs)
                 _ls = _wrap_lines(fallback_title, _f)
                 if len(_ls) > MAX_LINES:
                     continue
-                _widest  = max((draw.textlength(ln, font=_f) for ln in _ls), default=0)
-                _block_h = int(_fs * 1.15) * len(_ls)
-                _budget  = max_h if len(_ls) == 1 else int(max_h * 1.7)
-                if _widest <= max_w and _block_h <= _budget:
+                _gap = max(1, int(_fs * 0.12))
+                _shadow = max(2, int(_fs * 0.04))
+                _block_w, _block_h, _line_boxes = _measure_block(_ls, _f, _gap)
+                if _block_w + _shadow <= max_w and _block_h + _shadow <= max_h:
                     font, font_size, lines = _f, _fs, _ls
+                    shadow_offset = _shadow
+                    block_w, block_h, line_boxes = _block_w, _block_h, _line_boxes
                     break
         except OSError:
             font      = ImageFont.load_default()
             font_size = MIN_FONT_SIZE
             lines     = [fallback_title]
+            shadow_offset = max(2, int(font_size * 0.04))
+            block_w, block_h, line_boxes = _measure_block(lines, font, max(1, int(font_size * 0.12)))
 
-        # Centre the multi-line block vertically around title_cy.
-        line_height    = int(font_size * 1.15)
-        total_height   = line_height * len(lines)
-        block_top      = title_cy - total_height // 2
-        shadow_offset  = max(2, int(font_size * 0.04))
+        if lines and line_boxes:
+            layer_w = max(1, int(np.ceil(block_w + shadow_offset)))
+            layer_h = max(1, int(np.ceil(block_h + shadow_offset)))
+            text_layer = Image.new("RGBA", (layer_w, layer_h), (0, 0, 0, 0))
+            layer_draw = ImageDraw.Draw(text_layer)
 
-        for i, line in enumerate(lines):
-            line_cy = block_top + i * line_height + line_height // 2
-            tx, ty  = _text_center(draw, line, font, width / 2, line_cy)  # type: ignore
-            draw.text((tx + shadow_offset, ty + shadow_offset), line, font=font, fill=(0, 0, 0, 180))
-            draw.text((tx, ty),                                  line, font=font, fill=(255, 255, 255, 255))
+            cursor_y = 0
+            line_gap = max(1, int(font_size * 0.12))
+            for line, bbox in line_boxes:
+                line_w = bbox[2] - bbox[0]
+                line_h = bbox[3] - bbox[1]
+                tx = (block_w - line_w) / 2 - bbox[0]
+                ty = cursor_y - bbox[1]
+                layer_draw.text((tx + shadow_offset, ty + shadow_offset), line, font=font, fill=(0, 0, 0, 180))
+                layer_draw.text((tx, ty),                                  line, font=font, fill=(255, 255, 255, 255))
+                cursor_y += line_h + line_gap
 
-    # Resolve the info-sash pick once, regardless of whether the diagonal sash
-    # itself is rendered independently.
-    #
-    # When greyscale is active on an unreleased title (Cinema / Production),
-    # force the release-status slot to the front so its badge always wins — that
-    # tells the user the poster is greyscale because it's unavailable, rather
-    # than a title whose art happens to be black & white.
-    _sash_priority = cfg.sash_priority
-    if (cfg.cinema_greyscale and discovery_meta is not None
-            and discovery_meta.release_status in ("Cinema", "Production")
-            and "release_status" in _sash_priority):
-        _sash_priority = ["release_status"] + [s for s in _sash_priority if s != "release_status"]
-    sash_result = (
-        pick_sash(discovery_meta, _sash_priority)
-        if discovery_meta is not None
-        else None
-    )
+            scale = min(max_w / text_layer.width, max_h / text_layer.height, 1.0)
+            if scale < 1.0:
+                text_layer = text_layer.resize(
+                    (max(1, int(text_layer.width * scale)), max(1, int(text_layer.height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
 
-    # --- Shared frosted tint (Match Notch Colour) ---------------------------
-    # When the frosted rating bar (mode 4) and a poster-coloured sash element are
-    # both on (a frosted notch badge OR a poster-coloured diagonal sash) and
-    # bar_match_notch is set, sample each region now (before either is drawn) and
-    # force both to the more saturated of the two colours so they match.
-    _shared_tint: tuple[float, float, float] | None = None
-    _sash_shown    = cfg.sash_mode != "hidden" and sash_result is not None
+            logo_x = round((width - text_layer.width) / 2)
+            if cfg.logo_bottom_anchor:
+                baseline = height - int(height * cfg.logo_bottom_ratio)
+                logo_y = baseline - text_layer.height
+            else:
+                centre_y = logo_centre_y(height, cfg.logo_bottom_ratio)
+                logo_y = int(centre_y - text_layer.height / 2)
+            image.paste(text_layer, (logo_x, logo_y), text_layer)
+
+
+    # --- Frosted tint colour -------------------------------------------------
+    # Every frosted element (rating bar, notch badge, poster-coloured sash) tints
+    # from ONE whole-poster colour sample, taken from the un-graded artwork. Since
+    # they all draw from the same sample they always match automatically — so the
+    # bar simply adopts the notch's colour (and, below, its saturation) whenever a
+    # frosted notch is shown, with no separate "match" toggle needed. A tinted
+    # vignette drew from the same sample above; reuse it rather than re-quantising.
     _notch_frosted = _sash_shown and cfg.sash_mode == "notch" and cfg.sash_badge_style == "frosted"
     _sash_poster   = _sash_shown and cfg.sash_mode == "sash" and cfg.sash_poster_color
-    if (
-        cfg.bar_match_notch
-        and cfg.rating_display_mode == 4
-        and cfg.bar_style in ("frosted", "rating_frosted")
-        and (_notch_frosted or _sash_poster)
-    ):
-        _bar_rgb = sample_frosted_bar_rgb(image, cfg.bar_height_ratio, cfg.bar_bottom_inset)
-        if _notch_frosted:
-            _sash_rgb = sample_frosted_notch_rgb(
-                image, translate_sash(sash_result[0], cfg.logo_language), sash_type=sash_result[1],
-                size_ratio_w=cfg.sash_badge_size_w, size_ratio_h=cfg.sash_badge_size_h,
-                font_size_ratio=cfg.sash_badge_font_ratio, notch_inset=cfg.sash_badge_inset,
-                star=(sash_result[1] == "win" and sash_result[0] in _STAR_WIN_AWARDS),
-            )
-        else:
-            _sash_rgb = sample_frosted_sash_rgb(image)
-        def _sat(rgb: tuple[float, float, float]) -> float:
-            import colorsys
-            return colorsys.rgb_to_hsv(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255)[1]
-        _shared_tint = _bar_rgb if _sat(_bar_rgb) >= _sat(_sash_rgb) else _sash_rgb
+    _bar_frosted   = cfg.rating_display_mode == 4 and cfg.bar_style in ("frosted", "rating_frosted")
+    _frost_tint: tuple[float, float, float] | None = (
+        (_strict_tint if _strict_tint is not None else dominant_frost_rgb(_frost_color_src))
+        if (_bar_frosted or _notch_frosted or _sash_poster) else None
+    )
+    # A tinted vignette and a frosted notch sample the same artwork but answer
+    # different questions — the vignette asks what the band's own stretch of art is
+    # made of, the notch what colour the poster is — so they can land some way
+    # apart, which reads as two elements disagreeing.  This option settles it in
+    # the vignette's favour.  It can only ever adopt a colour the vignette is
+    # actually wearing: a band that came out black has no colour to match, and the
+    # notch keeps its own logic rather than tinting from a hue nothing else on the
+    # poster shows.  The frosted bar follows, as it already follows the notch.
+    _frost_matched = (
+        cfg.notch_vignette_color and _notch_frosted and _vignette_shown is not None
+    )
+    if _frost_matched:
+        _frost_tint = _vignette_shown
+    # Matching gets its own mode rather than the saturation slider or plain
+    # reference.  The slider turns a poster colour into a pastel that is not that
+    # colour any more; reference keeps the saturation but lifts the Value to make
+    # the panel light, and since chroma is S x V that alone hands a dark muted band
+    # back as a bright one.  "match" holds chroma where the band had it.  The two
+    # controls are mutually exclusive in the configurator for the same reason.
+    _frost_ref: bool | str = "match" if _frost_matched else cfg.frost_reference
+    # One saturation for every frosted element: a frosted notch owns it (its slider
+    # lives in the sash panel); otherwise the rating bar's slider drives it. Sharing
+    # it keeps the bar and any sash/notch identical.
+    _frost_sat = cfg.sash_badge_frost_saturation if _notch_frosted else cfg.bar_frost_saturation
 
     # --- Rating / genre label ---
     if cfg.rating_display_mode != 0:
@@ -1561,23 +3300,22 @@ def build_poster(
             #
             # The separator immediately before the sash text becomes "★" when
             # the sash is a winner (sash_type == "win") rather than "·".  Same
-            # disambiguation trick used by Compact mode — Best Picture /
-            # Golden Globe / festival wins and nominees share their label
-            # text, so without this they'd be indistinguishable here.
+            # disambiguation trick used by Compact mode — festival wins and
+            # nominees can share their label text, so without this they'd be
+            # indistinguishable here.
             _append_year = cfg.accent_bar_append_mode in (0, 2)
             _append_sash = cfg.accent_bar_append_mode in (1, 2)
             _sash_text_for_label, _sash_type_for_label = (
                 sash_result if (_append_sash and sash_result) else (None, None)
             )
 
-            _pre_sash = [genre_label]
+            _pre_sash = [genre_label] if genre_label else []
             if _append_year and release_year:
                 _pre_sash.append(str(release_year))
             _label_main = " · ".join(_pre_sash)
 
             if _sash_text_for_label:
-                _sash_sep = " ★ " if _sash_type_for_label == "win" else " · "
-                label = _label_main + _sash_sep + translate_sash(_sash_text_for_label, cfg.logo_language)
+                label = _label_main + " · " + translate_sash(_sash_text_for_label, cfg.logo_language) if _label_main else translate_sash(_sash_text_for_label, cfg.logo_language)
             else:
                 label = _label_main
             rating_cy = height * cfg.accent_bar_y_offset
@@ -1592,15 +3330,23 @@ def build_poster(
                 (tx, ty - int(font_size * 0.10)),
                 label,
                 font=font_meta,
-                fill=(200, 200, 200, 255),
+                fill=(*cfg.rating_text_color, 255) if cfg.rating_text_color else (200, 200, 200, 255),
             )
+            if cfg.score_glow_color == "match":
+                _glow_color = "match"
+            elif len(cfg.score_glow_color) == 6:
+                _glow_color = tuple(int(cfg.score_glow_color[i:i+2], 16) for i in (0, 2, 4))
+            else:
+                _glow_color = None
             draw_score_bar(
                 image, score,
                 bottom_margin=int(height * cfg.accent_bar_bottom_ratio),
                 glow_threshold=cfg.score_glow_threshold,
                 glow_blur=cfg.score_glow_blur,
                 glow_alpha=cfg.score_glow_alpha,
+                glow_color=_glow_color,
                 color_mode=cfg.score_color_mode,
+                custom_palette=cfg.score_custom_palette,
             )
 
         elif cfg.rating_display_mode == 2:
@@ -1614,7 +3360,7 @@ def build_poster(
                 _score_text = "10" if score >= 100 else f"{score / 10:.1f}"
             else:
                 _score_text = str(score)
-            label = f"{genre_label} ★ {_score_text}"
+            label = f"{genre_label} ★ {_score_text}" if genre_label else f"★ {_score_text}"
             rating_cy = height * cfg.numeric_score_y_offset
 
             try:
@@ -1627,7 +3373,7 @@ def build_poster(
                 (tx, ty - int(font_size * 0.10)),
                 label,
                 font=font_meta,
-                fill=(200, 200, 200, 255),
+                fill=(*cfg.rating_text_color, 255) if cfg.rating_text_color else (200, 200, 200, 255),
             )
 
         elif cfg.rating_display_mode == 3:
@@ -1640,64 +3386,153 @@ def build_poster(
 
             y = round(height * cfg.minimalist_mode_font_y_offset)
             right_edge = width - int(width * cfg.minimalist_mode_font_x_offset)
-            _ink = (235, 235, 235, 255)
+            _ink = (*cfg.rating_text_color, 255) if cfg.rating_text_color else (235, 235, 235, 255)
 
-            # Segments, each tagged with the SEPARATOR that precedes it:
-            #   "pip"  — silver vertical pip (before the year)
-            #   "star" — ★ glyph (before the rating/score)
-            #   "rpip" — pip COLOURED by score (mode 0 only: the rating shown
-            #            purely by colour, no number)
-            # Mode 0 ("Year"): genre [rating-pip] year
-            # Mode 1 ("Rating"): genre ★ score
-            # Mode 2 ("Year + Rating"): genre [pip] year ★ score
+            # Segments, each tagged with the ROLE of the separator that precedes
+            # it.  The role says what the separator divides; the configured
+            # style says what it is drawn as.  Keeping those apart is what lets
+            # every mode's separator be restyled without the layout knowing:
+            #   "field"  — between two plain fields (genre | year).  Text colour.
+            #   "rfield" — the same slot in Year mode, where the separator IS
+            #              the rating: it takes the score's colour, because
+            #              nothing else in that layout shows the score at all.
+            #   "rating" — immediately before a printed score.  Defaults to the
+            #              ★, which labels the number rather than dividing it
+            #              off, but can be a plain separator instead.
+            # Mode 0 ("Year"):   genre [rfield] year
+            # Mode 1 ("Rating"): genre [rating] score
+            # Mode 2 ("Both"):   genre [field] year [rating] score
+            # Mode 3 ("Split"):  genre [field] year .................... score
+            #   The same left-hand group as Both with the score moved to the
+            #   opposite margin, where it needs nothing to say what it is — a
+            #   separator earns its place between things that would otherwise
+            #   run together, and nothing runs together across a poster's width.
             _has_score = score not in ("N/A", None)
-            parts = [(genre_label, None)]   # (text, separator_before)
+            # Score formatting matches the other modes: out of 100 by default,
+            # one decimal out of 10 ("8.7"), with a bare "10" at the top.
+            if _has_score and cfg.minimalist_score_out_of_10:
+                _score_str = "10" if int(score) >= 100 else f"{int(score) / 10:.1f}"
+            else:
+                _score_str = str(score)
+            parts = [(genre_label, None)] if genre_label else []
+            left_parts: list[tuple[str, str | None]] = []
             if cfg.minimalist_append_mode == 0:
                 if release_year:
-                    parts.append((str(release_year), "rpip"))
+                    parts.append((str(release_year), "rfield" if parts else None))
             elif cfg.minimalist_append_mode == 1:
                 if _has_score:
-                    parts.append((str(score), "star"))
-            else:  # 2 — Year + Rating
+                    parts.append((_score_str, "rating" if parts else None))
+            elif cfg.minimalist_append_mode == 3:   # Split
                 if release_year:
-                    parts.append((str(release_year), "pip"))
+                    parts.append((str(release_year), "field" if parts else None))
+                left_parts, parts = parts, ([(_score_str, None)] if _has_score else [])
+            else:  # 2 — Both
+                if release_year:
+                    parts.append((str(release_year), "field" if parts else None))
                 if _has_score:
-                    parts.append((str(score), "star"))
+                    parts.append((_score_str, "rating" if parts else None))
 
             pip_gap = int(font_size * 0.55)
             pip_w   = max(4, int(font_size * 0.18))
             pip_h   = int(font_size * 1.4)
             pip_cy  = round(y + font_size * 0.60)
-            star_w  = draw.textlength("★", font=font_meta)
+
+            # Style resolution.  The two field roles share one setting because
+            # they are the same slot in different layouts; the rating role has
+            # its own, since the ★ only makes sense in front of a number and
+            # would be nonsense between a genre and a year.  A glyph reserves
+            # its own width where the bar has a fixed one, so the choice has to
+            # reach the layout below and not just the drawing.
+            _SEP_GLYPH = {"pip": None, "bullet": "•", "star": "★"}
+
+            def _sep_style(role: str) -> str:
+                return (cfg.minimalist_rating_separator if role == "rating"
+                        else cfg.minimalist_separator)
+
+            def _sep_glyph(role: str) -> str | None:
+                # Unknown styles fall back to the bar rather than raising: this
+                # runs per poster, and a bad value is a config problem, not a
+                # reason to fail the render.
+                return _SEP_GLYPH.get(_sep_style(role))
+
+            def _sep_width(role: str) -> float:
+                glyph = _sep_glyph(role)
+                return pip_w if glyph is None else draw.textlength(glyph, font=font_meta)
+
+            def _score_int(value) -> "int | None":
+                try:
+                    return max(0, min(int(value), 100))
+                except (TypeError, ValueError):
+                    return None
 
             # Lay out right-to-left: each segment, with its separator to its left.
+            ops    = []   # (kind, x[, text]); kind in text|field|rfield|rating
             cursor = right_edge
-            ops    = []   # (kind, x[, text]); kind in text|pip|rpip|star
             for i in range(len(parts) - 1, -1, -1):
                 seg, sep = parts[i]
-                seg_x = cursor - draw.textlength(seg, font=font_meta)
+                seg_x = int(cursor - draw.textlength(seg, font=font_meta))
                 ops.append(("text", seg_x, seg))
                 cursor = seg_x
                 if sep:
                     cursor -= pip_gap
-                    sep_w  = star_w if sep == "star" else pip_w
+                    sep_w  = _sep_width(sep)
                     sep_x  = cursor - sep_w
                     ops.append((sep, sep_x))
                     cursor = sep_x - pip_gap
+
+            # Optional centre anchor.  The logo above is centred on the poster,
+            # so the metadata line can be too; the x offset then stops being a
+            # right margin and simply stops applying.  The loop above leaves
+            # `cursor` on the group's left edge, so its exact drawn extent is
+            # known here and the whole thing can just be slid into the middle —
+            # measured after layout rather than predicted before it, because the
+            # per-segment rounding above would otherwise push the result a pixel
+            # or two off centre.  Split is excluded: its two groups are DEFINED
+            # by the opposite margins they hang off, so there is no single group
+            # left to centre, and the option is hidden in the configurator.
+            if cfg.minimalist_center and cfg.minimalist_append_mode != 3 and ops:
+                _shift = round(width / 2 - (cursor + right_edge) / 2)
+                ops = [(op[0], op[1] + _shift, *op[2:]) for op in ops]
+
+            # ...and the split mode's left-hand group the same way but forwards,
+            # off the opposite margin, so the two groups sit symmetrically.
+            cursor = width - right_edge
+            for seg, sep in left_parts:
+                if sep:
+                    cursor += pip_gap
+                    ops.append((sep, int(cursor)))
+                    cursor += _sep_width(sep) + pip_gap
+                ops.append(("text", int(cursor), seg))
+                cursor += draw.textlength(seg, font=font_meta)
 
             for op in ops:
                 kind, ox = op[0], op[1]
                 if kind == "text":
                     draw.text((ox, y), op[2], font=font_meta, fill=_ink)
-                elif kind == "star":
-                    draw.text((ox, y), "★", font=font_meta, fill=_ink)
-                elif kind == "rpip":
-                    draw_score_bar_vertical(image, score, x=ox, y_center=pip_cy,
-                                            height=pip_h, width=pip_w,
-                                            color_mode=cfg.score_color_mode)
-                else:  # "pip"
+                    continue
+
+                glyph = _sep_glyph(kind)
+                if kind == "rfield":
+                    # The rating shown as a colour.  Both shapes take the same
+                    # score lookup, and both are skipped when there is no score
+                    # to colour them with — a neutral mark in this slot would
+                    # read as a rating rather than as the absence of one.
+                    _sc = _score_int(score)
+                    if _sc is None:
+                        continue
+                    _fill = score_color_for_mode(
+                        _sc, cfg.score_color_mode, cfg.score_custom_palette)[0]
+                else:
+                    # Unless this separator is carrying the rating in Year
+                    # mode, it belongs to the metadata line and follows that
+                    # line's configured (or default) text colour.
+                    _fill = _ink[:3]
+
+                if glyph is None:
                     _draw_solid_pip(image, x=ox, y_center=pip_cy,
-                                    width=pip_w, height=pip_h, color=(192, 192, 200))
+                                    width=pip_w, height=pip_h, color=_fill)
+                else:
+                    draw.text((ox, y), glyph, font=font_meta, fill=(*_fill, 255))
 
         elif cfg.rating_display_mode == 4:
             # Frosted bar — centred dot-separated label at the bottom.
@@ -1730,6 +3565,8 @@ def build_poster(
                 bar_height_ratio = cfg.bar_height_ratio,
                 font_size_ratio  = cfg.bar_font_size_ratio,
                 frost_opacity    = cfg.bar_frost_opacity,
+                frost_saturation = _frost_sat,
+                frost_reference  = _frost_ref,
                 bottom_inset     = cfg.bar_bottom_inset,
                 style            = cfg.bar_style,
                 score            = score if score not in ("N/A", None) else None,
@@ -1738,21 +3575,22 @@ def build_poster(
                     if cfg.bar_accent == "sample" else
                     {"silver": (210, 210, 218), "gold": (212, 175, 55)}.get(cfg.bar_accent)
                     or (
-                        {0: _score_color, 1: _score_color_alt, 2: _score_color_metal}
-                        .get(int(cfg.bar_accent[-1]), _score_color)(int(score))[0]
+                        score_color_for_mode(
+                            int(score),
+                            3 if cfg.bar_accent == "palette_custom" else int(cfg.bar_accent[-1]),
+                            cfg.score_custom_palette,
+                        )[0]
                         if score not in ("N/A", None) else (210, 210, 218)
                     )
                 ) if cfg.bar_style in ("rating_black", "rating_frosted") else None,
-                tint_rgb         = _shared_tint,
+                tint_rgb         = _frost_tint,
+                text_color       = cfg.rating_text_color,
             )
 
     # --- Discovery sash / badge ---
     if cfg.sash_mode != "hidden" and sash_result is not None:
         label, sash_type = sash_result
-        # Decide the ★ winner marker on the CANONICAL English label, then render
-        # the translated label.  (The renderers' own English set-match would miss
-        # a translated label and drop the star.)
-        _is_star  = sash_type == "win" and label in _STAR_WIN_AWARDS
+        _is_star  = cfg.sash_winner_star and sash_type == "win"
         _label_tr = translate_sash(label, cfg.logo_language)
         if cfg.sash_mode == "notch":
             image = draw_award_badge(image, _label_tr, sash_type=sash_type,
@@ -1760,18 +3598,24 @@ def build_poster(
                                      size_ratio_h=cfg.sash_badge_size_h,
                                      notch_style=cfg.sash_badge_style,
                                      notch_inset=cfg.sash_badge_inset,
+                                     notch_pad_ratio=cfg.sash_badge_pad,
                                      font_size_ratio=cfg.sash_badge_font_ratio,
                                      frost_opacity=cfg.sash_badge_frost_opacity,
-                                     tint_rgb=_shared_tint,
-                                     star=_is_star)
+                                     frost_saturation=cfg.sash_badge_frost_saturation,
+                                     frost_reference=_frost_ref,
+                                     tint_rgb=_frost_tint,
+                                     star=_is_star,
+                                     text_color=cfg.sash_text_color)
         else:  # "sash" — diagonal
-            _poster_color = None
-            if cfg.sash_poster_color:
-                _poster_color = _shared_tint or sample_frosted_sash_rgb(image)
+            _poster_color = _frost_tint if cfg.sash_poster_color else None
             image = draw_award_sash(image, _label_tr, sash_type=sash_type, muted=cfg.muted,
                                     length_ratio=cfg.sash_length_ratio,
                                     height_ratio=cfg.sash_height_ratio,
-                                    poster_color=_poster_color)
+                                    poster_color=_poster_color,
+                                    frost_saturation=_frost_sat,
+                                    frost_reference=_frost_ref,
+                                    star=_is_star,
+                                    text_color=cfg.sash_text_color)
 
     return image
 
@@ -1779,6 +3623,29 @@ def build_poster(
 # ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
+
+def prune_rating_state(now: float) -> tuple[int, int]:
+    """Drop rating back-off entries that have expired, and the failure counters
+    left behind by ones that already went.  Returns how many of each.
+
+    Both dicts are keyed by (imdb_id, API key) and are written and cleared
+    together everywhere a request touches them: a failure sets the counter and
+    the back-off, an expiry on access deletes both, a success clears both.  Only
+    this sweep could separate them, by deleting an expired back-off and leaving
+    its counter — which is why the counters are swept by *absence* of a back-off
+    rather than against the list just expired.  That also collects anything
+    stranded before this function existed, without which a long-lived instance
+    keeps a counter for every title that ever failed a rating fetch and was never
+    asked for again.
+    """
+    expired = [k for k, v in _rating_backoff.items() if v <= now]
+    for k in expired:
+        del _rating_backoff[k]
+    orphans = [k for k in _rating_fail_count if k not in _rating_backoff]
+    for k in orphans:
+        del _rating_fail_count[k]
+    return len(expired), len(orphans)
+
 
 async def _with_lease(lease_name: str, ttl_seconds: float) -> str | None:
     """Best-effort leader election (ElfHosted fork). Returns a lease token if
@@ -1812,9 +3679,12 @@ async def _cache_prune_loop() -> None:
 
             if lease_token is not None:
                 logger.info("Running scheduled cache prune (leader)")
-                # prune_caches is async (it deletes composite blobs from the
-                # blobstore alongside the metadata rows); the DB-side work
-                # inside it is sync, fine at a 6h cadence.
+                # ElfHosted fork: prune_caches is a coroutine (it deletes
+                # composite blobs from the blobstore alongside the metadata
+                # rows), so it is awaited rather than handed to the executor —
+                # run_in_executor would build the coroutine in a worker thread
+                # and never run it. The DB-side work inside is still sync,
+                # which is fine at this cadence.
                 await prune_caches()
                 # Coordinator-managed state (rating backoff, bg-fetch claims):
                 # evicts expired per-worker entries on the in-process backend;
@@ -1823,20 +3693,673 @@ async def _cache_prune_loop() -> None:
             else:
                 logger.debug("Cache prune skipped — another replica holds the lease")
 
-            # Evict expired entries from the in-process rating backoff dict.
-            # Done every cycle regardless of leadership since the dict is
-            # per-worker (entries are also removed lazily on access).
-            _now = asyncio.get_running_loop().time()
-            expired = [k for k, v in _rating_backoff.items() if v <= _now]
-            for k in expired:
-                del _rating_backoff[k]
-            if expired:
-                logger.debug(f"Pruned {len(expired)} expired rating backoff entries")
+            # Everything below is per-POD, so it runs whether or not this pod
+            # won the lease. Leadership decides who prunes the SHARED database,
+            # not who cleans up after itself.
+            #
+            # The deferred blob-delete queue is process-local and any worker
+            # can fill it — every invalidation this process performs lands
+            # there — so a follower that never drained would grow to the cap
+            # and start discarding keys, orphaning those objects for good.
+            # The TMDB poster/logo caches are pod-local files, so a follower
+            # that never swept them would keep artwork for every title it ever
+            # rendered, ignoring the configured TTLs until the volume filled.
+            await prune_local_caches()
+
+            # Per-worker in-memory state, so this runs regardless of leadership.
+            expired, orphans = prune_rating_state(asyncio.get_running_loop().time())
+            if expired or orphans:
+                logger.debug(
+                    f"Pruned {expired} expired rating backoff entries "
+                    f"and {orphans} stranded failure counters"
+                )
 
             await asyncio.sleep(6 * 3600)   # every 6 hours
     finally:
         if lease_token is not None:
-            await coord.release_lease(coord.LEASE_CACHE_PRUNE, lease_token)
+            with suppress(Exception):
+                await coord.release_lease(coord.LEASE_CACHE_PRUNE, lease_token)
+
+
+async def _run_cache_warm_cycle(client: httpx.AsyncClient) -> None:
+    """
+    Pre-populate the TMDB metadata, poster/backdrop image, and logo caches,
+    plus the MDBList rating/award cache, for currently-trending titles — so
+    the first real requests for them don't all hit upstream APIs/CDNs at
+    once. The poster/backdrop + logo downloads are the slowest, most
+    bandwidth-heavy part of a real request and the most likely to cause a
+    burst-traffic pile-up against a stale cache, so every processed
+    candidate gets the same default art fetched as a real view would.
+
+    If CACHE_WARM_CATALOG_URLS is set, the catalogs exposed by those addon
+    manifests are fetched first (the same way a Stremio client would when a
+    user opens that catalog) and warmed ahead of trending/popular/
+    supplemental, capped at CACHE_WARM_CATALOG_MAX_ITEMS items per catalog.
+
+    Single pass over a ranked, deduped candidate list (catalog, then
+    trending, then popular, then supplemental — top rated / now playing /
+    on the air): walks until the TMDB metadata budget is spent or the
+    candidate list is exhausted. MDBList lookups are interleaved for as long
+    as the MDBList budget allows, then the loop continues warming TMDB-only
+    for the remainder. Both budgets only count actual cache-miss
+    metadata/rating API calls — entries already warm (including images and
+    logos) cost nothing.
+
+    If CACHE_WARM_QUALITY_ENABLED is set, also pre-fetches quality badge
+    data (resolution/source/HDR tokens) for every processed candidate via
+    the configured quality source (series default to S01E01). This is off
+    by default — see the config comment for why.
+    """
+    global _mdblist_semaphore, _mdblist_active_key_idx, _quality_bg_semaphore
+
+    if not _cfg.SERVER_TMDB_KEY:
+        logger.info("Cache warm: skipped — no server TMDB key configured")
+        return
+
+    tmdb_budget    = max(0, _cfg.CACHE_WARM_TMDB_BUDGET)
+    mdblist_budget = max(0, _cfg.CACHE_WARM_MDBLIST_BUDGET)
+    if tmdb_budget == 0:
+        logger.info("Cache warm: skipped — CACHE_WARM_TMDB_BUDGET is 0")
+        return
+
+    effective_mdblist_key = _resolve_mdblist_key("") if _cfg.SERVER_MDBLIST_KEYS else None
+    if not effective_mdblist_key:
+        mdblist_budget = 0
+
+    # Mix three sources: trending (volatile, day/week hot list), popular
+    # (broad, slow-moving catalogue staples), and supplemental (top rated /
+    # now playing / on the air — acclaimed and currently-airing titles that
+    # trending and popular tend to miss). Split the target list across the
+    # three so warming covers "what's hot right now", "what people steadily
+    # watch", and "what's airing/acclaimed". Each source is independently
+    # ranked/deduped; the combined list is deduped again here so a title
+    # appearing in multiple sources only costs one slot.
+    target_total  = max(tmdb_budget, mdblist_budget) or tmdb_budget
+    trending_target    = (target_total * 4 + 9) // 10  # ~40%
+    popular_target     = (target_total * 3 + 9) // 10  # ~30%
+    supplemental_target = target_total - trending_target - popular_target  # ~30%
+
+    catalog_candidates, trending_candidates, popular_candidates, supplemental_candidates = await asyncio.gather(
+        fetch_catalog_candidates(
+            client, _cfg.CACHE_WARM_CATALOG_URLS, _cfg.SERVER_TMDB_KEY,
+            max_items_per_catalog=_cfg.CACHE_WARM_CATALOG_MAX_ITEMS,
+        ),
+        fetch_trending_candidates(client, _cfg.SERVER_TMDB_KEY, max_items=trending_target),
+        fetch_popular_candidates(client, _cfg.SERVER_TMDB_KEY, max_items=popular_target),
+        fetch_supplemental_candidates(client, _cfg.SERVER_TMDB_KEY, max_items=supplemental_target),
+    )
+
+    # Catalog candidates come first so a user-requested catalog is warmed
+    # ahead of generic trending/popular/supplemental within the shared budgets.
+    seen: set[tuple[str, str]] = set()
+    candidates: list[dict] = []
+    for item in catalog_candidates + trending_candidates + popular_candidates + supplemental_candidates:
+        key = (item["media_type"], item["tmdb_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(item)
+
+    logger.info(
+        f"Cache warm: starting cycle — {len(candidates)} candidates "
+        f"({len(catalog_candidates)} catalog, {len(trending_candidates)} trending, "
+        f"{len(popular_candidates)} popular, {len(supplemental_candidates)} supplemental, "
+        f"{len(catalog_candidates) + len(trending_candidates) + len(popular_candidates) + len(supplemental_candidates) - len(candidates)} overlap), "
+        f"tmdb_budget={tmdb_budget}, mdblist_budget={mdblist_budget}"
+    )
+
+    if _mdblist_semaphore is None:
+        _mdblist_semaphore = asyncio.Semaphore(_cfg.MDBLIST_CONCURRENCY)
+
+    tmdb_calls      = 0
+    mdblist_calls   = 0
+    quality_calls   = 0
+    detection_calls = 0
+    titles_seen     = 0
+
+    # Text-detection scans (~400ms each) are pipelined: queue a scan and keep
+    # processing later candidates' metadata/image/rating work while it runs,
+    # only blocking once _DETECTION_PIPELINE_DEPTH scans are in flight. The
+    # existing TEXTLESS_DETECTION_CONCURRENCY semaphore still caps how many
+    # actually run at once — this just stops the loop from idling while they do.
+    _pending_detections: list[asyncio.Task] = []
+    _detection_pipeline_depth = _cfg.TEXTLESS_DETECTION_CONCURRENCY + 1
+
+    for candidate in candidates:
+        if tmdb_calls >= tmdb_budget:
+            break
+
+        tmdb_id    = candidate["tmdb_id"]
+        media_type = candidate["media_type"]
+        endpoint   = "tv" if media_type in ("tv", "series") else "movie"
+
+        metadata_cache_key = tmdb_metadata_cache_key(endpoint, tmdb_id, "en")
+        cached_meta = get_cached_tmdb_metadata(metadata_cache_key)
+
+        if cached_meta is None:
+            try:
+                genre_ids, is_textless, logos, release_year, _title, poster_path, backdrop_path, tmdb_data = (
+                    await _coalesced_fetch_poster_metadata(client, tmdb_id, _cfg.SERVER_TMDB_KEY, media_type, "en")
+                )
+            except Exception as exc:
+                logger.warning(f"Cache warm: TMDB metadata fetch failed for {media_type}/{tmdb_id}: {exc}")
+                continue
+            tmdb_calls += 1
+            imdb_id           = tmdb_data.get("imdb_id")
+            original_language = tmdb_data.get("original_language")
+            original_title    = tmdb_data.get("original_title")
+            vote_count        = tmdb_data.get("vote_count")
+            title             = _title
+        else:
+            genre_ids         = cached_meta.get("genre_ids", [])
+            imdb_id           = cached_meta.get("imdb_id")
+            is_textless       = cached_meta.get("is_textless", False)
+            logos             = cached_meta.get("logos", [])
+            poster_path       = cached_meta.get("poster_path")
+            backdrop_path     = cached_meta.get("backdrop_path")
+            original_language = cached_meta.get("original_language")
+            release_year      = cached_meta.get("release_year")
+            original_title    = cached_meta.get("original_title")
+            vote_count        = cached_meta.get("vote_count")
+            title             = cached_meta.get("title")
+
+        titles_seen += 1
+
+        # Pre-fetch the poster/backdrop image and (when applicable) the logo
+        # this title would render with by default — the slow, bandwidth-heavy
+        # part of a real request. fetch_poster_image/fetch_backdrop_image/
+        # fetch_logo each check their own disk cache first and skip the
+        # download when already warm, so this is cheap in steady state.
+        # Mirrors the default poster-endpoint art selection (textless poster,
+        # else backdrop fallback, else text-bearing poster) but skips the
+        # CPU-heavy text-detection rescue path and original-art mode, which
+        # are per-request preferences rather than the common default.
+        _use_backdrop = bool(backdrop_path) and (poster_path is None or not is_textless)
+        try:
+            if _use_backdrop:
+                await fetch_backdrop_image(client, tmdb_id, backdrop_path, avoid_text=False)
+                _logo_textless = True
+            elif poster_path:
+                await fetch_poster_image(client, tmdb_id, media_type, poster_path)
+                _logo_textless = is_textless
+            else:
+                _logo_textless = False
+
+            if _logo_textless and logos:
+                await fetch_logo(
+                    client, logos, "en",
+                    imdb_id=imdb_id,
+                    original_language=original_language,
+                    logo_priority="native_original",
+                )
+        except Exception as exc:
+            logger.warning(f"Cache warm: image/logo fetch failed for {media_type}/{tmdb_id}: {exc}")
+
+        # Pre-run burned-in-text detection on the textless art selected above —
+        # the same scan a real /poster request would trigger on first view, and
+        # by far the slowest per-request step (~400ms cold). Mirrors the
+        # /poster cache-key scheme exactly (source tag + crop version + conf +
+        # detector signature) so a warmed result is a hit on the real request.
+        # Unlike /poster, no vote-count gate: warming happens off the request
+        # path, so every textless title gets resolved up front.
+        if _cfg.TEXTLESS_TEXT_DETECTION and is_textless and (_use_backdrop or poster_path):
+            try:
+                from text_detect import DETECT_RES_SIG
+
+                if _use_backdrop:
+                    _det_src = f"bd:{backdrop_path}:{_CROP_VERSION}:plain"
+                    _image_cache_key = f"backdrop_{tmdb_id}_{backdrop_path.strip('/')}_{_CROP_VERSION}"
+                    _det_source = "backdrop"
+                else:
+                    _det_src = f"ps:{poster_path}"
+                    _image_cache_key = f"{media_type}_{tmdb_id}_{poster_path.strip('/')}"
+                    _det_source = "poster"
+
+                _det_key = f"{_det_src}|conf={_cfg.PPOCR_BOX_THRESHOLD}:{DETECT_RES_SIG}"
+                if get_cached_text_detection(_det_key) is None:
+                    _det_image = await asyncio.get_running_loop().run_in_executor(
+                        None, _load_detection_image, _image_cache_key
+                    )
+                    if _det_image is not None:
+                        _text_titles = tuple(dict.fromkeys(
+                            value for value in (title, original_title) if value
+                        ))
+                        _pending_detections.append(_start_text_detection(
+                            _det_key,
+                            _det_image,
+                            title=_text_titles,
+                            source=_det_source,
+                            tmdb_id=tmdb_id,
+                            vote_count=vote_count,
+                            source_key=_det_src,
+                            media_type=media_type,
+                            image_path=poster_path,
+                            foreground=False,
+                        ))
+                        detection_calls += 1
+                        if len(_pending_detections) >= _detection_pipeline_depth:
+                            _done, _pending = await asyncio.wait(
+                                _pending_detections, return_when=asyncio.FIRST_COMPLETED
+                            )
+                            _pending_detections = list(_pending)
+            except Exception as exc:
+                logger.warning(f"Cache warm: text detection failed for {media_type}/{tmdb_id}: {exc}")
+
+        # Optionally pre-fetch quality badge data (resolution/source/HDR) via
+        # the configured quality source. Series default to S01E01 — the warm
+        # cycle has no concept of "which episode", so this is a best-effort
+        # warm of the most commonly requested entry point. Off by default;
+        # see CACHE_WARM_QUALITY_ENABLED for why.
+        if _cfg.CACHE_WARM_QUALITY_ENABLED and imdb_id:
+            if quality_source_configured() and _quality_backoff_remaining() <= 0:
+                if get_cached_quality(imdb_id, release_year) is None:
+                    if _quality_bg_semaphore is None:
+                        _quality_bg_semaphore = asyncio.Semaphore(_cfg.QUALITY_BG_CONCURRENCY)
+                    try:
+                        async with _quality_bg_semaphore:
+                            q_result = await _with_retry(
+                                fetch_quality,
+                                client, imdb_id, media_type, 1, 1, release_year,
+                            )
+                        quality_calls += 1
+                        _record_quality_result(q_result)
+                        if q_result is QUALITY_PENDING:
+                            # Still counts as a warm: the lookup registered the
+                            # title with QualiCache, which now queues it.
+                            logger.debug(f"Cache warm: quality pending for {imdb_id}")
+                        elif q_result is FETCH_FAILED:
+                            logger.warning(f"Cache warm: quality fetch failed for {imdb_id}")
+                    except Exception as exc:
+                        quality_calls += 1
+                        _record_quality_result(FETCH_FAILED)
+                        logger.warning(f"Cache warm: quality fetch failed for {imdb_id}: {exc}")
+
+        if mdblist_calls >= mdblist_budget:
+            continue
+
+        # Warm under exactly the identity /poster reads, or the row is written
+        # where nothing looks for it. A title TMDB has no IMDb link for is warmed
+        # through the TMDB route rather than skipped.
+        warm_canonical_id = _canonical_rating_id(imdb_id or "", "", tmdb_id)
+        warm_provider     = "imdb" if imdb_id else "tmdb"
+        warm_media_id     = imdb_id or tmdb_id
+
+        if get_cached_rating(warm_canonical_id) is not None:
+            continue  # rating already fresh — nothing to do
+
+        # The quota is per day, not per second, and the warmer shares it with
+        # real requests. Stop spending a key before it is drained so the rest
+        # of the day still renders ratings — on a free key (1000/day) the
+        # default budget alone would otherwise take half the quota in one
+        # cycle. A key live traffic has already put on cooldown is skipped the
+        # same way. When a sibling key still has room, warming moves to it.
+        _warm_now = asyncio.get_running_loop().time()
+        _warm_key = _warm_mdblist_key_with_quota(
+            effective_mdblist_key, _warm_now, _cfg.CACHE_WARM_MDBLIST_RESERVE
+        )
+        if _warm_key is None:
+            logger.info(
+                f"Cache warm: no MDBList key with quota above the reserve "
+                f"({_cfg.CACHE_WARM_MDBLIST_RESERVE}) or off cooldown — "
+                f"stopping MDBList warming for this cycle after {mdblist_calls} calls"
+            )
+            mdblist_budget = mdblist_calls
+            continue
+        if _warm_key != effective_mdblist_key:
+            logger.info(
+                f"Cache warm: MDBList {_mdblist_server_key_label(effective_mdblist_key)} at its "
+                f"quota reserve or cooling down — warming continues on "
+                f"{_mdblist_server_key_label(_warm_key)}"
+            )
+            effective_mdblist_key = _warm_key
+
+        await asyncio.sleep(0.25)
+
+        async def _fetch_rating_warm(_key: str):
+            async with _mdblist_semaphore:
+                return await fetch_rating(
+                    client, _key, genre_ids, media_type,
+                    media_id=warm_media_id, provider=warm_provider,
+                )
+
+        result = await _fetch_rating_warm(effective_mdblist_key)
+        mdblist_calls += 1
+
+        if isinstance(result, _RateLimited):
+            backoff_secs, replacement = _mark_mdblist_rate_limit(warm_canonical_id, effective_mdblist_key, result)
+            logger.warning(
+                f"Cache warm: MDBList rate-limited on {warm_canonical_id}; "
+                f"key cooling down for {backoff_secs:.0f}s"
+            )
+            # The warmer runs on one replica but spends the key every replica
+            # shares, so its 429 has to reach them too — otherwise the other
+            # replicas keep issuing live requests against a key that is done
+            # for the day.
+            await _publish_fleet_mdblist_cooldown(effective_mdblist_key, backoff_secs)
+            if replacement:
+                effective_mdblist_key = replacement
+            else:
+                logger.info("Cache warm: no healthy MDBList key remains — stopping MDBList warming for this cycle")
+                mdblist_budget = mdblist_calls  # stop further MDBList attempts
+            continue
+
+        if result is FETCH_FAILED:
+            logger.warning(f"Cache warm: MDBList fetch failed for {warm_canonical_id} — stopping MDBList warming for this cycle")
+            mdblist_budget = mdblist_calls  # stop further MDBList attempts
+            continue
+
+        ratings_dict, genre, rel, keywords, age_rating = result
+        award_wins, award_noms = parse_mdblist_awards(keywords, tmdb_id=tmdb_id, media_type=media_type)
+        kw_names = {(kw.get("name") or "").lower().strip() for kw in keywords}
+        festival_keyword = match_festival_keyword(kw_names)
+        is_cult       = bool({"cult-classic", "cult-film"} & kw_names)
+        is_true_story = "based-on-true-story" in kw_names
+        is_metacritic = "metacritic-must-see" in kw_names
+
+        set_cached_rating(
+            warm_canonical_id,
+            ratings_dict if isinstance(ratings_dict, dict) else {},
+            genre or "Unknown",
+            rel,
+            award_wins,
+            award_noms,
+            awards_fetched=True,
+            festival_keyword=festival_keyword,
+            age_rating=age_rating,
+            is_cult=is_cult,
+            is_true_story=is_true_story,
+            is_metacritic=is_metacritic,
+        )
+
+    if _pending_detections:
+        await asyncio.gather(*_pending_detections, return_exceptions=True)
+
+    _quota_note = ""
+    if effective_mdblist_key:
+        _quota_left = mdblist_quota_remaining(effective_mdblist_key)
+        if _quota_left is not None:
+            _quota_note = f", {_quota_left} MDBList daily requests left on the active key"
+    logger.info(
+        f"Cache warm: cycle complete — {titles_seen} titles processed, "
+        f"{tmdb_calls} TMDB calls, {mdblist_calls} MDBList calls, "
+        f"{quality_calls} quality calls, {detection_calls} text-detection scans{_quota_note}"
+    )
+
+
+_CACHE_WARM_LAST_RUN_KEY = "cache_warm_last_run"
+# Wait this long after startup before the very first-ever cycle, so it
+# doesn't compete with other startup warm-up work (text detection model,
+# genre backgrounds, etc.).
+_CACHE_WARM_STARTUP_GRACE_SECS = 60
+# When a restart finds the cycle already overdue, still wait this long before
+# running — avoids hammering startup with warming work on a crash-loop.
+_CACHE_WARM_MIN_WAIT_SECS = 60
+
+
+def _format_local(ts: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def _seconds_until_next_hour(target_hour: float, now: float | None = None) -> float:
+    """Seconds from `now` until the next occurrence of `target_hour` (0-24,
+    local time, may be fractional e.g. 4.5 for 4:30am). Always returns a
+    positive value — if `target_hour` is the current hour, rolls to tomorrow.
+    """
+    if now is None:
+        now = time.time()
+    local = time.localtime(now)
+    midnight = now - (local.tm_hour * 3600 + local.tm_min * 60 + local.tm_sec)
+    target = midnight + target_hour * 3600
+    if target <= now:
+        target += 86400
+    return target - now
+
+# Third-party credentials must never be persisted to the poster cache. They are
+# stripped before storage; the background regeneration cycle re-supplies the
+# server-side keys. access_key is intentionally kept — the /poster replay needs
+# it to pass the instance access gate, and it is the instance's own key.
+_UNCACHEABLE_PARAMS = {"tmdb_key", "mdblist_key"}
+
+
+def _sanitize_request_params(query: str) -> str:
+    """Drop user API keys from a stored query string, preserving order."""
+    if not query:
+        return query
+    kept = [(k, v) for k, v in parse_qsl(query, keep_blank_values=True)
+            if k not in _UNCACHEABLE_PARAMS]
+    return urlencode(kept)
+
+
+async def _run_trending_fetch_cycle(client: httpx.AsyncClient) -> None:
+    logger.info("Starting scheduled trending fetch cycle")
+    if not _cfg.SERVER_TMDB_KEY:
+        logger.info("Trending fetch: skipped - no server TMDB key configured")
+        return
+
+    try:
+        trending = await fetch_trending_candidates(
+            client, _cfg.SERVER_TMDB_KEY, max_items=max(_cfg.TRENDING_FETCH_COUNT, _cfg.TRENDING_BROAD_FETCH_COUNT)
+        )
+    except Exception as exc:
+        logger.error(f"Trending fetch: failed to fetch candidates: {exc}")
+        return
+
+    # Build the set of trending (tmdb_id, type) pairs. TV titles are cached under
+    # both "tv" and "series" (Stremio uses "series"), so include both variants.
+    # Keeping the media type prevents a movie and a TV show that share a numeric
+    # TMDB id from cross-triggering each other's regeneration.
+    trending_pairs: set[tuple[str, str]] = set()
+    for item in trending:
+        tid = item.get("tmdb_id")
+        if tid is None:
+            continue
+        tid = str(tid)
+        mt = item.get("media_type")
+        if mt in ("tv", "series"):
+            trending_pairs.add((tid, "tv"))
+            trending_pairs.add((tid, "series"))
+        elif mt:
+            trending_pairs.add((tid, mt))
+    if not trending_pairs:
+        return
+
+    rows = list_composite_request_params()
+
+    # Use a test client to regenerate posters through the API
+    regenerated_count = 0
+    
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as local_client:
+        for cache_key, req_params_str in rows:
+            parts = cache_key.split(":")
+            if len(parts) < 4:
+                continue
+            if (parts[1], parts[2]) not in trending_pairs:
+                continue
+            if not req_params_str:
+                continue
+            logger.info(f"Trending fetch: regenerating poster for {cache_key}")
+            try:
+                # Delete first so the replay misses the cache and re-renders with
+                # the fresh trending rank instead of serving the stale composite.
+                delete_cached_final_poster(cache_key)
+                resp = await local_client.get(f"/poster?{req_params_str}")
+                if resp.status_code >= 400:
+                    logger.warning(f"Trending fetch: regenerate for {cache_key} returned HTTP {resp.status_code}")
+                else:
+                    regenerated_count += 1
+            except Exception as exc:
+                logger.error(f"Trending fetch: failed to regenerate poster {cache_key}: {exc}")
+                    
+    logger.info(f"Trending fetch cycle completed. Regenerated {regenerated_count} posters.")
+
+
+async def _trending_fetch_loop() -> None:
+    """Periodically fetch trending items and regenerate cached posters."""
+    # ElfHosted fork: leader-elected. This cycle re-renders composites through
+    # the API, so on an N-replica deployment it would otherwise do N times the
+    # work against the same shared cache.
+    lease_ttl = 26 * 3600.0   # one daily cycle plus headroom
+    lease_token: str | None = None
+
+    async def _lead() -> bool:
+        nonlocal lease_token
+        if lease_token is None:
+            lease_token = await _with_lease(coord.LEASE_TRENDING_FETCH, lease_ttl)
+        elif not await coord.refresh_lease(
+            coord.LEASE_TRENDING_FETCH, lease_token, lease_ttl
+        ):
+            logger.info(f"Lease {coord.LEASE_TRENDING_FETCH!r} lost")
+            lease_token = None
+        return lease_token is not None
+
+    # First run immediately on startup
+    await asyncio.sleep(10)
+    try:
+        if _HTTP_CLIENT is not None and await _lead():
+            await _run_trending_fetch_cycle(_HTTP_CLIENT)
+    except Exception as exc:
+        logger.error(f"Trending fetch: startup cycle failed: {exc}")
+
+    while True:
+        if not _cfg.TRENDING_FETCH_TIME:
+            wait = 86400.0
+        else:
+            try:
+                tz = zoneinfo.ZoneInfo(_cfg.TRENDING_FETCH_TIMEZONE)
+            except Exception as exc:
+                logger.error(f"Trending fetch: invalid timezone {_cfg.TRENDING_FETCH_TIMEZONE}: {exc}, using UTC")
+                tz = zoneinfo.ZoneInfo("UTC")
+
+            try:
+                h, m = map(int, _cfg.TRENDING_FETCH_TIME.split(':'))
+            except ValueError:
+                h, m = 0, 0
+                
+            now_dt = datetime.now(tz)
+            target_dt = now_dt.replace(hour=h, minute=m, second=0, microsecond=0)
+            if target_dt <= now_dt:
+                target_dt += timedelta(days=1)
+            wait = (target_dt - now_dt).total_seconds()
+            
+        logger.info(f"Trending fetch: next cycle scheduled in {wait / 3600:.1f} hours")
+        try:
+            await asyncio.sleep(wait)
+            try:
+                if _HTTP_CLIENT is None:
+                    pass
+                elif await _lead():
+                    await _run_trending_fetch_cycle(_HTTP_CLIENT)
+                else:
+                    logger.debug("Trending fetch skipped — another replica holds the lease")
+            except Exception as exc:
+                logger.error(f"Trending fetch: cycle failed: {exc}")
+        except asyncio.CancelledError:
+            # Shutdown. Hand the lease back rather than making the next pod
+            # wait out a 26-hour TTL before anything refreshes trending again —
+            # a rolling deploy would otherwise skip a daily cycle every time.
+            if lease_token is not None:
+                with suppress(Exception):
+                    await coord.release_lease(coord.LEASE_TRENDING_FETCH, lease_token)
+                lease_token = None
+            raise
+
+
+async def _cache_warm_loop(digital_release_ready: asyncio.Event | None = None) -> None:
+    """
+    Periodically warm the TMDB metadata/image and MDBList rating caches for
+    trending + popular titles.
+
+    The last completed cycle's timestamp is persisted (app_state table) so a
+    container restart within CACHE_WARM_INTERVAL_HOURS of the last run
+    doesn't immediately re-run the whole cycle — it instead waits out the
+    remainder of the interval. The very first run ever uses a short startup
+    grace period instead.
+
+    If CACHE_WARM_AT_HOUR is set, steady-state cycles (after the first) are
+    instead scheduled for the next occurrence of that local hour-of-day,
+    rather than exactly CACHE_WARM_INTERVAL_HOURS after the previous run.
+
+    On the very first cycle, also wait (briefly) for the digital-release
+    (movieleaks) sync to finish first, so the two startup background jobs
+    don't both hammer external APIs at the same time.
+    """
+    if not _cfg.CACHE_WARM_ENABLED:
+        return
+
+    interval_secs = max(1.0, _cfg.CACHE_WARM_INTERVAL_HOURS) * 3600
+
+    last_run_raw = get_app_state(_CACHE_WARM_LAST_RUN_KEY)
+    if last_run_raw is not None:
+        try:
+            last_run = float(last_run_raw)
+        except ValueError:
+            last_run = None
+    else:
+        last_run = None
+
+    if last_run is None:
+        wait = float(_CACHE_WARM_STARTUP_GRACE_SECS)
+    elif _cfg.CACHE_WARM_AT_HOUR is not None:
+        wait = max(_CACHE_WARM_MIN_WAIT_SECS, _seconds_until_next_hour(_cfg.CACHE_WARM_AT_HOUR))
+    else:
+        wait = max(_CACHE_WARM_MIN_WAIT_SECS, (last_run + interval_secs) - time.time())
+
+    # ElfHosted fork: leader-elected. The warmer spends the operator's MDBList
+    # daily quota, and its own CACHE_WARM_MDBLIST_RESERVE guard counts only
+    # what THIS process spent — it cannot see sibling replicas draining the
+    # same key. Unleased, an N-replica deployment burns roughly N budgets a
+    # cycle and blows through the reserve the guard exists to protect.
+    lease_ttl = max(interval_secs, 3600.0) + 3600.0
+    lease_token: str | None = None
+
+    first_cycle = True
+    try:
+        while True:
+            logger.info(
+                f"Cache warm: next cycle scheduled for {_format_local(time.time() + wait)} "
+                f"(in {wait / 60:.1f} min)"
+            )
+            await asyncio.sleep(wait)
+            if first_cycle and digital_release_ready is not None and not digital_release_ready.is_set():
+                try:
+                    await asyncio.wait_for(digital_release_ready.wait(), timeout=120)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Cache warm: digital release sync didn't finish within 120s — proceeding anyway"
+                    )
+            first_cycle = False
+
+            if lease_token is None:
+                lease_token = await _with_lease(coord.LEASE_CACHE_WARM, lease_ttl)
+            elif not await coord.refresh_lease(
+                coord.LEASE_CACHE_WARM, lease_token, lease_ttl
+            ):
+                logger.info(f"Lease {coord.LEASE_CACHE_WARM!r} lost")
+                lease_token = None
+
+            try:
+                if lease_token is None:
+                    logger.debug("Cache warm skipped — another replica holds the lease")
+                elif _HTTP_CLIENT is not None:
+                    await _run_cache_warm_cycle(_HTTP_CLIENT)
+                    # Written by the leader only. The timestamp gates the
+                    # restart-suppression wait at the top of this function, and
+                    # it is shared state: a follower writing it would tell every
+                    # replica a cycle had run when none had on their watch.
+                    set_app_state(_CACHE_WARM_LAST_RUN_KEY, str(time.time()))
+                else:
+                    logger.warning("Cache warm: HTTP client not ready — skipping this cycle")
+            except Exception as exc:
+                logger.error(f"Cache warm: cycle failed: {exc}")
+            if _cfg.CACHE_WARM_AT_HOUR is not None:
+                wait = max(_CACHE_WARM_MIN_WAIT_SECS, _seconds_until_next_hour(_cfg.CACHE_WARM_AT_HOUR))
+            else:
+                wait = interval_secs
+    finally:
+        if lease_token is not None:
+            with suppress(Exception):
+                await coord.release_lease(coord.LEASE_CACHE_WARM, lease_token)
 
 
 @asynccontextmanager
@@ -1859,40 +4382,72 @@ async def lifespan(app: FastAPI):
         f"composite TTL {_cfg.COMPOSITE_CACHE_TTL}s / "
         f"{_cfg.COMPOSITE_CACHE_TTL / 86400:.1f}d)"
     )
+    imdb_dataset.init_db()
+    if imdb_dataset.is_enabled():
+        logger.info(
+            f"IMDb local dataset enabled (refresh every {_cfg.IMDB_DATASET_REFRESH_HOURS}h, "
+            f"{imdb_dataset.row_count()} titles currently loaded)"
+        )
     _HTTP_CLIENT = _make_http_client()
     logger.info("HTTP client initialised")
     # Warn on quality source misconfiguration
-    if _cfg.QUALITY_SOURCE == "scraper" and (bool(_cfg.AIOSTREAMS_URL) or bool(_cfg.AIOSTREAMS_AUTH)):
+    _quality_source = active_quality_source()
+    if _cfg.QUALITY_SOURCE not in QUALITY_SOURCES:
         logger.warning(
-            "QUALITY_SOURCE=scraper but AIOSTREAMS_URL/AIOSTREAMS_AUTH are also set — "
-            "scraper will be used; AIOSTREAMS settings are ignored. "
+            f"Unknown QUALITY_SOURCE={_cfg.QUALITY_SOURCE!r} — expected one of "
+            f"{', '.join(QUALITY_SOURCES)}; defaulting to aiostreams behaviour."
+        )
+    elif _quality_source != "aiostreams" and (bool(_cfg.AIOSTREAMS_URL) or bool(_cfg.AIOSTREAMS_AUTH)):
+        logger.warning(
+            f"QUALITY_SOURCE={_quality_source} but AIOSTREAMS_URL/AIOSTREAMS_AUTH are also set — "
+            f"{_quality_source} will be used; AIOSTREAMS settings are ignored. "
             "Unset AIOSTREAMS_URL and AIOSTREAMS_AUTH to silence this warning."
         )
-    if _cfg.QUALITY_SOURCE == "scraper" and not _cfg.SCRAPER_URL:
+    if _quality_source == "scraper" and not _cfg.SCRAPER_URL:
         logger.warning("QUALITY_SOURCE=scraper but SCRAPER_URL is not set — quality fetching is disabled.")
-    if _cfg.QUALITY_SOURCE not in ("aiostreams", "scraper"):
-        logger.warning(f"Unknown QUALITY_SOURCE={_cfg.QUALITY_SOURCE!r} — defaulting to aiostreams behaviour.")
+    if _quality_source == "qualicache" and not _cfg.QUALICACHE_URL:
+        logger.warning("QUALITY_SOURCE=qualicache but QUALICACHE_URL is not set — quality fetching is disabled.")
+    if _quality_source == "qualicache" and _cfg.QUALICACHE_URL:
+        if _cfg.QUALICACHE_MIN_TRUST_RAW not in _cfg.QUALICACHE_MIN_TRUST_VALUES:
+            logger.warning(
+                f"Unknown QUALICACHE_MIN_TRUST={_cfg.QUALICACHE_MIN_TRUST_RAW!r} — "
+                "expected high, medium, or low; defaulting to high."
+            )
+        logger.info(
+            f"Quality source: QualiCache at {_cfg.QUALICACHE_URL} "
+            f"(minimum trust: {_cfg.QUALICACHE_MIN_TRUST})"
+        )
+    if not _cfg.CDN_CACHE_TTL_VALID:
+        logger.warning(
+            f"Unknown CDN_CACHE_TTL={_cfg._CDN_CACHE_TTL_RAW!r} — expected a number of "
+            'seconds or "auto"; sending no Cache-Control.'
+        )
     _configurator_html = _load_configurator_html()
     load_languages()   # poster-output translations (English fallback if absent)
     _render_assets_signature = _compute_render_assets_signature()
-    # Warm the genre fallback backgrounds into memory so no-art posters render
-    # with zero extra latency (same idea as the badge cache warm-up).
+    # Count the genre fallback backgrounds without decoding them.  These are only
+    # used when a title has no usable art at all, so warming the whole set into
+    # memory cost ~172 MB resident for a path most requests never touch; they now
+    # load on demand into a bounded LRU (see _load_genre_background).  The count
+    # still logs, because "no art found" is worth telling the operator about.
     try:
-        _warmed = 0
+        _available = 0
         for _style in _GENRE_BG_STYLES:
             _sdir = os.path.join(_GENRE_BG_DIR, _style)
             if not os.path.isdir(_sdir):
                 continue
-            for _fn in os.listdir(_sdir):
-                if _fn.lower().endswith(".png"):
-                    if _load_genre_background(_fn[:-4], _style) is not None:
-                        _warmed += 1
-        if _warmed:
-            logger.info(f"Genre backgrounds warmed: {_warmed} entries")
+            _available += sum(
+                1 for _fn in os.listdir(_sdir) if _fn.lower().endswith(".png")
+            )
+        if _available:
+            logger.info(
+                f"Genre backgrounds available: {_available} entries "
+                f"(loaded on demand, cache limit {_GENRE_BG_CACHE_MAX})"
+            )
         else:
             logger.info("No genre background art found — using gradient fallbacks")
     except Exception as exc:
-        logger.warning(f"Genre background warm-up skipped: {exc}")
+        logger.warning(f"Genre background scan skipped: {exc}")
     # Burned-in-text detection: fetch + load PP-OCRv5 Mobile in the background so
     # the first textless request isn't blocked by the one-time ~4.6 MB
     # download.  On by default; skipped when the operator has opted out.
@@ -1912,11 +4467,24 @@ async def lifespan(app: FastAPI):
                 logger.warning(f"PP-OCR warm-up failed: {exc}")
         asyncio.create_task(_warm_text_detector())
 
+    try:
+        from tvdb import tvdb_status
+        logger.info(f"TVDB fallback art source: {tvdb_status()}")
+    except Exception as exc:
+        logger.warning(f"TVDB status check failed: {exc}")
+
+    _digital_release_ready = asyncio.Event()
     prune_task   = asyncio.create_task(_cache_prune_loop())
-    digital_task = asyncio.create_task(digital_release_poll_loop(_HTTP_CLIENT))
+    digital_task = asyncio.create_task(digital_release_poll_loop(_HTTP_CLIENT, _digital_release_ready))
+    cache_warm_task = asyncio.create_task(_cache_warm_loop(_digital_release_ready))
+    trending_task = asyncio.create_task(_trending_fetch_loop())
+    imdb_dataset_task = asyncio.create_task(imdb_dataset_refresh_loop(_HTTP_CLIENT))
     yield
     prune_task.cancel()
     digital_task.cancel()
+    cache_warm_task.cancel()
+    trending_task.cancel()
+    imdb_dataset_task.cancel()
     if _background_detection_task is not None:
         _background_detection_task.cancel()
     # Await the cancelled tasks so their finally: blocks finish unwinding
@@ -1925,6 +4493,12 @@ async def lifespan(app: FastAPI):
         await prune_task
     with suppress(asyncio.CancelledError):
         await digital_task
+    with suppress(asyncio.CancelledError):
+        await cache_warm_task
+    with suppress(asyncio.CancelledError):
+        await trending_task
+    with suppress(asyncio.CancelledError):
+        await imdb_dataset_task
     if _background_detection_task is not None:
         with suppress(asyncio.CancelledError):
             await _background_detection_task
@@ -1936,6 +4510,13 @@ async def lifespan(app: FastAPI):
     logger.info("HTTP client closed")
     with suppress(Exception):
         await coord.close()
+    # The deferred blob-delete queue is process memory. Drain what is past its
+    # grace period before exit, or a rolling deploy strands those objects for
+    # good — their rows are already gone, so no later prune can find them.
+    # Entries still inside the grace are left: a client may be replaying a
+    # cached redirect to them, and an orphan costs less than a 404.
+    with suppress(Exception):
+        await blobstore.drain_deferred_deletes()
     with suppress(Exception):
         await blobstore.close()
     with suppress(Exception):
@@ -1948,10 +4529,19 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _FONTS_DIR = os.path.join(BASE_DIR, "fonts")
 
 
+# Font objects are immutable once built and re-parsing the TTF per size adds up
+# fast in the fallback-title fit loop, which probes many sizes for one title.
+# Shared across render threads, matching what quality.py and age_badge.py
+# already do with their own font caches.
+@lru_cache(maxsize=256)
+def _load_font(path: str, size: int) -> ImageFont.FreeTypeFont:
+    return ImageFont.truetype(path, size)
+
+
 def _read_app_version() -> str:
     """ElfHosted fork: the app version for the configurator's build footer +
     /server-caps. Read once at import from version.txt (release-please keeps it
-    in sync with the cut tag, e.g. 1.1.0-elf.1). Falls back to 'dev' when the
+    in sync with the cut tag, e.g. 1.2.0-elf.1). Falls back to 'dev' when the
     file is absent (local checkout before a release)."""
     try:
         with open(os.path.join(BASE_DIR, "version.txt"), "r", encoding="utf-8") as f:
@@ -1973,12 +4563,35 @@ _GENRE_BG_DIR = os.path.join(BASE_DIR, "static", "genre_bg")
 # fallback_bg_style: "minimal" (procedural textured) or "photoreal" (hand-made
 # photographic art that blends with real posters).
 _GENRE_BG_STYLES = ("minimal", "photoreal")
-_genre_bg_cache: dict[str, "Image.Image | None"] = {}   # keyed "style/genre"
+# Bounded LRU, keyed "style/genre", holding decoded RGBA at canvas size.
+#
+# Both bounds matter.  Decoded, the full set is ~172 MB (the photoreal art ships
+# at 1024x1536, 6 MB each as RGBA), and it used to be loaded in full at startup
+# and held forever — a permanent cost for a path that only fires when a title has
+# no usable art at all.  Capping the cache keeps the resident set to the handful
+# of genres a given library actually hits; entries are cheap to reload (one PNG
+# decode) on the rare miss.
+_GENRE_BG_CACHE_MAX = 8
+_genre_bg_cache: "OrderedDict[str, Image.Image | None]" = OrderedDict()
+
+
+_GENRE_BG_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _&'.-]{0,63}$")
 
 
 def _genre_bg_path(style: str, name: str) -> "str | None":
-    """Filesystem path to a genre-background PNG, or None if it doesn't exist."""
-    p = os.path.join(_GENRE_BG_DIR, style, f"{name}.png")
+    """Filesystem path to a genre-background PNG, or None if it doesn't exist.
+
+    ElfHosted fork: *name* can come straight from a query string
+    (/debug/canvas?genre=…), so it is validated and the result confined to
+    _GENRE_BG_DIR. Without that, genre=../../<anything> read any .png on disk.
+    """
+    if (style not in _GENRE_BG_STYLES or not _GENRE_BG_NAME_RE.match(name or "")
+            or ".." in name):
+        return None
+    base = os.path.realpath(_GENRE_BG_DIR)
+    p = os.path.realpath(os.path.join(base, style, f"{name}.png"))
+    if not p.startswith(base + os.sep):
+        return None
     return p if os.path.exists(p) else None
 
 
@@ -1987,11 +4600,18 @@ def _load_genre_background(genre: str, style: str = "minimal") -> "Image.Image |
     None if none exists.  A missing image degrades gracefully: the style's
     default.png → the minimal set's genre/default → None (caller then renders the
     procedural gradient canvas).  So selecting a not-yet-populated style never
-    breaks — it just falls back to minimal."""
+    breaks — it just falls back to minimal.
+
+    The returned canvas is always POSTER_WIDTH x POSTER_HEIGHT.  build_poster
+    takes its geometry from the canvas it is handed, so returning the photoreal
+    art at its native 1024x1536 made those fallbacks render at a different size
+    from every other poster — and paid a 4x encode for the privilege."""
     if style not in _GENRE_BG_STYLES:
         style = "minimal"
     key = f"{style}/{genre}"
-    if key not in _genre_bg_cache:
+    if key in _genre_bg_cache:
+        _genre_bg_cache.move_to_end(key)
+    else:
         path = (
             _genre_bg_path(style, genre)
             or _genre_bg_path(style, "default")
@@ -1999,11 +4619,34 @@ def _load_genre_background(genre: str, style: str = "minimal") -> "Image.Image |
             or _genre_bg_path("minimal", "default")
         )
         try:
-            _genre_bg_cache[key] = Image.open(path).convert("RGBA") if path else None
+            _genre_bg_cache[key] = (
+                _normalise_fallback_canvas(Image.open(path)) if path else None
+            )
         except Exception:
             _genre_bg_cache[key] = None
+        while len(_genre_bg_cache) > _GENRE_BG_CACHE_MAX:
+            _evicted = _genre_bg_cache.popitem(last=False)[1]
+            if _evicted is not None:
+                _evicted.close()
     base = _genre_bg_cache[key]
     return base.copy() if base is not None else None
+
+
+def _normalise_fallback_canvas(image: Image.Image) -> Image.Image:
+    """Fit-cover a fallback background to the poster canvas, as RGBA.
+
+    Fit-cover rather than a plain resize so a background authored at some other
+    aspect ratio is centre-cropped instead of squashed.  The shipped art is
+    already 2:3, for which this is just the resize."""
+    target_w, target_h = _cfg.POSTER_WIDTH, _cfg.POSTER_HEIGHT
+    src_w, src_h = image.size
+    if (src_w, src_h) != (target_w, target_h):
+        scale = max(target_w / src_w, target_h / src_h)
+        new_w, new_h = round(src_w * scale), round(src_h * scale)
+        image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        left, top = round((new_w - target_w) / 2), round((new_h - target_h) / 2)
+        image = image.crop((left, top, left + target_w, top + target_h))
+    return image.convert("RGBA")
 
 
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
@@ -2020,10 +4663,49 @@ async def remove_server_header(request: Request, call_next):
 # Server capability endpoint
 # ---------------------------------------------------------------------------
 
+# Parameters the configurator must always send, whatever their value.  The
+# first four are identity and authentication rather than render settings, and
+# primary_client is the one setting that *changes other defaults* — the client
+# profile picks the two edge insets, so the defaults below are only meaningful
+# alongside it.
+_NEVER_OMITTED_PARAMS = frozenset({
+    "tmdb_id", "imdb_id", "type", "stremio_id", "anilist_id", "kitsu_id",
+    "access_key", "tmdb_key", "mdblist_key", "primary_client", "quality",
+    "bar_bottom_inset", "sash_badge_inset",
+})
+
+
+def _render_param_defaults() -> dict:
+    """Every render setting's default value, keyed by its query-parameter name.
+
+    Read straight off a freshly built RequestConfig rather than restated here,
+    because the whole point is that the configurator can drop a parameter it
+    knows the server would have chosen anyway — and a default duplicated in
+    JavaScript is a default that drifts.  When it drifts, the configurator omits
+    a parameter believing it is the default, the server picks something else,
+    and the poster silently changes.
+
+    The two client-profile insets are excluded: their default depends on
+    primary_client, so there is no single answer to publish.
+    """
+    cfg = RequestConfig()
+    defaults: dict = {}
+    for spec in dataclasses.fields(cfg):
+        if spec.name in _NEVER_OMITTED_PARAMS:
+            continue
+        value = getattr(cfg, spec.name)
+        if isinstance(value, (list, tuple)):
+            value = ",".join(str(v) for v in value)
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            defaults[spec.name] = value
+    return defaults
+
+
 @app.get("/server-caps")
 async def server_caps(access_key: str = ""):
-    # access_key_valid is the escape-hatch signal for the configurator lock:
-    # true only when an ACCESS_KEY is configured AND the caller supplied it.
+    # ElfHosted fork: access_key_valid is the escape-hatch signal for the
+    # configurator lock — true only when an ACCESS_KEY is configured AND the
+    # caller supplied it.
     access_key_valid = bool(
         _cfg.ACCESS_KEY and access_key
         and hmac.compare_digest(access_key, _cfg.ACCESS_KEY)
@@ -2033,20 +4715,52 @@ async def server_caps(access_key: str = ""):
     # original access_key gate stays.
     if _cfg.ACCESS_KEY and not _cfg.PRESET_ENABLED and not access_key_valid:
         raise HTTPException(status_code=403, detail="Unauthorized")
+    next_refresh_hours = None
+    if _cfg.TRENDING_FETCH_TIME:
+        import zoneinfo
+        from datetime import datetime, timedelta
+        try:
+            tz = zoneinfo.ZoneInfo(_cfg.TRENDING_FETCH_TIMEZONE)
+        except Exception:
+            tz = zoneinfo.ZoneInfo("UTC")
+        try:
+            h, m = map(int, _cfg.TRENDING_FETCH_TIME.split(':'))
+            now_dt = datetime.now(tz)
+            target_dt = now_dt.replace(hour=h, minute=m, second=0, microsecond=0)
+            if target_dt <= now_dt:
+                target_dt += timedelta(days=1)
+            next_refresh_hours = round((target_dt - now_dt).total_seconds() / 3600, 1)
+        except Exception:
+            pass
+
     return {
         "tmdb_key_set":          bool(_cfg.SERVER_TMDB_KEY),
         "mdblist_key_set":       bool(_cfg.SERVER_MDBLIST_KEYS),
         "mdblist_key_count":     len(_cfg.SERVER_MDBLIST_KEYS),
         "aiostreams_configured": bool(_cfg.AIOSTREAMS_URL and _cfg.AIOSTREAMS_AUTH),
-        "quality_configured":    (
-            bool(_cfg.AIOSTREAMS_URL and _cfg.AIOSTREAMS_AUTH)
-            or (_cfg.QUALITY_SOURCE == "scraper" and bool(_cfg.SCRAPER_URL))
-        ),
+        "quality_source":        active_quality_source(),
+        "quality_configured":    quality_source_configured(),
+        "trending_fetch_count":  _cfg.TRENDING_FETCH_COUNT,
+        "trending_fetch_time":   _cfg.TRENDING_FETCH_TIME,
+        "trending_fetch_timezone": _cfg.TRENDING_FETCH_TIMEZONE,
+        "trending_next_refresh_hours": next_refresh_hours,
+        # Lets the configurator leave out any parameter already at its default.
+        # A generated URL was running ~1500 characters, most of it restating
+        # defaults, against metadata clients that truncate at 2000.
+        "param_defaults":        _render_param_defaults(),
+        "never_omitted_params":  sorted(_NEVER_OMITTED_PARAMS),
+        "sash_priority_default": list(_cfg.SASH_PRIORITY),
+        "sash_priority_diff_seed": _SASH_DIFF_SEED,
+        "imdb_dataset_enabled":  imdb_dataset.is_enabled(),
+        "imdb_dataset_titles":   imdb_dataset.row_count(),
         # ElfHosted fork — static-preset moat / public-tier lock signals.
         "preset_enabled":        _cfg.PRESET_ENABLED,
         "presets":               preset_catalog() if _cfg.PRESET_ENABLED else [],
         "access_key_valid":      access_key_valid,
         "version":               _APP_VERSION,
+        # Lets the configurator offer an id-agnostic stremio_id={id} pattern
+        # (e.g. for Nuvio) only on instances that can resolve it.
+        "poster_resolve_imdb":   _cfg.POSTER_RESOLVE_IMDB,
     }
 
 
@@ -2061,7 +4775,15 @@ _configurator_html: str | None = None
 # which is what made sliders / dropdowns drift out of sync with the new
 # defaults until a manual Reset.
 _configurator_etag: str | None = None
-_RENDER_CACHE_VERSION = "2"
+# "3": photoreal genre fallback backgrounds now render at the poster canvas size
+#      rather than their native 1024x1536, so previously cached oversized
+#      composites must be re-rendered.
+# "4": the tinted vignette no longer frosts posters with confirmed burned-in
+#      text, so composites cached with a blurred-over title must be re-rendered.
+# "5": mode 6 adds a tier-coloured bookmark at the poster top-left corner.
+# "6": the mode 6 bookmark is redrawn with rounded tips and a curved inner edge,
+#      so composites cached with the old hard-edged triangle look stale.
+_RENDER_CACHE_VERSION = "6"
 _render_assets_signature = "startup"
 
 
@@ -2097,7 +4819,11 @@ def _compute_render_assets_signature() -> str:
 def _server_render_signature() -> str:
     return "|".join((
         f"render={_RENDER_CACHE_VERSION}",
+        f"format={_cfg.IMAGE_FORMAT}",
+        # Include both quality knobs so a change to either busts the render
+        # cache regardless of which format is currently active.
         f"jpeg={_cfg.JPEG_QUALITY}",
+        f"webp={_cfg.WEBP_QUALITY}",
         f"contrast={int(_cfg.LOGO_CONTRAST_RESCUE)}",
         f"stretch={int(_cfg.LOGO_STRETCH_DISABLED)}:{_cfg.LOGO_STRETCH_FACTOR:g}",
         f"assets={_render_assets_signature}",
@@ -2105,18 +4831,27 @@ def _server_render_signature() -> str:
 
 
 def _composite_cache_key(
-    imdb_id: str,
+    canonical_id: str,
     tmdb_id: str,
     media_type: str,
     raw_params: dict,
     fallback_to_imdb: bool,
+    *,
+    anime_key: str | None = None,
+    imdb_id: str = "",
 ) -> str:
-    """Build the composite blobstore key. Shared by /poster and the /p preset
-    route so an equivalent preset and /poster render share one composite — no
-    duplicate bytes. Server-side settings that affect the output but aren't URL
-    params (detection thresholds, poster-selection policy, rating policy, render
-    signature) are folded into the hash so changing them auto-busts stale
-    composites."""
+    """Build the composite cache key.
+
+    ElfHosted fork: extracted from /poster so the anonymous /p preset route can
+    call it too — an equivalent preset render and /poster render then share one
+    composite instead of storing the same bytes twice.
+
+    Server-side settings that change the output but are not URL params
+    (detection thresholds, poster-selection policy, rating policy, the IMDb
+    dataset, the render signature) are folded into the hash, so changing any of
+    them auto-busts stale composites and leaves keys unchanged when the feature
+    is off.
+    """
     if _cfg.TEXTLESS_TEXT_DETECTION:
         from text_detect import DETECT_RES_SIG
         _detect_sig = (
@@ -2125,9 +4860,27 @@ def _composite_cache_key(
     else:
         _detect_sig = ""
     _poster_selection_sig = (
-        f"|ps={_cfg.TMDB_POSTER_MIN_VOTES}:{_cfg.TMDB_POSTER_MAX_SCORE_DROP:g}"
+        f"|ps={_cfg.TMDB_POSTER_MIN_VOTES}:"
+        f"{_cfg.TMDB_POSTER_MAX_SCORE_DROP:g}"
     )
-    _rating_policy_sig = f"|rp={_cfg.RATING_MIN_VOTES}:{int(fallback_to_imdb)}"
+    _rating_policy_sig = (
+        f"|rp={_cfg.RATING_MIN_VOTES}:"
+        f"{int(fallback_to_imdb)}"
+    )
+    # The IMDb dataset changes the rendered score exactly the way
+    # RATING_MIN_VOTES does, so flipping IMDB_DATASET_ENABLED has to bust
+    # composites the same way. Appended only when the feature is on, so
+    # instances that never enable it keep every existing cache entry.
+    #
+    # is_ready() rather than is_enabled(): on the first-ever start the feature
+    # is on but the table is empty until the download lands, and posters
+    # rendered in that window would otherwise be cached at "N/A" for the full
+    # composite TTL.
+    _dataset_sig = (
+        f"|imdbds={int(imdb_dataset.is_ready())}:{_cfg.IMDB_DATASET_MIN_VOTES}"
+        if imdb_dataset.is_enabled()
+        else ""
+    )
     _server_sig = "|server=" + _server_render_signature()
     _params_hash = hashlib.sha256(
         (
@@ -2135,10 +4888,20 @@ def _composite_cache_key(
             + _detect_sig
             + _poster_selection_sig
             + _rating_policy_sig
+            + _dataset_sig
             + _server_sig
         ).encode()
     ).hexdigest()[:16]
-    return f"{imdb_id}:{tmdb_id}:{media_type}:{_params_hash}"
+    # The anime key has to be part of this: the same imdb/tmdb pair renders
+    # different art depending on whether an anime id came with it, so the two
+    # must not share a composite cache entry.
+    # Non-anime uses canonical_id rather than the raw imdb_id so a TMDB-only
+    # title gets "tmdb:1698026:…" instead of a leading empty segment. For a
+    # title that has an IMDb id the two are the same string, so existing cache
+    # entries stay valid.
+    if anime_key:
+        return f"{anime_key}:{imdb_id}:{tmdb_id}:{media_type}:{_params_hash}"
+    return f"{canonical_id}:{tmdb_id}:{media_type}:{_params_hash}"
 
 
 def _load_configurator_html() -> str:
@@ -2147,6 +4910,11 @@ def _load_configurator_html() -> str:
     try:
         with open(html_path, "r", encoding="utf-8") as f:
             content = f.read()
+
+        content = content.replace("{{TRENDING_FETCH_COUNT}}", str(_cfg.TRENDING_FETCH_COUNT))
+        content = content.replace("{{TRENDING_FETCH_COUNT_PLUS_ONE}}", str(_cfg.TRENDING_FETCH_COUNT + 1))
+        content = content.replace("{{TRENDING_BROAD_FETCH_COUNT}}", str(_cfg.TRENDING_BROAD_FETCH_COUNT))
+
         _configurator_etag = '"' + hashlib.md5(content.encode("utf-8")).hexdigest()[:16] + '"'
         return content
     except FileNotFoundError:
@@ -2231,20 +4999,6 @@ async def metrics_endpoint(request: Request, access_key: str = ""):
     return Response(content=payload, media_type=CONTENT_TYPE_LATEST)
 
 
-@app.api_route("/llms.txt", methods=["GET", "HEAD"], response_class=Response)
-async def get_llms_txt():
-    """llmstxt.org convention (ElfHosted fork) — serve the LLM-readable site
-    summary at /llms.txt. The file lives under static/ for editability but must
-    be reachable at the root path per the spec. HEAD is supported so crawlers
-    that probe before fetching don't get a 405."""
-    path = os.path.join(BASE_DIR, "static", "llms.txt")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return Response(content=f.read(), media_type="text/markdown")
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="llms.txt not found")
-
-
 @app.get("/stats")
 async def stats(access_key: str = ""):
     """
@@ -2252,30 +5006,49 @@ async def stats(access_key: str = ""):
     (in-flight renders, background quality fetches, MDBList key cooldowns).
     Gated behind the access key when one is configured.
     """
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    _require_operator(access_key)
 
     now = asyncio.get_running_loop().time()
     keys = _cfg.SERVER_MDBLIST_KEYS
     mdblist_keys = []
     for i, k in enumerate(keys):
         cd = _mdblist_key_cooldown.get(k, 0.0)
+        quota = MDBLIST_QUOTA.get(k)
         mdblist_keys.append({
             "index":         i + 1,
             "active":        i == (_mdblist_active_key_idx % len(keys)),
             "cooling_down":  now < cd,
             "cooldown_secs": max(0, round(cd - now)),
+            # Daily quota as last reported by MDBList; None until the key has
+            # made a request this window.
+            "daily_limit":     quota.limit if quota and quota.is_current() else None,
+            "daily_remaining": mdblist_quota_remaining(k),
+            "quota_reset_at":  quota.reset_at if quota and quota.is_current() else None,
         })
 
     return {
         "cache":   get_cache_stats(),
+        # Surfaced here rather than only on /server-caps because a failed or
+        # silently stale dataset refresh is otherwise invisible outside the
+        # container logs.
+        "imdb_dataset": imdb_dataset.status(),
         "runtime": {
             "renders_in_flight":        len(_render_inflight),
+            # Fresh renders holding a slot vs parked waiting for one. A queue
+            # that never drains means POSTER_RENDER_CONCURRENCY is too low for
+            # the machine; a pool of PoolTimeouts with an empty queue means the
+            # HTTP pool, not admission, is the bottleneck.
+            "renders_active":           _active_poster_renders,
+            "renders_queued":           _renders_queued,
+            "render_slots":             _cfg.POSTER_RENDER_CONCURRENCY,
             "quality_fetches_in_flight": len(_quality_bg_inflight),
             "quality_source_backoff_secs": round(_quality_backoff_remaining(now)),
             "rating_fetches_in_flight":  len(_rating_fetch_inflight),
             "rating_backoff_titles":     len({imdb_id for imdb_id, _ in _rating_backoff}),
             "rating_backoff_entries":    len(_rating_backoff),
+            # Should track the line above: a persistent gap means counters are
+            # outliving their back-off entries again.
+            "rating_fail_counters":      len(_rating_fail_count),
             "mdblist_keys":              mdblist_keys,
             "composite_cache_disabled":  _cfg.DISABLE_COMPOSITE_CACHE,
             "svg_logo_support":          svg_logo_supported(),
@@ -2305,8 +5078,7 @@ async def debug_canvas(genre: str = "Action", title: str = "Sample Title",
     the usual rating label composited on top.  Lets you eyeball any genre/style
     without hunting for a title that happens to lack poster art.
     """
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    _require_operator(access_key)
     if len(title) > 200:
         raise HTTPException(status_code=400, detail="Title too long")
     cache_key = (genre, title, style, year, score)
@@ -2314,7 +5086,7 @@ async def debug_canvas(genre: str = "Action", title: str = "Sample Title",
     cached = _debug_canvas_cache.get(cache_key)
     if cached is not None and now - cached[0] <= _DEBUG_CANVAS_TTL:
         return Response(
-            content=cached[1], media_type="image/jpeg",
+            content=cached[1], media_type=f"image/{_cfg.IMAGE_FORMAT}",
             headers={"Cache-Control": "private, max-age=300"},
         )
     gid = _DEBUG_GENRE_IDS.get(genre)
@@ -2326,14 +5098,14 @@ async def debug_canvas(genre: str = "Action", title: str = "Sample Title",
     img = build_poster(canvas, _score, genre, cfg, fallback_title=title,
                        release_year=(year or None), no_poster=True)
     buf = io.BytesIO()
-    img.convert("RGB").save(buf, format="JPEG", quality=90)
-    jpeg = buf.getvalue()
+    _quality = _cfg.WEBP_QUALITY if _cfg.IMAGE_FORMAT == "webp" else _cfg.JPEG_QUALITY
+    img.convert("RGB").save(buf, format=_cfg.IMAGE_FORMAT.upper(), quality=_quality)
+    data = buf.getvalue()
     if len(_debug_canvas_cache) >= _DEBUG_CANVAS_MAX_ENTRIES:
         oldest = min(_debug_canvas_cache, key=lambda key: _debug_canvas_cache[key][0])
         _debug_canvas_cache.pop(oldest, None)
-    _debug_canvas_cache[cache_key] = (now, jpeg)
     return Response(
-        content=jpeg, media_type="image/jpeg",
+        content=data, media_type=f"image/{_cfg.IMAGE_FORMAT}",
         headers={"Cache-Control": "private, max-age=300"},
     )
 
@@ -2346,11 +5118,17 @@ async def fallback_gallery(style: str = "minimal", access_key: str = ""):
     genre fonts at a glance and compare the minimal vs photoreal sets.  Gated
     behind the access key when configured.
     """
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized. Provide ?access_key=<key>")
-    if style not in _GENRE_BG_STYLES:
-        style = "minimal"
-    _ak = f"&access_key={access_key}" if access_key else ""
+    _require_operator(access_key)
+    # Take the value from our own constants rather than keeping the request's
+    # string: it ends up in HTML, and this way nothing user-supplied can.
+    style = next((s for s in _GENRE_BG_STYLES if s == style), "minimal")
+    # ElfHosted fork: the key is echoed into HTML links, so it is URL-encoded
+    # and HTML-escaped. Upstream interpolated it raw — a reflected XSS on any
+    # instance where the gate lets an arbitrary access_key through.
+    _ak = (
+        "&access_key=" + _html_escape(urllib.parse.quote(access_key, safe=""))
+        if access_key else ""
+    )
 
     # Every genre that has a background (covers the full genre map + any future
     # additions), derived from the minimal set so the gallery is never stale.
@@ -2439,6 +5217,38 @@ async def get_configurator(request: Request, access_key: str = "", reload: str =
 # Search endpoint
 # ---------------------------------------------------------------------------
 
+def _require_operator(
+    access_key: str,
+    *,
+    detail: str = "Unauthorized",
+    public_detail: str | None = None,
+) -> None:
+    """ElfHosted fork: fail-closed gate for endpoints that spend operator keys
+    or expose operator data (/poster, /logo, /stats, /debug/*).
+
+    Upstream's gate is `if ACCESS_KEY and <key doesn't match>`, which fires
+    only when ACCESS_KEY is set. A public-tier instance runs PRESET_ENABLED
+    with NO ACCESS_KEY, so under upstream's gate all of these were anonymous:
+    custom renders with live MDBList fetches and foreground OCR on the
+    operator's keys, unbounded debug canvas renders, cache counts on /stats.
+    Here, PRESET_ENABLED alone is enough to require a valid key — and with no
+    key configured, nothing can pass: /p is the only way in. That is the
+    posture the public instance's configmap relies on; v1.0.3-elf.4 had it,
+    and the v1.1.0 rebuild dropped it.
+    """
+    if not (_cfg.PRESET_ENABLED or _cfg.ACCESS_KEY):
+        return
+    if (_cfg.ACCESS_KEY and access_key
+            and hmac.compare_digest(access_key.encode("utf-8"),
+                                    _cfg.ACCESS_KEY.encode("utf-8"))):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=(public_detail or detail)
+        if _cfg.PRESET_ENABLED and not _cfg.ACCESS_KEY else detail,
+    )
+
+
 def _gate_anonymous_tmdb_proxy(access_key: str) -> None:
     """ElfHosted fork: when ACCESS_KEY is configured, /search and /resolve-imdb
     are anonymous ONLY if PRESET_ENABLED (the public preset flow needs the title
@@ -2505,7 +5315,7 @@ async def search_proxy(
     if _HTTP_CLIENT is None:
         raise HTTPException(status_code=503, detail="Service unavailable")
     resp = await _HTTP_CLIENT.get(
-        "https://api.themoviedb.org/3/search/multi",
+        f"{_cfg.TMDB_API_BASE}/search/multi",
         params={
             "api_key": effective_key,
             "query": q,
@@ -2534,9 +5344,9 @@ async def resolve_imdb(
         raise HTTPException(status_code=400, detail="No TMDB API key available")
 
     endpoint = (
-        f"https://api.themoviedb.org/3/tv/{tmdb_id}/external_ids"
+        f"{_cfg.TMDB_API_BASE}/tv/{tmdb_id}/external_ids"
         if type == "tv"
-        else f"https://api.themoviedb.org/3/movie/{tmdb_id}/external_ids"
+        else f"{_cfg.TMDB_API_BASE}/movie/{tmdb_id}/external_ids"
     )
 
     if _HTTP_CLIENT is None:
@@ -2546,25 +5356,255 @@ async def resolve_imdb(
 
 
 # ---------------------------------------------------------------------------
-# Static-preset overload moat (ElfHosted fork)
+# Logo endpoint
 # ---------------------------------------------------------------------------
-# /p/{preset}/{type}/{imdb_id}.jpg — anonymous, CDN-cacheable, no per-user
-# keys. Presets ship in presets.py (mirroring the configurator gallery). The
-# render reuses /poster's helpers but enforces the moat invariants: rating,
-# quality, and burned-in-text detection are used ONLY if already cached — an
-# anonymous hit never fans out to MDBList/AIOStreams and never triggers a
-# foreground OCR scan. An incomplete (not-fully-determined) render is served
-# with a short Cache-Control and is NOT persisted, so it can't poison the CDN
-# with a long TTL and will be replaced once the title is warmed by a paid
-# /poster hit or the background detector. A fully-determined preset render
-# shares its composite cache key with the equivalent /poster render.
 
+@app.get("/logo")
+async def get_logo(
+    tmdb_id: str,
+    type: str = "movie",
+    lang: str = "en",
+    imdb_id: str | None = None,
+    access_key: str = "",
+    tmdb_key: str = "",
+):
+    """
+    Return the best available logo PNG for a title.
+
+    Checks the local file cache first (same cache the poster endpoint uses),
+    then falls through to TMDB and Metahub as needed.  No rendering is applied —
+    callers receive the original PNG exactly as stored.
+    """
+    _require_operator(access_key)
+
+    if _HTTP_CLIENT is None:
+        raise HTTPException(status_code=503, detail="Service unavailable")
+
+    effective_tmdb_key = _resolve_tmdb_key((tmdb_key or "").strip())
+    if not effective_tmdb_key:
+        raise HTTPException(status_code=503, detail="No TMDB API key configured")
+    media_type = "tv" if type in ("tv", "series") else "movie"
+    effective_lang = (lang or "en").strip() or "en"
+
+    client = _HTTP_CLIENT
+
+    _, _, logos, _, _, _, _, tmdb_data = await _coalesced_fetch_poster_metadata(
+        client, tmdb_id, effective_tmdb_key, media_type, effective_lang
+    )
+
+    # Use imdb_id from metadata if not supplied — needed for Metahub fallback
+    effective_imdb_id = (imdb_id or "").strip() or tmdb_data.get("imdb_id") or None
+    original_language = tmdb_data.get("original_language")
+
+    logo_image = await fetch_logo(
+        client, logos, effective_lang,
+        imdb_id=effective_imdb_id,
+        original_language=original_language,
+    )
+
+    if logo_image is None:
+        raise HTTPException(status_code=404, detail="No logo available")
+
+    buf = io.BytesIO()
+    logo_image.save(buf, format="PNG")
+    return Response(
+        content=buf.getvalue(),
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=2592000"},
+    )
+
+
+# Background warming of film release facts for /p (ElfHosted fork).
+#
+# /p may read TMDB-derived caches but never fetch in the foreground, and it
+# will not persist a film render whose release status is unknown. On an
+# instance serving mostly /p nothing else ever fetches those facts, so without
+# this a film would never become persistable and every hit would re-render —
+# quietly defeating the caching the preset route exists for. Mirroring the
+# background text-detection queue: bounded concurrency, de-duplicated, and a
+# cap on how much can be pending so an anonymous burst cannot grow it without
+# limit. One fetch_release_status call fills both release caches.
+_release_warm_pending: set[str] = set()
+_release_warm_tasks: set["asyncio.Task[None]"] = set()
+_release_warm_semaphore: "asyncio.Semaphore | None" = None
+_RELEASE_WARM_MAX_PENDING = 256
+_RELEASE_WARM_CONCURRENCY = 2
+
+
+def _queue_release_warm(tmdb_id: str, tmdb_status: str | None) -> None:
+    global _release_warm_semaphore
+    if (tmdb_id in _release_warm_pending
+            or len(_release_warm_pending) >= _RELEASE_WARM_MAX_PENDING
+            or _HTTP_CLIENT is None or not _cfg.SERVER_TMDB_KEY):
+        return
+    if _release_warm_semaphore is None:
+        _release_warm_semaphore = asyncio.Semaphore(_RELEASE_WARM_CONCURRENCY)
+    _release_warm_pending.add(tmdb_id)
+
+    async def _warm() -> None:
+        try:
+            async with _release_warm_semaphore:
+                await fetch_release_status(
+                    _HTTP_CLIENT, tmdb_id, _cfg.SERVER_TMDB_KEY, "movie", tmdb_status,
+                )
+        except Exception as exc:
+            logger.debug(f"Release warm failed for movie {tmdb_id}: {exc}")
+        finally:
+            _release_warm_pending.discard(tmdb_id)
+
+    task = asyncio.get_running_loop().create_task(_warm())
+    _release_warm_tasks.add(task)          # keep a strong reference
+    task.add_done_callback(_release_warm_tasks.discard)
+
+
+# Background rating warm for /p (ElfHosted fork, PRESET_MDBLIST_FETCH).
+#
+# Same shape as the release-fact warm above: /p may never call MDBList in the
+# foreground, but with /poster closed on a preset-only instance nothing else
+# would ever fetch a rating. Bounded by MDBLIST_CONCURRENCY (shared with every
+# other MDBList caller), de-duplicated, capped in how much can be pending, and
+# it only spends a key that is off cooldown here AND fleet-wide and has quota
+# left. A 429 is recorded exactly as /poster records one, so the whole fleet
+# backs off. The row it writes is the same one the cache warmer and /poster
+# write, so it serves them too.
+_rating_warm_pending: set[str] = set()
+_rating_warm_tasks: set["asyncio.Task[None]"] = set()
+_rating_warm_failed_until: dict[str, float] = {}
+_RATING_WARM_MAX_PENDING = 256
+_RATING_WARM_FAILURE_BACKOFF = 600.0
+
+
+def _queue_rating_warm(
+    canonical_id: str, imdb_id: str, tmdb_id: str, media_type: str,
+    genre_ids: list[int],
+) -> None:
+    global _mdblist_semaphore
+    if (not _cfg.PRESET_MDBLIST_FETCH or not _cfg.SERVER_MDBLIST_KEYS
+            or _HTTP_CLIENT is None
+            or canonical_id in _rating_warm_pending
+            or len(_rating_warm_pending) >= _RATING_WARM_MAX_PENDING):
+        return
+    loop = asyncio.get_running_loop()
+    if loop.time() < _rating_warm_failed_until.get(canonical_id, 0.0):
+        return
+    if _mdblist_semaphore is None:
+        _mdblist_semaphore = asyncio.Semaphore(_cfg.MDBLIST_CONCURRENCY)
+    _rating_warm_pending.add(canonical_id)
+
+    async def _pick_key() -> str | None:
+        """A configured key that is off cooldown here AND fleet-wide and has
+        quota left, trying each in turn. The local check alone would keep
+        choosing a key a sibling replica has already been 429'd on."""
+        now = loop.time()
+        keys = _cfg.SERVER_MDBLIST_KEYS
+        start = _resolve_mdblist_key("")
+        order = keys[keys.index(start):] + keys[:keys.index(start)] if start in keys else list(keys)
+        for candidate in order:
+            if _warm_mdblist_key_with_quota(candidate, now, 0) != candidate:
+                continue
+            if await _fleet_mdblist_cooling(candidate):
+                continue
+            return candidate
+        return None
+
+    async def _warm() -> None:
+        try:
+            async with _mdblist_semaphore:
+                # Chosen only once admitted. Picking before the wait meant a
+                # burst of queued warms all carried the same key into the
+                # semaphore, and when the first came back 429 the rest still
+                # spent it — one call each against a key that had just said
+                # stop.
+                key = await _pick_key()
+                if key is None:
+                    return
+                result = await fetch_rating(
+                    _HTTP_CLIENT, key, genre_ids, media_type,
+                    media_id=imdb_id or tmdb_id,
+                    provider="imdb" if imdb_id else "tmdb",
+                )
+            if isinstance(result, _RateLimited):
+                backoff, _ = _mark_mdblist_rate_limit(canonical_id, key, result)
+                await _publish_fleet_mdblist_cooldown(key, backoff)
+                return
+            if result is FETCH_FAILED:
+                _rating_warm_failed_until[canonical_id] = (
+                    loop.time() + _RATING_WARM_FAILURE_BACKOFF
+                )
+                return
+            ratings_dict, genre, rel, keywords, age_rating = result
+            award_wins, award_noms = parse_mdblist_awards(
+                keywords, tmdb_id=tmdb_id, media_type=media_type,
+            )
+            kw_names = {(kw.get("name") or "").lower().strip() for kw in keywords}
+            set_cached_rating(
+                canonical_id,
+                ratings_dict if isinstance(ratings_dict, dict) else {},
+                genre or "Unknown",
+                rel,
+                award_wins,
+                award_noms,
+                awards_fetched=True,
+                festival_keyword=match_festival_keyword(kw_names),
+                age_rating=age_rating,
+                is_cult=bool({"cult-classic", "cult-film"} & kw_names),
+                is_true_story="based-on-true-story" in kw_names,
+                is_metacritic="metacritic-must-see" in kw_names,
+            )
+        except Exception as exc:
+            logger.debug(f"Preset rating warm failed for {canonical_id}: {exc}")
+        finally:
+            _rating_warm_pending.discard(canonical_id)
+            if len(_rating_warm_failed_until) > 4 * _RATING_WARM_MAX_PENDING:
+                _now = loop.time()
+                for _k in [k for k, v in _rating_warm_failed_until.items() if v <= _now]:
+                    _rating_warm_failed_until.pop(_k, None)
+
+    task = loop.create_task(_warm())
+    _rating_warm_tasks.add(task)          # keep a strong reference
+    task.add_done_callback(_rating_warm_tasks.discard)
+
+
+# ---------------------------------------------------------------------------
+# Static-preset route (ElfHosted fork)
+# ---------------------------------------------------------------------------
+#
+# /p/{preset}/{type}/{imdb_id}.jpg is the public tier: anonymous, no keys, one
+# of a fixed set of looks, and deterministic per (preset, title) so a CDN can
+# hold it for a day. That makes it the overload surface, and the whole design
+# of this handler is about what an anonymous hit is NOT allowed to make the
+# server do.
+#
+# The moat, in one line: an anonymous hit may READ any cache, and may never
+# FILL an expensive one.
+#
+#   * Ratings and quality are cached-only. No MDBList call, no AIOStreams call.
+#   * Burned-in-text detection is cached-only, and a miss queues the BACKGROUND
+#     worker rather than scanning inline. A foreground OCR scan is ~400ms of
+#     pinned CPU, so a few hundred cold titles would be a denial of service
+#     with no authentication needed to trigger it.
+#   * A render made without all of those inputs is "undetermined": it may not
+#     match what /poster produces once the caches warm. It is served with a
+#     60-second Cache-Control and is NOT persisted, so an incomplete poster
+#     can neither poison the CDN for a day nor be stored under a key that a
+#     later, complete render would want.
+#
+# Composite keys come from _composite_cache_key, the same function /poster
+# uses, so an equivalent preset render and /poster render share one composite.
 _PRESET_ROUTE_VALID_TYPES = frozenset({"movie", "tv"})
 _PRESET_INCOMPLETE_TTL = 60   # short Cache-Control (s) for not-yet-warm renders
 
 
 @app.get("/p/{preset}/{type}/{imdb_id}.jpg")
-async def get_preset_poster(preset: str, type: str, imdb_id: str):
+async def get_preset_poster(preset: str, type: str, imdb_id: str, shape: str = ""):
+    """Anonymous preset render.
+
+    The id segment is an IMDb id ("tt0111161") or a TMDB id, bare ("278") or
+    in Nuvio's/Stremio's namespaced form ("tmdb:278"), so a client pattern like
+    /p/<preset>/{type}/{id}.jpg?shape={shape} covers IMDb- and TMDB-keyed
+    catalogues alike. ``shape=landscape`` renders the 16:9 layout; ``poster``,
+    ``square`` or nothing renders the portrait one.
+    """
     if not _cfg.PRESET_ENABLED:
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -2577,7 +5617,23 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
         type = "tv"
     if type not in _PRESET_ROUTE_VALID_TYPES:
         raise HTTPException(status_code=400, detail="Invalid type (movie|tv)")
-    _check_imdb_id(imdb_id)
+    # "tmdb:<digits>" names the title directly; anything else must be an IMDb
+    # id. A TMDB-only request has no IMDb enrichment and is keyed "tmdb:<id>",
+    # exactly as /poster keys a TMDB-only request, so the two share composites.
+    # A bare number is also a TMDB id: IMDb ids always carry the "tt" prefix,
+    # so there is no ambiguity, and it is what a pipe placeholder such as
+    # Nuvio's {imdb_id|tmdb_id} substitutes for a TMDB-keyed title.
+    _direct_tmdb_id = ""
+    if imdb_id.startswith("tmdb:") or imdb_id.isdigit():
+        _direct_tmdb_id = imdb_id[len("tmdb:"):] if imdb_id.startswith("tmdb:") else imdb_id
+        _check_tmdb_id(_direct_tmdb_id)
+        imdb_id = ""
+    else:
+        _check_imdb_id(imdb_id)
+    _shape = (shape or "").strip().lower()
+    if _shape not in ("", "poster", "portrait", "square", "landscape"):
+        raise HTTPException(status_code=400, detail="Invalid shape (poster|landscape)")
+    _is_landscape = _shape == "landscape"
 
     effective_tmdb_key = _resolve_tmdb_key("")
     if not effective_tmdb_key:
@@ -2598,56 +5654,217 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
         raise HTTPException(status_code=503, detail="Service unavailable")
     client = _HTTP_CLIENT
 
-    tmdb_id = await resolve_imdb_to_tmdb(client, imdb_id, effective_tmdb_key, type)
+    # A cold imdb->tmdb resolution is a TMDB /find call, made before the
+    # render slot below is taken — and a miss returns 404 without ever reaching
+    # it. Unbounded, an anonymous burst of unknown ids would drain the shared
+    # HTTP pool that the render cap exists to protect, so a cold lookup takes a
+    # slot of its own. Warm lookups are a local read and skip this.
+    if _direct_tmdb_id:
+        tmdb_id = _direct_tmdb_id
+    elif get_cached_imdb_to_tmdb(imdb_id, type) is None:
+        _resolve_sem = _get_render_semaphore()
+        try:
+            if _cfg.RENDER_QUEUE_TIMEOUT > 0:
+                await asyncio.wait_for(
+                    _resolve_sem.acquire(), timeout=_cfg.RENDER_QUEUE_TIMEOUT
+                )
+            else:
+                await _resolve_sem.acquire()
+        except asyncio.TimeoutError:
+            _metrics.render_saturated_total.inc()
+            raise HTTPException(status_code=503, detail="Server saturated — try again shortly",
+                                headers={"Retry-After": "5"})
+        try:
+            tmdb_id = await resolve_imdb_to_tmdb(client, imdb_id, effective_tmdb_key, type)
+        finally:
+            _resolve_sem.release()
+    else:
+        tmdb_id = await resolve_imdb_to_tmdb(client, imdb_id, effective_tmdb_key, type)
     if not tmdb_id:
         raise HTTPException(status_code=404, detail="Title not found on TMDB")
 
     raw_params = dict(preset_params)
+    # Only landscape is added to the params, so every existing portrait preset
+    # keeps its composite key; landscape gets its own, as on /poster.
+    if _is_landscape:
+        raw_params["shape"] = "landscape"
     rcfg = build_request_config(raw_params)
+
+    # The preset route always carries a real IMDb id, so the canonical identity
+    # is that id — but go through the same helper /poster uses rather than
+    # assuming it, so the two stay keyed alike if the rule ever changes.
+    canonical_id = _canonical_rating_id(imdb_id, "", tmdb_id)
 
     # Same key shape as /poster → a preset and an equivalent /poster render
     # share one composite.
     final_cache_key = _composite_cache_key(
-        imdb_id, tmdb_id, type, raw_params, rcfg.fallback_to_imdb
+        canonical_id, tmdb_id, type, raw_params, rcfg.fallback_to_imdb,
+        imdb_id=imdb_id,
     )
 
-    def _preset_header(persisted: bool) -> dict:
+    def _preset_header(persisted: bool, expires_at: int | None = None) -> dict:
+        # The operator's development switch: nothing is cached, anywhere, so
+        # rendering changes show up immediately — including through the
+        # locked configurator's preview, which renders via this route.
+        if _cfg.DISABLE_COMPOSITE_CACHE:
+            return {"Cache-Control": "no-store, no-cache, must-revalidate",
+                    "Pragma": "no-cache"}
         ttl = _cfg.PRESET_CDN_CACHE_TTL if persisted else _PRESET_INCOMPLETE_TTL
+        # Never outlive the composite being pointed at. PRESET_CDN_CACHE_TTL is
+        # a day by default, and a render pinned to a trending rank or a release
+        # status can expire well inside that — the long preset TTL is safe
+        # because a preset render is deterministic, not because it is eternal.
+        if expires_at is not None:
+            ttl = min(ttl, max(0, int(expires_at) - int(time.time())))
         return {"Cache-Control": f"public, max-age={ttl}"} if ttl > 0 else {}
 
     # Cache hit: prefer a 302 to the CDN when a public URL is configured,
     # else serve the bytes inline.
     cdn_url = get_cached_final_poster_url(final_cache_key)
-    if cdn_url is not None:
-        if await is_cached_final_poster_fresh(final_cache_key):
+    if _cfg.DISABLE_COMPOSITE_CACHE:
+        pass
+    elif cdn_url is not None:
+        # From the shared row, never L1 — see get_cached_final_poster_redirect.
+        _redirect = await get_cached_final_poster_redirect(final_cache_key)
+        if _redirect is not None:
+            cdn_url, _cdn_expires_at = _redirect
             logger.info(f"Preset {preset} cache hit (CDN redirect) for {final_cache_key}")
             resp = Response(status_code=302)
             resp.headers["Location"] = cdn_url
-            for k, v in _preset_header(True).items():
+            # Capped below the blob grace period — see the /poster redirect.
+            for k, v in _preset_header(True, min(
+                _cdn_expires_at,
+                int(time.time()) + blobstore.REDIRECT_MAX_AGE_SECONDS,
+            )).items():
                 resp.headers[k] = v
             return resp
     else:
-        cached_jpeg = await get_cached_final_poster(final_cache_key)
+        # get_cached_final_poster_entry, not ..._poster: without the deadline
+        # this path advertised the full preset TTL on every hit, so a shared
+        # composite with seconds left could be held downstream for another day
+        # with an expired trending rank or release status baked in.
+        _inline_entry = await get_cached_final_poster_entry(final_cache_key)
+        cached_jpeg, _cdn_expires_at_inline = (
+            _inline_entry if _inline_entry is not None else (None, None)
+        )
         if cached_jpeg is not None:
             logger.info(f"Preset {preset} cache hit (inline) for {final_cache_key}")
-            return Response(content=cached_jpeg, media_type="image/jpeg",
-                            headers=_preset_header(True))
+            return Response(content=cached_jpeg, media_type=f"image/{_cfg.IMAGE_FORMAT}",
+                            headers=_preset_header(True, _cdn_expires_at_inline))
 
     # Rating + quality: cached-only. None means "never queried" (suppress
     # persistence); [] means "queried, nothing available" (safe to persist).
-    cached_rating = get_cached_rating(imdb_id)
+    cached_rating = get_cached_rating(canonical_id)
     cached_release_date = cached_rating[2] if cached_rating is not None else None
-    cached_quality = get_cached_quality(imdb_id, cached_release_date)
+    cached_quality = (
+        get_cached_quality(imdb_id, cached_release_date) if imdb_id else None
+    )
     quality_tokens = cached_quality or []
     # Any non-hidden badge mode reads quality_tokens; persisting before quality
     # is cached would lock in an empty/grey badge for the long preset TTL.
-    wants_badges = rcfg.badge_display_mode != 0
+    wants_badges = rcfg.badge_display_mode != 0 and not _is_landscape
     quality_missing = wants_badges and cached_quality is None
+
+    # Coalesce onto an in-flight render for the same composite, BEFORE taking
+    # an admission slot.
+    #
+    # Waiting while holding a slot is a circular wait: with the cap at one, a
+    # /poster request can publish its future and then queue for the slot this
+    # request is sitting on while this request waits for that future. Neither
+    # proceeds — RENDER_QUEUE_TIMEOUT turns it into a 503, and with the timeout
+    # disabled it never resolves at all. Nothing is needed from the fetch
+    # pipeline to join: the composite key is already known.
+    _existing_fut = _render_inflight.get(final_cache_key)
+    if _existing_fut is not None:
+        logger.info(f"Preset {preset} coalescing on {final_cache_key}")
+        try:
+            _coalesced = await _existing_fut
+            # /poster's futures carry (bytes, provisional, expires_at); this
+            # route publishes the same shape, but accept bare bytes too so an
+            # older in-flight render is never mis-read.
+            if isinstance(_coalesced, tuple):
+                _coalesced_bytes = _coalesced[0]
+                _coalesced_provisional = _coalesced[1]
+                _coalesced_expires_at = (
+                    _coalesced[2] if len(_coalesced) > 2 else None
+                )
+            else:
+                _coalesced_bytes, _coalesced_provisional = _coalesced, False
+                _coalesced_expires_at = None
+            # A provisional /poster render is one made without all its inputs,
+            # which is exactly what must not go out under the long preset TTL.
+            return Response(
+                content=_coalesced_bytes, media_type=f"image/{_cfg.IMAGE_FORMAT}",
+                headers=_preset_header(
+                    not _coalesced_provisional, _coalesced_expires_at
+                ),
+            )
+        except Exception:
+            pass   # in-flight render failed; fall through and try ourselves
+
+    # Bound before the try: the finally clears this slot, and a failure in the
+    # metadata fetch below happens before the coalescing future is created.
+    _render_fut: "asyncio.Future[bytes] | None" = None
+
+    # Render admission, before the cold fetch pipeline rather than just before
+    # the Pillow encode.
+    #
+    # Everything above this line was cache reads. Everything below talks to
+    # TMDB — metadata, art, logo, trending — and that is the part the cap
+    # exists to bound: those calls share one httpx pool with /poster, and a
+    # burst past the pool's budget fails with PoolTimeout instead of queueing.
+    # Gating only the encode would let an anonymous burst — the exact traffic
+    # this route is built to absorb — walk straight past the limit protecting
+    # /poster, and hold decoded images in memory while it waited.
+    _render_sem = _get_render_semaphore()
+    if _render_sem.locked():
+        logger.debug(
+            f"Preset render for {imdb_id} queued: "
+            f"{_cfg.POSTER_RENDER_CONCURRENCY} renders already in flight"
+        )
+    try:
+        if _cfg.RENDER_QUEUE_TIMEOUT > 0:
+            await asyncio.wait_for(
+                _render_sem.acquire(), timeout=_cfg.RENDER_QUEUE_TIMEOUT
+            )
+        else:
+            await _render_sem.acquire()
+    except asyncio.TimeoutError:
+        _metrics.render_saturated_total.inc()
+        logger.warning(
+            f"Render queue saturated (cap={_cfg.POSTER_RENDER_CONCURRENCY}); "
+            f"503 for preset={preset} imdb={imdb_id}"
+        )
+        raise HTTPException(status_code=503, detail="Server saturated — try again shortly",
+                            headers={"Retry-After": "5"})
 
     try:
         genre_ids, is_textless, logos, release_year, title, poster_path, backdrop_path, tmdb_data = (
-            await fetch_poster_metadata(client, tmdb_id, effective_tmdb_key, type)
+            await fetch_poster_metadata(
+                client, tmdb_id, effective_tmdb_key, type, rcfg.logo_language,
+            )
         )
+
+        # IMDb id for enrichment lookups — the request's, else the one TMDB
+        # returned — exactly as /poster derives effective_imdb_id. For a
+        # "tmdb:<id>" request this is what lets the IMDb dataset, digital
+        # release and Metahub logo still apply. It is NOT the cache identity:
+        # canonical_id stays "tmdb:<id>", which is fixed before any fetch.
+        effective_imdb_id = imdb_id or tmdb_data.get("imdb_id") or ""
+
+        # Quality is IMDb-keyed. A TMDB-keyed request had no IMDb id when
+        # quality was read above, so read it again now that TMDB has supplied
+        # one — otherwise a badge preset would always see "missing", never
+        # show its badges, and never become persistable.
+        if not imdb_id and effective_imdb_id and wants_badges:
+            cached_quality = get_cached_quality(effective_imdb_id, cached_release_date)
+            quality_tokens = cached_quality or []
+            quality_missing = cached_quality is None
+        elif not effective_imdb_id:
+            # No IMDb id anywhere: quality can never be fetched for this title,
+            # so waiting on it would keep the render unpersistable forever.
+            # /poster persists these without badges; so do we.
+            quality_missing = False
 
         # TMDB-derived genre fallback — the preset path never calls MDBList, so
         # for never-warmed titles derive the genre label from TMDB genre_ids
@@ -2655,8 +5872,21 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
         if cached_rating is not None:
             (
                 ratings_dict, cached_genre, _crd, award_wins, award_noms, _af,
-                festival_label, age_rating, is_cult, is_true_story, is_metacritic,
+                festival_keyword, age_rating, is_cult, is_true_story, is_metacritic,
             ) = cached_rating
+            # Same correction /poster applies to stored award labels (legacy or
+            # since-fixed Emmy/Globe entries). Local, so allowed here — and
+            # required, since both routes write the same composite key.
+            award_wins, award_noms = reconcile_cached_awards(
+                award_wins, award_noms, tmdb_id, type,
+            )
+            # The IMDb weight can come from the local dataset instead of
+            # MDBList, and that is a local table read, not a network call — so
+            # it is allowed here and keeps the preset score matching /poster's.
+            ratings_dict = _merge_imdb_dataset_rating(
+                ratings_dict if isinstance(ratings_dict, dict) else {},
+                effective_imdb_id, rcfg,
+            )
             weights = (
                 (rcfg.tv_weights or _cfg.TV_WEIGHTS) if type in ("tv", "series")
                 else (rcfg.movie_weights or _cfg.MOVIE_WEIGHTS)
@@ -2669,9 +5899,25 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             genre = cached_genre or "Unknown"
             rel = cached_release_date
         else:
-            ratings_dict, score, genre, rel = {}, "N/A", "Unknown", None
+            # No MDBList row: ask for one in the background (PRESET_MDBLIST_FETCH)
+            # so the next hit can persist. Nothing is fetched on this request.
+            _queue_rating_warm(canonical_id, imdb_id, tmdb_id, type, genre_ids)
+            # The IMDb dataset is still a local table, so a dataset-sourced
+            # score is allowed here exactly as /poster uses it.
+            ratings_dict = _merge_imdb_dataset_rating({}, effective_imdb_id, rcfg)
+            if ratings_dict:
+                weights = (
+                    (rcfg.tv_weights or _cfg.TV_WEIGHTS) if type in ("tv", "series")
+                    else (rcfg.movie_weights or _cfg.MOVIE_WEIGHTS)
+                )
+                score = calculate_weighted_score(
+                    ratings_dict, weights, fallback_to_imdb=rcfg.fallback_to_imdb
+                )
+            else:
+                score = "N/A"
+            genre, rel = "Unknown", None
             award_wins, award_noms = [], []
-            festival_label = age_rating = None
+            festival_keyword = age_rating = None
             is_cult = is_true_story = is_metacritic = False
 
         if genre == "Unknown" and genre_ids:
@@ -2681,64 +5927,221 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
                     genre = _cfg.GENRE_MAP[_gid]
                     break
 
-        # No-poster ladder: poster → backdrop → gradient canvas.
-        is_no_poster = poster_path is None
-        use_backdrop = is_no_poster and backdrop_path is not None
-        if use_backdrop:
-            image_coro = fetch_backdrop_image(client, tmdb_id, backdrop_path)
-        elif is_no_poster:
-            image_coro = _resolved(_make_fallback_canvas(genre_ids))
-        else:
-            image_coro = fetch_poster_image(client, tmdb_id, type, poster_path)
-
-        # Burned-in-text detection: CACHED ONLY. Never scan in the foreground on
-        # an anonymous hit. If a textless poster's detection isn't cached, the
-        # render is "undetermined" (it might differ from what /poster produces
-        # once OCR runs), so we don't persist it and we queue a background scan
-        # to warm it — matching /poster's det cache key exactly so the result
-        # is shared.
-        _suppress_overlay = False
-        _ocr_undetermined = False
-        _scan_selected = (
-            _cfg.TEXTLESS_TEXT_DETECTION and is_textless and not is_no_poster
+        # Original-art mode. Pure selection over metadata already in hand — no
+        # extra request — so the moat allows it, and four of the ten gallery
+        # presets set use_original_art. Without this they silently rendered the
+        # textless art instead, and then persisted it under the key /poster
+        # shares, handing the wrong artwork to configured instances too.
+        _plangs    = tmdb_data.get("poster_langs") or {}
+        _p_default = tmdb_data.get("original_poster_path")
+        _original_lang = tmdb_data.get("original_language") or ""
+        _poster_language_order = image_language_order(
+            rcfg.logo_language, _original_lang, rcfg.logo_priority, ""
         )
-        if _scan_selected:
-            from text_detect import DETECT_RES_SIG
-            _det_src = f"ps:{poster_path}"
-            _det_key = f"{_det_src}|conf={_cfg.PPOCR_BOX_THRESHOLD}:{DETECT_RES_SIG}"
-            _det_cached = get_cached_text_detection(_det_key)
-            if _det_cached is None:
-                _ocr_undetermined = True
-                _queue_background_text_detection(_DeferredTextDetection(
-                    cache_key=_det_key,
-                    image_cache_key=f"{type}_{tmdb_id}_{poster_path.strip('/')}",
-                    title=[title] if title else [],
-                    source="poster",
-                    tmdb_id=tmdb_id,
-                    media_type=type,
-                    image_path=poster_path,
-                    vote_count=tmdb_data.get("vote_count"),
-                    source_key=_det_src,
-                ))
+        _priority_lang = _poster_language_order[0] if _poster_language_order else ""
+        _ranked_posters = [
+            _plangs[language]
+            for language in _poster_language_order
+            if _plangs.get(language)
+        ]
+        _use_primary = (
+            _priority_lang == "en" and rcfg.original_art_source == "primary"
+        )
+        if _use_primary:
+            _orig_art = _p_default or next(iter(_ranked_posters), None)
+        else:
+            _orig_art = next(iter(_ranked_posters), None) or _p_default
+        if _is_landscape:
+            # Landscape, mirroring /poster's short-circuit: the backdrop as
+            # shot, picked by TMDB's own language tag rather than by OCR, so
+            # there is no scan to defer and nothing the moat forbids.
+            #   textless — the language-neutral backdrop, our logo on top;
+            #   original — the highest-voted text-bearing one, title included.
+            # Each falls back to the other, and is_textless follows the art
+            # actually chosen, which is what the renderer must key off.
+            _art_undetermined = False
+            _ocr_undetermined = False
+            _suppress_overlay = False
+            use_backdrop = False
+            _vc = tmdb_data.get("vote_count")
+            _vote_detection_ok = _detection_vote_ok(_vc)
+            _ls_text_bd = tmdb_data.get("text_backdrop_path")
+            if rcfg.landscape_art == "original":
+                _ls_path = _ls_text_bd or backdrop_path
+                is_textless = _ls_text_bd is None and _ls_path is not None
             else:
-                _suppress_overlay = bool(_det_cached)
+                _ls_path = backdrop_path or _ls_text_bd
+                is_textless = bool(backdrop_path)
+            is_no_poster = _ls_path is None
+            if _ls_path is None:
+                image_coro = _resolved(_make_landscape_canvas(genre_ids))
+                is_textless = True
+            else:
+                image_coro = fetch_landscape_image(client, tmdb_id, _ls_path)
+        else:
+            # Art selection, mirroring /poster step for step: the two routes share
+            # composite keys, so a preset that picked different art would store a
+            # different poster under the key /poster reads.
+            #
+            #   no poster, or a poster with its title burned in → backdrop crop,
+            #   which is textless, so our logo goes on top;
+            #   original-art mode overrides both and serves the poster as-is.
+            _art_undetermined = False
+            use_backdrop = bool(backdrop_path) and (poster_path is None or not is_textless)
+            if use_backdrop:
+                is_textless = True
+            if rcfg.use_original_art and _orig_art:
+                poster_path = _orig_art
+                is_textless = False
+                use_backdrop = False
+            is_no_poster = poster_path is None and not use_backdrop
+
+            _vc = tmdb_data.get("vote_count")
+            _vote_detection_ok = _detection_vote_ok(_vc)
+
+            # A text-bearing poster under the vote gate is where /poster tries its
+            # rescues — a text-aware crop of a text-bearing backdrop, then TVDB art
+            # — each needing OCR or a request the moat forbids. The official
+            # poster is a fine anonymous answer, but may not be the image /poster
+            # stores under this key, so don't share it.
+            _orig_mode = bool(rcfg.use_original_art and _orig_art)
+            if (not use_backdrop and not is_no_poster and not is_textless
+                    and not _orig_mode and _vote_detection_ok):
+                _tmdb_rescue = (_cfg.TEXTLESS_TEXT_DETECTION
+                                and bool(tmdb_data.get("text_backdrop_path")))
+                _tvdb_rescue = (tvdb.tvdb_enabled()
+                                and (_cfg.TVDB_USE_BACKDROPS or _cfg.TVDB_USE_POSTERS))
+                if _tmdb_rescue or _tvdb_rescue:
+                    _art_undetermined = True
+            if use_backdrop:
+                # /poster crops a backdrop text-aware when detection is on and the
+                # title is under the vote gate — and that crop runs OCR, which this
+                # route may not. Crop plainly, and if /poster would have cropped
+                # differently, don't share the result.
+                _poster_would_avoid_text = (
+                    _cfg.TEXTLESS_TEXT_DETECTION and _vote_detection_ok
+                )
+                if _poster_would_avoid_text:
+                    _art_undetermined = True
+                image_coro = fetch_backdrop_image(
+                    client, tmdb_id, backdrop_path, avoid_text=False
+                )
+            elif is_no_poster:
+                # /poster tries TVDB art and the atmospheric genre backgrounds
+                # before the flat canvas — more requests than the moat allows. The
+                # canvas is a fine anonymous answer but not the same poster.
+                _art_undetermined = True
+                image_coro = _resolved(_make_fallback_canvas(genre_ids))
+            else:
+                image_coro = fetch_poster_image(client, tmdb_id, type, poster_path)
+
+            # Burned-in-text detection: CACHED ONLY. Never scan in the foreground on
+            # an anonymous hit. The detection key follows the art actually chosen —
+            # a backdrop is scanned under its own "bd:" key, exactly as /poster
+            # does, so a result either route computes is shared. Uncached means the
+            # render is undetermined: queue the background scan and don't persist.
+            _suppress_overlay = False
+            _ocr_undetermined = False
+            _scan_selected = (
+                _cfg.TEXTLESS_TEXT_DETECTION and is_textless and not is_no_poster
+            )
+            if _scan_selected:
+                from text_detect import DETECT_RES_SIG
+                if use_backdrop:
+                    _det_src = f"bd:{backdrop_path}:{_CROP_VERSION}:plain"
+                    _image_cache_key = (
+                        f"backdrop_{tmdb_id}_{backdrop_path.strip('/')}_{_CROP_VERSION}"
+                    )
+                    _det_source = "backdrop"
+                else:
+                    _det_src = f"ps:{poster_path}"
+                    _image_cache_key = f"{type}_{tmdb_id}_{poster_path.strip('/')}"
+                    _det_source = "poster"
+                _det_key = f"{_det_src}|conf={_cfg.PPOCR_BOX_THRESHOLD}:{DETECT_RES_SIG}"
+                _det_cached = get_cached_text_detection(_det_key)
+                if _det_cached is None:
+                    _ocr_undetermined = True
+                    _queue_background_text_detection(_DeferredTextDetection(
+                        cache_key=_det_key,
+                        image_cache_key=_image_cache_key,
+                        title=tuple(v for v in (title, tmdb_data.get("original_title")) if v),
+                        source=_det_source,
+                        tmdb_id=tmdb_id,
+                        media_type=type,
+                        image_path=poster_path,
+                        vote_count=_vc,
+                        source_key=_det_src,
+                    ))
+                else:
+                    _suppress_overlay = bool(_det_cached)
+
+        # Release status, cached-only.
+        #
+        # Every gallery preset asks for a release slot, so without this every
+        # /p render lost its status sash and cinema greyscale — and then
+        # persisted that under /poster's shared key, taking the sash away from
+        # configured instances too.
+        #
+        # For series it is a pure mapping of the tmdb_status already fetched,
+        # so it costs nothing. For films it needs TMDB's /release_dates, which
+        # the moat forbids: read the cached row instead and, when there isn't
+        # one, treat the render as undetermined rather than quietly shipping a
+        # poster missing a sash that /poster would have drawn.
+        _release_status: str | None = None
+        _release_undetermined = False
+        _RS_SLOTS = {
+            "release_status", "cinema", "streaming", "physical",
+            "production", "ended", "cancelled", "airing",
+        }
+        if any(s in rcfg.sash_priority for s in _RS_SLOTS):
+            if type in ("tv", "series"):
+                _release_status = await fetch_release_status(
+                    client, tmdb_id, effective_tmdb_key, type,
+                    tmdb_data.get("tmdb_status"),
+                )
+            else:
+                _release_status = get_cached_release_status(f"{type}_{tmdb_id}")
+                if _release_status is None:
+                    _release_undetermined = True
+                    _queue_release_warm(tmdb_id, tmdb_data.get("tmdb_status"))
+            # Both overrides below are local lookups, so they stay honest here.
+            if (_release_status in ("Cinema", "Production")
+                    and is_digital_release(effective_imdb_id)):
+                _release_status = "Streaming"
+            if (rcfg.release_status_cinema_only
+                    and _release_status not in ("Cinema", "Production")):
+                _release_status = None
+            # A dated "Oct 16 Cinema" sash needs the upcoming-release lookup,
+            # which is a request we may not make. The status alone renders
+            # differently from what /poster produces, so don't share it.
+            if (rcfg.release_status_dates
+                    and _release_status in ("Cinema", "Production")
+                    and type not in ("tv", "series")):
+                _release_undetermined = True
+
+        # "Just added" for films reads TMDB's release dates — cached-only here,
+        # like the status above. Unknown means don't share the render.
+        _recent_digital_release_date: str | None = None
+        if type not in ("tv", "series") and "just_added" in rcfg.sash_priority:
+            _known, _recent_digital_release_date = recent_digital_release_from_cache(tmdb_id)
+            if not _known:
+                _release_undetermined = True
+                _queue_release_warm(tmdb_id, tmdb_data.get("tmdb_status"))
 
         will_persist = (
-            cached_rating is not None and not quality_missing and not _ocr_undetermined
+            not _cfg.DISABLE_COMPOSITE_CACHE
+            and cached_rating is not None
+            and not quality_missing
+            and not _ocr_undetermined
+            and not _release_undetermined
+            and not _art_undetermined
         )
 
-        # Coalesce concurrent uncached renders — only on the will-persist path
-        # (an incomplete render must not be shared under the long preset TTL).
-        _render_fut: "asyncio.Future[bytes] | None" = None
-        if will_persist:
-            _existing_fut = _render_inflight.get(final_cache_key)
-            if _existing_fut is not None:
-                logger.info(f"Preset {preset} coalescing on {final_cache_key}")
-                try:
-                    return Response(content=await _existing_fut, media_type="image/jpeg",
-                                    headers=_preset_header(True))
-                except Exception:
-                    pass   # in-flight render failed; fall through and try ourselves
+        # Publish this render for others to coalesce onto — only on the
+        # will-persist path (an incomplete render must not be shared under the
+        # long preset TTL). Joining an existing render happened before
+        # admission, above.
+        if will_persist and _render_inflight.get(final_cache_key) is None:
             _render_fut = asyncio.get_running_loop().create_future()
             _render_fut.add_done_callback(
                 lambda f: f.exception() if not f.cancelled() and f.exception() else None
@@ -2752,20 +6155,33 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             image_coro,
             fetch_logo(
                 client, logos, rcfg.logo_language,
-                imdb_id=imdb_id, original_language=tmdb_data.get("original_language"),
+                imdb_id=effective_imdb_id or None,
+                original_language=tmdb_data.get("original_language"),
                 logo_priority=rcfg.logo_priority,
             ) if _overlay_logo else _resolved(None),
             fetch_trending_rank(client, tmdb_id, effective_tmdb_key, type),
         )
 
+        # /poster may take the logo from TVDB — first, second, or as the last
+        # resort after TMDB and Metahub, per TVDB_LOGO_PRIORITY. That is a TVDB
+        # request /p does not make, so whenever it could change the answer the
+        # render is not shared.
+        if (_overlay_logo and tvdb.tvdb_enabled() and _cfg.TVDB_USE_LOGOS
+                and (_cfg.TVDB_LOGO_PRIORITY < 3 or not logo)):
+            _art_undetermined = True
+            will_persist = False
+
         discovery_meta = extract_discovery_meta(
             tmdb_data=tmdb_data, media_type=type,
             award_wins=award_wins, award_noms=award_noms,
-            trending_rank=trending_rank, release_date=rel, keywords=[],
-            festival_label_override=festival_label,
+            trending_rank=trending_rank, tmdb_id=tmdb_id,
+            release_date=rel, keywords=[],
+            festival_keyword=festival_keyword,
             is_cult_override=is_cult, is_true_story_override=is_true_story,
             is_metacritic_override=is_metacritic,
-            is_digital_release_override=is_digital_release(imdb_id),
+            is_digital_release_override=is_digital_release(effective_imdb_id),
+            release_status_override=_release_status,
+            recent_digital_release_date=_recent_digital_release_date,
         )
 
         _bp_args = dict(
@@ -2780,32 +6196,25 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             release_year=release_year,
             age_rating=age_rating,
             no_poster=is_no_poster,
+            # A confirmed burned-in title must also switch off the tinted
+            # frosting, as /poster does; suppressing only the logo left the
+            # tint painted over the existing title.
+            has_burned_in_text=(_suppress_overlay is True),
         )
 
         def _composite_and_encode() -> bytes:
-            result = build_poster(image, score, genre, rcfg, **_bp_args)
+            _render = build_landscape if _is_landscape else build_poster
+            result = _render(image, score, genre, rcfg, **_bp_args)
             buf = io.BytesIO()
-            result.convert("RGB").save(buf, format="JPEG", quality=_cfg.JPEG_QUALITY)
+            # Must match /poster's encoding: the two share a composite key, so
+            # a JPEG written here is later served as image/<IMAGE_FORMAT> by
+            # /poster (webp by default), and vice versa.
+            _quality = _cfg.WEBP_QUALITY if _cfg.IMAGE_FORMAT == "webp" else _cfg.JPEG_QUALITY
+            result.convert("RGB").save(buf, format=_cfg.IMAGE_FORMAT.upper(), quality=_quality)
             return buf.getvalue()
 
-        global _render_semaphore
-        if _render_semaphore is None:
-            _render_semaphore = asyncio.Semaphore(_cfg.RENDER_CONCURRENCY)
-        try:
-            if _cfg.RENDER_QUEUE_TIMEOUT > 0:
-                await asyncio.wait_for(_render_semaphore.acquire(),
-                                       timeout=_cfg.RENDER_QUEUE_TIMEOUT)
-            else:
-                await _render_semaphore.acquire()
-        except asyncio.TimeoutError:
-            _metrics.render_saturated_total.inc()
-            logger.warning(f"Render queue saturated (cap={_cfg.RENDER_CONCURRENCY}); "
-                           f"503 for preset={preset} imdb={imdb_id}")
-            if _render_fut is not None and not _render_fut.done():
-                _render_fut.set_exception(HTTPException(status_code=503))
-                _render_inflight.pop(final_cache_key, None)
-            raise HTTPException(status_code=503, detail="Server saturated — try again shortly",
-                                headers={"Retry-After": "5"})
+        # The admission slot was taken before the fetch pipeline above and is
+        # released in this function's finally; only the CPU metering is here.
         try:
             _metrics.render_inflight.inc()
             with _metrics.render_duration_seconds.time():
@@ -2813,42 +6222,182 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
                     None, _composite_and_encode)
         finally:
             _metrics.render_inflight.dec()
-            _render_semaphore.release()
 
+        _persisted_expires_at: int | None = None
         if will_persist:
-            await set_cached_final_poster(final_cache_key, img_bytes)
+            # No request_params: replaying a /p URL through the trending
+            # refresh would need the /poster query string, which this route
+            # never had. The composite is still invalidated by tmdb_id like any
+            # other, so a rank change drops it and the next hit re-renders.
+            # Same dependency cap /poster applies: a composite must not outlive
+            # the facts baked into it. Without it a preset with a trending sash
+            # or a Cinema/Production status sat for the full ~7-day composite
+            # TTL — and, sharing /poster's key, served that stale sash to
+            # configured instances too, since cache hits skip resolution.
+            _ttl_override = None
+            _sash_result = pick_sash(discovery_meta, rcfg.sash_priority)
+            if _sash_result and _sash_result[1] in ("trending", "trending_broad"):
+                _ttl_override = 86400
+            if _release_status:
+                _status_ttl = release_status_ttl_seconds(_release_status)
+                _ttl_override = (
+                    _status_ttl if _ttl_override is None
+                    else min(_ttl_override, _status_ttl)
+                )
+            _persisted_expires_at = await set_cached_final_poster(
+                final_cache_key, img_bytes, ttl_override=_ttl_override,
+            )
             logger.info(f"Preset {preset} rendered + cached {final_cache_key}")
             if _render_fut is not None and not _render_fut.done():
-                _render_fut.set_result(img_bytes)
+                # Publish /poster's (bytes, provisional, expires_at) shape.
+                # _render_inflight is shared between the two routes, so a
+                # /poster request coalescing onto THIS render unpacks three
+                # values — bare bytes there would raise inside its own
+                # exception handler, be read as a failed render, and send it
+                # through the whole pipeline again.
+                _render_fut.set_result(
+                    (img_bytes, False, _persisted_expires_at)
+                )
         else:
+            # A render can turn non-persistable after its coalescing future was
+            # published (the TVDB-logo check needs the logo result). Hand the
+            # waiters the bytes anyway, marked provisional so none of them
+            # stores or long-caches it.
+            if _render_fut is not None and not _render_fut.done():
+                _render_fut.set_result((img_bytes, True, None))
             logger.info(
                 f"Preset {preset} rendered (not persisted: "
                 f"rating_cached={cached_rating is not None}, "
-                f"quality_missing={quality_missing}, ocr_undetermined={_ocr_undetermined}) "
+                f"quality_missing={quality_missing}, ocr_undetermined={_ocr_undetermined}, "
+                f"release_undetermined={_release_undetermined}, "
+                f"art_undetermined={_art_undetermined}) "
                 f"{final_cache_key}"
             )
-        return Response(content=img_bytes, media_type="image/jpeg",
-                        headers=_preset_header(will_persist))
+        return Response(content=img_bytes, media_type=f"image/{_cfg.IMAGE_FORMAT}",
+                        headers=_preset_header(will_persist, _persisted_expires_at))
     finally:
+        _render_sem.release()
         # Clear our coalescing slot. Waiters already hold the future object, so
         # popping after a successful set_result is safe; on an error path we
-        # fail the future first so waiters don't hang.
-        _f = _render_inflight.get(final_cache_key)
-        if _f is not None:
-            if not _f.done():
-                _f.set_exception(HTTPException(status_code=500))
-            _render_inflight.pop(final_cache_key, None)
+        # fail the future first so waiters don't hang. Only touch the future
+        # this call published — on the non-persisting path we never registered
+        # one, and popping then would steal another request's slot.
+        if _render_fut is not None:
+            if not _render_fut.done():
+                _render_fut.set_exception(HTTPException(status_code=500))
+            if _render_inflight.get(final_cache_key) is _render_fut:
+                _render_inflight.pop(final_cache_key, None)
 
 
 # ---------------------------------------------------------------------------
 # Poster endpoint
 # ---------------------------------------------------------------------------
 
+def _poster_etag(body: bytes) -> str:
+    """Derive a poster's validator from the bytes actually being served.
+
+    This used to be the composite cache key, which is a pure function of the
+    ids, the render params and the server signature — nothing in it describes
+    the *content*.  Trending rank, release status and the sash they drive all
+    turn over without touching any of those, so a re-render stored under the
+    same key inherited the same validator: the client revalidated, matched,
+    took a 304 and kept the superseded poster for as long as it kept asking.
+    A validator has to be a function of what it validates.
+    """
+    return f'"{hashlib.blake2b(body, digest_size=16).hexdigest()}"'
+
+
+def _apply_poster_cache_headers(
+    response: Response,
+    provisional: bool,
+    etag: str | None = None,
+    expires_at: int | None = None,
+) -> None:
+    """Attach the validator and freshness headers a poster response has earned.
+
+    *provisional* marks a render the pipeline itself declined to keep: quality
+    is still being fetched, OCR is queued, MDBlist just failed.  Leaving those
+    out of the composite cache only helps if the render is not held anywhere
+    else either.  A content-derived validator no longer lets a client revalidate
+    its badge-less copy against the finished composite and keep it — the two
+    hash differently — but nothing stops a CDN from storing the provisional
+    bytes and serving them to everyone for the full TTL, which is the worse half
+    of the same bug.
+
+    A provisional render therefore ships no validator and asks not to be stored.
+    """
+    if provisional:
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        return
+
+    if etag is not None:
+        response.headers["ETag"] = etag
+    if _cfg.DISABLE_COMPOSITE_CACHE:
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        return
+
+    remaining = None
+    if expires_at is not None:
+        remaining = max(0, int(expires_at) - int(time.time()))
+
+    if _cfg.CDN_CACHE_TTL_AUTO:
+        max_age = remaining
+    elif _cfg.CDN_CACHE_TTL > 0:
+        max_age = _cfg.CDN_CACHE_TTL if remaining is None else min(_cfg.CDN_CACHE_TTL, remaining)
+    else:
+        max_age = None
+
+    if max_age:
+        response.headers["Cache-Control"] = f"public, max-age={max_age}"
+    elif max_age == 0:
+        response.headers["Cache-Control"] = "public, max-age=0, must-revalidate"
+
+
+def _poster_response(
+    request: Request,
+    body: bytes,
+    final_cache_key: str | None,
+    provisional: bool,
+    expires_at: int | None = None,
+) -> Response:
+    """Return the 200 — or the 304 — a finished poster body has earned.
+
+    Every path that hands poster bytes back goes through here (composite hit,
+    coalesced render, fresh render) so the validator is computed one way and the
+    conditional request is answered one way.  *final_cache_key* only gates
+    whether a validator is offered at all: a quality= override is a one-off that
+    never enters the composite cache and has nothing to revalidate against.
+
+    The 304 carries the same headers as the 200 it stands in for.  A bare 304
+    leaves the client's stored freshness untouched (RFC 9111 §4.3.4 updates the
+    stored headers from whatever the 304 carries), so the poster would keep
+    whatever max-age it was first served with no matter how the TTL moved on.
+    """
+    etag = None
+    if final_cache_key is not None and not provisional:
+        etag = _poster_etag(body)
+        if request.headers.get("if-none-match") == etag:
+            not_modified = Response(status_code=304)
+            _apply_poster_cache_headers(
+                not_modified, provisional, etag=etag, expires_at=expires_at
+            )
+            return not_modified
+
+    response = Response(content=body, media_type=f"image/{_cfg.IMAGE_FORMAT}")
+    _apply_poster_cache_headers(response, provisional, etag=etag, expires_at=expires_at)
+    return response
+
+
 @app.get("/poster")
 async def get_poster(
     request: Request,
-    tmdb_id: str,
-    imdb_id: str,
+    tmdb_id: str = "",
+    imdb_id: str = "",
+    anilist_id: str = "",
+    kitsu_id: str = "",
+    stremio_id: str = "",
     type: str = "movie",
     quality: str = "",
     season: int = 1,
@@ -2879,16 +6428,28 @@ async def get_poster(
     badge_anchor_y: str | None = None,
     movie_weights: str | None = None,
     tv_weights: str | None = None,
+    anime_movie_weights: str | None = None,
+    anime_tv_weights: str | None = None,
     logo_language: str | None = None,
     sash_priority: str | None = None,
     muted: str | None = None,
     textless: str | None = None,
     score_color_mode: str | None = None,
+    shape: str | None = None,
+    landscape_art: str | None = None,
+    badge_pos: str | None = None,
     debug: str | None = None,
     nocache: str | None = None,
 ):
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized, your access key is not valid for this instance.")
+    # ElfHosted fork: fail-closed operator gate — see _require_operator.
+    _require_operator(
+        access_key,
+        public_detail=(
+            "Custom posters are not available on this instance; use a "
+            "/p/{preset}/{type}/{imdb_id}.jpg preset URL."
+        ),
+        detail="Unauthorized, your access key is not valid for this instance.",
+    )
 
     # ElfHosted fork: per-tenant rate limit. Tenant identity is derived from
     # the user-supplied key when the user brings their own (so a noisy tenant
@@ -2910,9 +6471,164 @@ async def get_poster(
                 headers={"Retry-After": str(retry_after)},
             )
 
-    _check_tmdb_id(tmdb_id)
-    _check_imdb_id(imdb_id)
     _check_type(type)
+
+    # Done before anything reads imdb_id — the composite cache key is built from
+    # it further down, and a literal "{imdb_id?}" baked into cache keys would
+    # fragment the cache per client build.
+    imdb_id = _normalise_optional_id(imdb_id, "imdb_id")
+
+    # AIOMetadata's "{id}" is the raw Stremio meta id, and for an ordinary title
+    # that IS the IMDb id ("tt0903747"). Generated templates no longer send
+    # imdb_id — a required placeholder with no value nulls the whole url — so
+    # when a template carries {id} and nothing else identifies the title to
+    # IMDb, take it from there. Request-supplied and available before any
+    # metadata fetch, so unlike an id discovered from TMDB later it is safe to
+    # key the cache on: it makes the row shared with every other client that
+    # sends an IMDb id, rather than a second row under the tmdb: form.
+    #
+    # Parsed here rather than in _resolve_anime_request because that returns
+    # early when anime sources are disabled, and this is not an anime concern.
+    if not imdb_id and stremio_id:
+        _stremio_hint = stremio_id.strip()
+        if _IMDB_ID_RE.match(_stremio_hint):
+            imdb_id = _stremio_hint
+        # ElfHosted fork (POSTER_RESOLVE_IMDB): "tmdb:<id>" — the third form
+        # this param's docstring lists — names the TMDB id directly. Upstream
+        # only reads tt… here, so a TMDB-keyed title sent as {id} fell through
+        # to "missing tmdb_id". With both forms understood, a client whose {id}
+        # placeholder is always populated (Nuvio's is) can use stremio_id={id}
+        # alone and never have the URL dropped for want of a per-service id.
+        elif (_cfg.POSTER_RESOLVE_IMDB and not tmdb_id
+              and _stremio_hint.lower().startswith("tmdb:")):
+            tmdb_id = _stremio_hint.split(":", 2)[1]
+
+    # -----------------------------------------------------------------------
+    # Anime-native ids (AniList / Kitsu).
+    #
+    # A client that can supply one — AIOMetadata and similar advanced metadata
+    # providers — gets art, titles, genres and a community score straight from
+    # the anime provider, with no id conversion anywhere. Clients that only
+    # speak imdb/tmdb/tvdb pass neither param and take the unchanged TMDB path.
+    #
+    # The anime id governs the ART and the metadata spine only. AIOMetadata
+    # sends tmdb_id and imdb_id alongside it whenever it has them, and those are
+    # worth keeping: MDBList ratings, awards, keywords, age rating and digital
+    # release are all IMDb-keyed, and trending and movie release status are
+    # TMDB-keyed. Discarding them leaves the info sash with nothing to say
+    # beyond the foreign-language label. So enrichment still runs on whatever
+    # ids the client supplied; only the art comes from the anime provider.
+    #
+    # `canonical_id` is the identity for the rating cache table: the IMDb id
+    # when there is one (so the row is shared with the ordinary path), else the
+    # "<namespace>:<id>" anime form, which can't collide with a bare TMDB id or
+    # a tt-prefixed IMDb id. See _canonical_rating_id(); the stream id sent to
+    # quality sources is resolved separately, after metadata.
+    # -----------------------------------------------------------------------
+    anime_namespace, anime_id = _resolve_anime_request(anilist_id, kitsu_id, stremio_id)
+    is_anime = anime_namespace is not None
+    anime_key = anime.namespaced_id(anime_namespace, anime_id) if is_anime else ""
+
+    if is_anime:
+        # Both are optional on this path, but must still be well-formed if sent.
+        if imdb_id:
+            _check_imdb_id(imdb_id)
+        if tmdb_id:
+            _check_tmdb_id(tmdb_id)
+        has_tmdb_id = bool(tmdb_id)
+        # Downstream art fetching, log lines and detection keys are written in
+        # terms of tmdb_id. Keep the real one when supplied (better cache keys,
+        # and it re-enables the TMDB-only lookups); otherwise stand in the
+        # anime id so those paths keep working without a second id threaded
+        # through them.
+        if not tmdb_id:
+            tmdb_id = anime_key
+    else:
+        # tmdb_id is the one required identity: it selects the artwork and the
+        # metadata spine, and nothing renders without it. imdb_id is optional
+        # enrichment.
+        #
+        # It used to be required too, which meant a title TMDB has no IMDb link
+        # for — TMDB returns imdb_id: null for these — could not be rendered at
+        # all, and the 400 named a parameter the caller had no way to supply.
+        # Handing the empty string to the format checks was worse still: it
+        # reported a missing id as malformed, and named whichever param happened
+        # to be checked first.
+        # ElfHosted fork (POSTER_RESOLVE_IMDB): an IMDb-only request resolves
+        # its tmdb_id server-side. The resolved request is keyed exactly like
+        # one that sent both ids — canonical_id is the IMDb id either way — so
+        # the two share composites rather than rendering the title twice.
+        if not tmdb_id and imdb_id and _cfg.POSTER_RESOLVE_IMDB:
+            _check_imdb_id(imdb_id)
+            _resolve_key = _resolve_tmdb_key(tmdb_key)
+            _resolve_type = "tv" if type in ("tv", "series") else "movie"
+            if _resolve_key and _HTTP_CLIENT is not None:
+                # A cold resolution is a TMDB request made before this request
+                # reaches render admission; a catalogue burst of IMDb-only
+                # titles would otherwise walk past POSTER_RENDER_CONCURRENCY
+                # and drain the shared HTTP pool. Same guard as /p. A cached
+                # mapping is a local read and skips it.
+                _cold = get_cached_imdb_to_tmdb(imdb_id, _resolve_type) is None
+                if _cold:
+                    _resolve_sem = _get_render_semaphore()
+                    try:
+                        if _cfg.RENDER_QUEUE_TIMEOUT > 0:
+                            await asyncio.wait_for(
+                                _resolve_sem.acquire(), timeout=_cfg.RENDER_QUEUE_TIMEOUT
+                            )
+                        else:
+                            await _resolve_sem.acquire()
+                    except asyncio.TimeoutError:
+                        _metrics.render_saturated_total.inc()
+                        raise HTTPException(
+                            status_code=503, detail="Server saturated — try again shortly",
+                            headers={"Retry-After": "5"},
+                        )
+                try:
+                    tmdb_id = await resolve_imdb_to_tmdb(
+                        _HTTP_CLIENT, imdb_id, _resolve_key, _resolve_type,
+                    ) or ""
+                finally:
+                    if _cold:
+                        _resolve_sem.release()
+                if not tmdb_id:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"No TMDB {type} found for imdb_id {imdb_id}",
+                    )
+        if not tmdb_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Missing required parameter: tmdb_id. /poster needs tmdb_id — "
+                    "it selects the artwork and metadata. imdb_id is optional; "
+                    "supplying it adds the IMDb-keyed enrichment (Metahub logo "
+                    "fallback, digital-release detection, stream-quality badges)."
+                ),
+            )
+        _check_tmdb_id(tmdb_id)
+        if imdb_id:
+            _check_imdb_id(imdb_id)
+        has_tmdb_id = True
+
+    canonical_id = _canonical_rating_id(imdb_id, anime_key, tmdb_id)
+
+    # The MDBList lookup route — what we ask upstream, as opposed to what we key
+    # the cache on. MDBList serves the same record under /imdb/… and /tmdb/…, so
+    # a title with no IMDb id still has ratings, awards, keywords and an age
+    # rating available; it just has to be asked for by its TMDB id.
+    #
+    # Anime is deliberately excluded from the TMDB route: those titles take their
+    # score, genre and age rating from the anime provider, and routing them to
+    # MDBList as well would start putting awards and festival sashes on a whole
+    # catalogue that has never had them. That is a rendering change to make on
+    # purpose, not a side effect of this one.
+    if imdb_id:
+        rating_provider, rating_media_id = "imdb", imdb_id
+    elif has_tmdb_id and not is_anime:
+        rating_provider, rating_media_id = "tmdb", tmdb_id
+    else:
+        rating_provider, rating_media_id = None, None
 
     # -----------------------------------------------------------------------
     # Single-user mode: check for a cached final poster first.
@@ -2925,7 +6641,25 @@ async def get_poster(
     effective_tmdb_key    = _resolve_tmdb_key(tmdb_key)
     effective_mdblist_key = _resolve_mdblist_key(mdblist_key)
 
-    if not effective_tmdb_key:
+    # Only null the key when the request has no MDBList-resolvable identity at
+    # all — that makes every downstream MDBList gate (cooldown, back-off,
+    # coalescing, the fetch itself) skip naturally rather than needing a branch
+    # at each one.
+    #
+    # This used to trigger on a missing IMDb id, which quietly made the lookup
+    # unreachable for TMDB-only titles no matter how the fetch itself was
+    # routed. It is now the absence of a route: an anime request that carries
+    # neither an IMDb id nor a TMDB id. When AIOMetadata does send an IMDb id
+    # alongside the anime id, the normal fetch runs and the provider score is
+    # merged into its result, so the sash gets awards, keywords and an age
+    # rating too.
+    if rating_media_id is None:
+        effective_mdblist_key = None
+
+    # An anime request gets its art and metadata from the provider, so a TMDB
+    # key is optional there even when a tmdb_id is supplied — it only unlocks
+    # the extra TMDB-keyed lookups (trending, movie release status).
+    if not effective_tmdb_key and not is_anime:
         raise HTTPException(
             status_code=400,
             detail=(
@@ -2937,11 +6671,33 @@ async def get_poster(
     raw_params = {
         k: v for k, v in request.query_params.items()
         if k not in (
-            "tmdb_id", "imdb_id", "mdblist_key", "tmdb_key", "type",
+            "tmdb_id", "imdb_id", "anilist_id", "kitsu_id", "stremio_id",
+            # Not art sources here (MAL needs auth, AniDB's API is heavily
+            # restricted), but AIOMetadata templates carry the full placeholder
+            # set. Excluded so their presence — substituted or not — can't
+            # fragment the composite cache key across otherwise identical
+            # requests.
+            "mal_id", "anidb_id",
+            "mdblist_key", "tmdb_key", "type",
             "quality", "season", "episode", "access_key", "debug", "nocache",
         )
     }
     rcfg = build_request_config(raw_params)
+
+    # Anime is essentially always Japanese, so the foreign-language slot says
+    # nothing here — but ranked highly (a reasonable choice for live-action,
+    # where it is a real signal) it would mask every sash below it on every
+    # anime title. Demote it to last rather than dropping it, so a title with
+    # nothing else to say still gets a label; a user who removed the slot
+    # entirely keeps it removed.
+    #
+    # Applied to rcfg itself rather than at the pick_sash call sites because
+    # build_poster derives its own ordering from cfg.sash_priority, and that is
+    # the one that ends up on the rendered poster.
+    if is_anime and "foreign" in rcfg.sash_priority:
+        rcfg.sash_priority = (
+            [s for s in rcfg.sash_priority if s != "foreign"] + ["foreign"]
+        )
 
     # Operator force-refresh: ?nocache=1 skips the composite cache READ so a fresh
     # render is produced (and re-cached), letting an operator invalidate a single
@@ -2958,38 +6714,75 @@ async def get_poster(
     # Skipped when an explicit quality= override is supplied (one-off).
     # ------------------------------------------------------------------
     if not quality and not _cfg.DISABLE_COMPOSITE_CACHE:
+        # ElfHosted fork: the key construction lives in _composite_cache_key so
+        # the anonymous /p preset route builds byte-identical keys and shares
+        # these composites.
         final_cache_key = _composite_cache_key(
-            imdb_id, tmdb_id, type, raw_params, rcfg.fallback_to_imdb
+            canonical_id,
+            tmdb_id,
+            type,
+            raw_params,
+            rcfg.fallback_to_imdb,
+            anime_key=anime_key if is_anime else None,
+            imdb_id=imdb_id,
         )
         if _force_refresh:
             logger.info(f"Force refresh (nocache) for {final_cache_key} — bypassing cache read")
-        # ElfHosted fork: when a CDN public URL is configured (OBJECT_STORE_PUBLIC_URL),
-        # serve cache hits by 302 to the CDN instead of pulling the bytes through
-        # the app pod + an S3 GET on every warm request. Only the cheap metadata
-        # freshness probe runs here — no blob fetch. Falls through to the inline
-        # path when no public URL is set or the row isn't fresh.
+        # ElfHosted fork: when a CDN public URL is configured
+        # (OBJECT_STORE_PUBLIC_URL), serve cache hits by 302 to the CDN instead
+        # of pulling the bytes through the app pod and an S3 GET on every warm
+        # request. Only the cheap metadata freshness probe runs here — no blob
+        # fetch. Falls through to the inline path when no public URL is set or
+        # the row isn't fresh.
+        #
+        # The redirect carries CDN_CACHE_TTL rather than the composite's own
+        # expires_at, because the client is being sent to an object whose
+        # lifetime the CDN manages; the inline path below still uses the
+        # per-composite deadline.
         if not _force_refresh:
-            _cdn_url = get_cached_final_poster_url(final_cache_key)
-            if _cdn_url is not None and await is_cached_final_poster_fresh(final_cache_key):
-                logger.info(f"Final poster cache hit (CDN redirect) for {final_cache_key}")
+            # Resolved from the SHARED row, never this process's L1: another
+            # pod may have replaced the composite, and only the row names the
+            # current (versioned) blob the CDN should be sent to.
+            _redirect = await get_cached_final_poster_redirect(final_cache_key)
+            if _redirect is not None:
+                _cdn_url, _cdn_expires_at = _redirect
+                logger.info(
+                    f"Final poster cache hit (CDN redirect) for {final_cache_key}"
+                )
                 _redir = Response(status_code=302)
                 _redir.headers["Location"] = _cdn_url
-                if _cfg.CDN_CACHE_TTL > 0:
-                    _redir.headers["Cache-Control"] = f"public, max-age={_cfg.CDN_CACHE_TTL}"
+                # Same header policy as the inline hit below, rather than a
+                # flat CDN_CACHE_TTL: with CDN_CACHE_TTL=auto (v1.2.0's
+                # per-composite mode) there is no flat TTL, and hardcoding
+                # one here would let a redirect outlive the composite it
+                # points at — the case that mode exists to prevent.
+                # ...but never longer than REDIRECT_MAX_AGE_SECONDS. The 302
+                # names one blob VERSION, and a superseded version is deleted
+                # after blobstore.DELETE_GRACE_SECONDS; a redirect cached past
+                # that would send clients to a 404. The object itself is
+                # immutable, so the CDN can hold it for as long as it likes.
+                _apply_poster_cache_headers(
+                    _redir, provisional=False,
+                    expires_at=min(
+                        _cdn_expires_at,
+                        int(time.time()) + blobstore.REDIRECT_MAX_AGE_SECONDS,
+                    ),
+                )
                 return _redir
-        cached_jpeg = None if _force_refresh else await get_cached_final_poster(final_cache_key)
-        if cached_jpeg is not None:
+        # ElfHosted fork: composite bytes live in the blobstore, so the read
+        # and the write are awaited (see cache.py).
+        _cached_entry = (
+            None if _force_refresh
+            else await get_cached_final_poster_entry(final_cache_key)
+        )
+        if _cached_entry is not None:
+            cached_jpeg, _cached_expires_at = _cached_entry
             logger.info(f"Final poster cache hit for {final_cache_key}")
-            etag = f'"{final_cache_key}"'
-            if request.headers.get("if-none-match") == etag:
-                return Response(status_code=304)
-            _hit_resp = Response(content=cached_jpeg, media_type="image/jpeg")
-            _hit_resp.headers["ETag"] = etag
-            # This path is only reached when composite caching is enabled, so a
-            # no-store branch would be dead here — CDN TTL is the only option.
-            if _cfg.CDN_CACHE_TTL > 0:
-                _hit_resp.headers["Cache-Control"] = f"public, max-age={_cfg.CDN_CACHE_TTL}"
-            return _hit_resp
+            # Only a finished render is ever written to the composite cache, so
+            # a cache hit is never provisional.
+            return _poster_response(
+                request, cached_jpeg, final_cache_key, False, _cached_expires_at
+            )
     else:
         final_cache_key = None
 
@@ -2999,19 +6792,19 @@ async def get_poster(
     # the pipeline.  Quality-override requests (final_cache_key=None) are
     # always rendered independently.
     # ------------------------------------------------------------------
-    _render_fut: "asyncio.Future[bytes] | None" = None
+    _render_fut: "asyncio.Future[tuple[bytes, bool, int | None]] | None" = None
     if final_cache_key is not None:
         _existing_fut = _render_inflight.get(final_cache_key)
         if _existing_fut is not None:
             logger.info(f"Coalescing request for {final_cache_key}")
             try:
-                _coal_resp = Response(content=await _existing_fut, media_type="image/jpeg")
-                _coal_resp.headers["ETag"] = f'"{final_cache_key}"'
-                # Coalescing only happens when caching is on (final_cache_key set),
-                # so no-store can't apply here — CDN TTL only.
-                if _cfg.CDN_CACHE_TTL > 0:
-                    _coal_resp.headers["Cache-Control"] = f"public, max-age={_cfg.CDN_CACHE_TTL}"
-                return _coal_resp
+                # The render we rode on decides our headers too: riding on a
+                # provisional one and then stamping an ETag would cache exactly
+                # the poster it was withheld to avoid.
+                _coal_bytes, _coal_provisional, _coal_expires_at = await _existing_fut
+                return _poster_response(
+                    request, _coal_bytes, final_cache_key, _coal_provisional, _coal_expires_at
+                )
             except Exception:
                 # The in-flight render failed; fall through and try ourselves.
                 pass
@@ -3027,7 +6820,7 @@ async def get_poster(
     # doesn't complain about use-before-global-declaration.
     global _mdblist_active_key_idx
 
-    cached_rating = get_cached_rating(imdb_id)
+    cached_rating = get_cached_rating(canonical_id)
 
     if cached_rating is not None:
         (
@@ -3037,24 +6830,31 @@ async def get_poster(
             cached_award_wins,
             cached_award_noms,
             cached_awards_fetched,
-            cached_festival_label,
+            cached_festival_keyword,
             cached_age_rating,
             cached_is_cult,
             cached_is_true_story,
             cached_is_metacritic,
         ) = cached_rating
+        # Globe / Emmy labels come from the TMDB id alone, so they are rebuilt
+        # here rather than read back: a stored label outlives its own
+        # correction, and rows written before movie and TV ids were kept in
+        # separate namespaces carry an "Emmy Winner" for Back to the Future.
+        cached_award_wins, cached_award_noms = reconcile_cached_awards(
+            cached_award_wins, cached_award_noms, tmdb_id, type,
+        )
     else:
-        cached_ratings_dict   = None
-        cached_genre          = None
-        cached_release_date   = None
-        cached_award_wins     = []
-        cached_award_noms     = []
-        cached_awards_fetched = False
-        cached_festival_label = None
-        cached_age_rating     = None
-        cached_is_cult        = False
-        cached_is_true_story  = False
-        cached_is_metacritic  = False
+        cached_ratings_dict     = None
+        cached_genre            = None
+        cached_release_date     = None
+        cached_award_wins       = []
+        cached_award_noms       = []
+        cached_awards_fetched   = False
+        cached_festival_keyword = None
+        cached_age_rating       = None
+        cached_is_cult          = False
+        cached_is_true_story    = False
+        cached_is_metacritic    = False
 
     release_date_for_quality_ttl = cached_release_date
     rating_already_cached        = cached_rating is not None
@@ -3062,14 +6862,14 @@ async def get_poster(
     # ------------------------------------------------------------------
     # Rating fetch coalescing + back-off
     #
-    # Goal: ensure at most one MDBList call per imdb_id per worker at a
+    # Goal: ensure at most one MDBList call per canonical_id per worker at a
     # time, and suppress repeated failures with key-scoped cooldowns.
     #
     # Back-off check: if a recent fetch failed, skip that title-key pair
     # until its escalating retry delay expires.
     #
     # Coalescing: if another coroutine in this worker is already fetching
-    # the same imdb_id, wait for its asyncio.Event, then re-read the DB.
+    # the same canonical_id, wait for its asyncio.Event, then re-read the DB.
     # If it succeeded we get the cached data for free; if it failed we
     # re-check the back-off (now set by the other coroutine) before
     # deciding whether to attempt our own call.
@@ -3081,18 +6881,41 @@ async def get_poster(
     if not rating_already_cached and effective_mdblist_key:
         _loop_now = asyncio.get_running_loop().time()
 
-        # ElfHosted fork: fleet-wide MDBList cooldown. When any replica has been
-        # 429'd recently, every replica backs off — cross-worker via the
-        # coordination layer (Redis), or per-process on the in-process default
-        # (where it overlaps the per-key cooldown below). Suppresses the fetch
-        # and the composite persist so an N/A score isn't locked in.
-        if await coord.is_backoff_active(
-            coord.NS_MDBLIST_GLOBAL_COOLDOWN, coord.MDBLIST_GLOBAL_KEY
-        ):
-            logger.debug(f"Rating fetch for {imdb_id} skipped (fleet-wide MDBList cooldown)")
-            effective_mdblist_key = None
-            _rating_backoff_active = True
-            _mdblist_unavailable_reason = "fleet-wide MDBList cooldown active"
+        # ElfHosted fork: fleet-wide MDBList cooldown, per credential. When a
+        # sibling replica has been 429'd on this key, back off here too rather
+        # than spending one more call to learn the same thing — cross-replica
+        # via the coordination layer, or per-process on the in-process default
+        # (where it overlaps the per-key cooldown below).
+        #
+        # Rotation first: a cooling key is a reason to try its siblings, not to
+        # stop. Only when every configured key is cooling does the request give
+        # up, which also suppresses the composite persist so an N/A score is
+        # not locked in for the composite TTL.
+        if await _fleet_mdblist_cooling(effective_mdblist_key):
+            _fleet_cooling_key = effective_mdblist_key
+            _fleet_replacement = None
+            for _candidate in _cfg.SERVER_MDBLIST_KEYS:
+                if _candidate == _fleet_cooling_key:
+                    continue
+                if _loop_now < _mdblist_key_cooldown.get(_candidate, 0.0):
+                    continue
+                if not await _fleet_mdblist_cooling(_candidate):
+                    _fleet_replacement = _candidate
+                    break
+            if _fleet_replacement is not None:
+                logger.info(
+                    f"MDBList {_mdblist_server_key_label(_fleet_cooling_key)} cooling "
+                    f"fleet-wide; using {_mdblist_server_key_label(_fleet_replacement)}"
+                )
+                effective_mdblist_key = _fleet_replacement
+            else:
+                logger.debug(
+                    f"Rating fetch for {canonical_id} skipped "
+                    f"(every MDBList key cooling fleet-wide)"
+                )
+                effective_mdblist_key = None
+                _rating_backoff_active = True
+                _mdblist_unavailable_reason = "fleet-wide MDBList cooldown active"
 
         # Per-key cooldown: configured server keys may rotate; request-supplied
         # keys remain isolated and simply wait for their own cooldown to expire.
@@ -3102,12 +6925,12 @@ async def get_poster(
             if _replacement is not None:
                 effective_mdblist_key = _replacement
                 logger.info(
-                    f"MDBList key rotated to key #{_mdblist_active_key_idx + 1} for {imdb_id}"
+                    f"MDBList key rotated to key #{_mdblist_active_key_idx + 1} for {canonical_id}"
                 )
             else:
                 _remaining = _mdblist_key_cooldown.get(_cooling_key, 0.0) - _loop_now
                 logger.debug(
-                    f"Rating fetch for {imdb_id} skipped "
+                    f"Rating fetch for {canonical_id} skipped "
                     f"(selected MDBList key cooling down; {_remaining:.0f}s remaining)"
                 )
                 effective_mdblist_key = None
@@ -3116,11 +6939,11 @@ async def get_poster(
 
         # Per-title and key backoff (network failures, or this title-key pair's last 429).
         if effective_mdblist_key:
-            _retry_key = _rating_retry_key(imdb_id, effective_mdblist_key)
+            _retry_key = _rating_retry_key(canonical_id, effective_mdblist_key)
             _backoff_until = _rating_backoff.get(_retry_key)
             if _backoff_until is not None:
                 if _loop_now < _backoff_until:
-                    logger.debug(f"Rating fetch for {imdb_id} skipped (MDBList back-off active for selected key)")
+                    logger.debug(f"Rating fetch for {canonical_id} skipped (MDBList back-off active for selected key)")
                     effective_mdblist_key = None
                     _rating_backoff_active = True
                     _mdblist_unavailable_reason = "selected key is in back-off for this title"
@@ -3129,12 +6952,12 @@ async def get_poster(
                     _rating_fail_count.pop(_retry_key, None)  # reset escalation for clean slate
 
     if not rating_already_cached and effective_mdblist_key:
-        _inflight_event = _rating_fetch_inflight.get(imdb_id)
+        _inflight_event = _rating_fetch_inflight.get(canonical_id)
         if _inflight_event is not None:
             # Another coroutine is mid-fetch — wait and piggyback on its result.
-            logger.info(f"Rating fetch coalesced for {imdb_id} — awaiting in-flight fetch")
+            logger.info(f"Rating fetch coalesced for {canonical_id} — awaiting in-flight fetch")
             await _inflight_event.wait()
-            _refreshed = get_cached_rating(imdb_id)
+            _refreshed = get_cached_rating(canonical_id)
             if _refreshed is not None:
                 (
                     cached_ratings_dict,
@@ -3143,92 +6966,266 @@ async def get_poster(
                     cached_award_wins,
                     cached_award_noms,
                     cached_awards_fetched,
-                    cached_festival_label,
+                    cached_festival_keyword,
                     cached_age_rating,
                     cached_is_cult,
                     cached_is_true_story,
                     cached_is_metacritic,
                 ) = _refreshed
+                cached_award_wins, cached_award_noms = reconcile_cached_awards(
+                    cached_award_wins, cached_award_noms, tmdb_id, type,
+                )
                 rating_already_cached        = True
                 release_date_for_quality_ttl = cached_release_date
-                logger.info(f"Rating coalesce succeeded for {imdb_id} — using cached result")
+                logger.info(f"Rating coalesce succeeded for {canonical_id} — using cached result")
             else:
-                # The other fetch also failed; re-check back-off it may have set.
-                _loop_now2    = asyncio.get_running_loop().time()
-                _retry_key2 = _rating_retry_key(imdb_id, effective_mdblist_key)
-                _backoff_now2 = _rating_backoff.get(_retry_key2)
-                if _backoff_now2 is not None and _loop_now2 < _backoff_now2:
-                    logger.debug(
-                        f"Rating fetch for {imdb_id} suppressed after coalescence (back-off active)"
-                    )
-                    effective_mdblist_key = None
-                    _rating_backoff_active = True
-                    _mdblist_unavailable_reason = "selected key is in back-off for this title"
-        else:
-            # First request for this imdb_id — claim the fetch slot.
-            _rating_event_to_set              = asyncio.Event()
-            _rating_fetch_inflight[imdb_id]   = _rating_event_to_set
-
-    # Quality tokens — cache checked exactly once here; fetch fn only writes.
-    if quality:
-        quality_tokens = parse_quality(quality)
-        cached_tokens  = None
-    else:
-        cached_tokens  = get_cached_quality(imdb_id, release_date_for_quality_ttl)
-        quality_tokens = cached_tokens or []
-
-    # A quality source is available when the server has AIOStreams configured,
-    # or QUALITY_SOURCE=scraper with a valid SCRAPER_URL.
-    _has_quality_source = (
-        bool(_cfg.AIOSTREAMS_URL and _cfg.AIOSTREAMS_AUTH)
-        or (_cfg.QUALITY_SOURCE == "scraper" and bool(_cfg.SCRAPER_URL))
-    )
-    _quality_cooldown_active = _has_quality_source and _quality_backoff_remaining() > 0
-    quality_needs_fetch = (
-        rcfg.badge_display_mode in (1, 2, 4, 5)
-        and not quality
-        and cached_tokens is None
-        and _has_quality_source
-        and not _quality_cooldown_active
-    )
-
-    quality_pending = bool(_quality_cooldown_active and cached_tokens is None)
-    if quality_needs_fetch and not rcfg.wait_for_quality:
-        # Fire-and-forget background fetch — poster is served immediately
-        # without badges; the cache will be warm on the next request.
-        if imdb_id not in _quality_bg_inflight:
-            _quality_bg_inflight.add(imdb_id)
-            asyncio.create_task(
-                _background_quality_fetch(
-                    imdb_id, type, season, episode,
-                    release_date_for_quality_ttl,
+                # The owner already made the MDBList attempt for this title.
+                # If it did not produce a cache row, do not launch a second
+                # same-content request from a waiter in the same burst.
+                logger.debug(
+                    f"Rating fetch for {canonical_id} suppressed after coalescence "
+                    "(owner did not cache rating)"
                 )
-            )
-            logger.info(f"Quality fetch deferred to background for {imdb_id}")
+                effective_mdblist_key = None
+                _rating_backoff_active = True
+                _mdblist_unavailable_reason = "coalesced fetch did not cache rating"
         else:
-            logger.info(f"Quality background fetch already in progress for {imdb_id}")
-        quality_needs_fetch = False
-        quality_pending = True
+            # First request for this canonical_id — claim the fetch slot.
+            _rating_event_to_set              = asyncio.Event()
+            _rating_fetch_inflight[canonical_id] = _rating_event_to_set
 
-    if not rating_already_cached and not effective_mdblist_key:
+    # A request with no MDBList route (anime carrying neither an IMDb nor a TMDB
+    # id) nulls the key deliberately, so this would be noise rather than a warning.
+    if not rating_already_cached and not effective_mdblist_key and rating_media_id:
         logger.warning(
-            f"MDBList unavailable for {imdb_id}: {_mdblist_unavailable_reason} — "
+            f"MDBList unavailable for {canonical_id}: {_mdblist_unavailable_reason} — "
             "poster will be served without rating/award data."
         )
 
     effective_movie_weights = rcfg.movie_weights or _cfg.MOVIE_WEIGHTS
     effective_tv_weights    = rcfg.tv_weights    or _cfg.TV_WEIGHTS
+    # Anime weights are opt-in: a URL naming neither scores its anime with the
+    # two sets above, exactly as it did before the anime parameters existed.
+    effective_anime_movie_weights = rcfg.anime_movie_weights or effective_movie_weights
+    effective_anime_tv_weights    = rcfg.anime_tv_weights    or effective_tv_weights
+
+    def _weights_for(ratings: dict) -> dict:
+        return _select_rating_weights(
+            ratings, type, anime_native=is_anime,
+            movie_weights=effective_movie_weights,
+            tv_weights=effective_tv_weights,
+            anime_movie_weights=effective_anime_movie_weights,
+            anime_tv_weights=effective_anime_tv_weights,
+        )
 
     if _HTTP_CLIENT is None:
         raise HTTPException(status_code=503, detail="Service unavailable")
     client = _HTTP_CLIENT
 
-    global _active_poster_renders
+    # Secondary preferred language, only when the chosen priority actually uses it.
+    _effective_secondary = (
+        rcfg.logo_language_secondary
+        if rcfg.logo_priority in _SECONDARY_LANGUAGE_PRIORITIES
+        else ""
+    )
+
+    # Render admission: everything above was cache lookups and coalescing
+    # bookkeeping; from here on the request talks to upstream APIs and
+    # composites, and only POSTER_RENDER_CONCURRENCY of those run at once.
+    # Released in the finally block below.
+    global _active_poster_renders, _renders_queued
+    _render_sem = _get_render_semaphore()
+    if _render_sem.locked():
+        logger.debug(
+            f"Render for tmdb_id={tmdb_id} queued: "
+            f"{_cfg.POSTER_RENDER_CONCURRENCY} renders already in flight"
+        )
+    _renders_queued += 1
+    try:
+        # ElfHosted fork: upstream waits here indefinitely, which is right for
+        # a private instance and wrong for a public one — a saturated queue
+        # there just becomes client timeouts with no signal to back off. With
+        # RENDER_QUEUE_TIMEOUT set, give up and tell the client to retry.
+        # Timing out is handled exactly like the cancellation below, because
+        # the consequences are identical: the coalescing future is already
+        # published and its riders must not be left waiting on a render that
+        # is never going to start.
+        if _cfg.RENDER_QUEUE_TIMEOUT > 0:
+            await asyncio.wait_for(
+                _render_sem.acquire(), timeout=_cfg.RENDER_QUEUE_TIMEOUT
+            )
+        else:
+            await _render_sem.acquire()
+    except BaseException as exc:
+        # Cancelled or timed out while queued. Nothing has been touched yet,
+        # but the coalescing future was already published and anyone riding it
+        # must not wait forever.
+        if isinstance(exc, asyncio.TimeoutError):
+            _metrics.render_saturated_total.inc()
+            logger.warning(
+                f"Render queue saturated (cap={_cfg.POSTER_RENDER_CONCURRENCY}, "
+                f"waited {_cfg.RENDER_QUEUE_TIMEOUT}s); returning 503 for "
+                f"tmdb_id={tmdb_id}"
+            )
+            exc = HTTPException(
+                status_code=503,
+                detail="Server saturated — try again shortly",
+                headers={"Retry-After": "5"},
+            )
+        if _render_fut is not None and not _render_fut.done():
+            _render_fut.set_exception(exc)
+        if final_cache_key is not None:
+            _render_inflight.pop(final_cache_key, None)
+        if _rating_event_to_set is not None:
+            _rating_event_to_set.set()
+            _rating_fetch_inflight.pop(canonical_id, None)
+        raise exc
+    finally:
+        _renders_queued -= 1
     _active_poster_renders += 1
     try:
-        genre_ids, is_textless, logos, release_year, title, poster_path, backdrop_path, tmdb_data = (
-            await fetch_poster_metadata(client, tmdb_id, effective_tmdb_key, type, rcfg.logo_language)
+        # True only while we are actually rendering the anime provider's cover
+        # art, which is what the art-specific rules key off. Distinct from
+        # is_anime, which stays true for a request that fell back to TMDB art.
+        using_anime_art = False
+        _anime_art_missing = False
+        if is_anime:
+            # Neither provider ships title logos, so when a tmdb_id came with
+            # the request pull TMDB's metadata alongside — purely for its logo
+            # list, which is language-aware and has good anime coverage. The
+            # art, title, genres, dates and score still come from the anime
+            # provider. This is cached for a week and coalesced, so the
+            # amortised cost is one extra call per title per week.
+            _anime_meta, _logo_meta = await asyncio.gather(
+                anime.fetch_anime_metadata(client, anime_namespace, anime_id),
+                _coalesced_fetch_poster_metadata(
+                    client, tmdb_id, effective_tmdb_key, type,
+                    rcfg.logo_language, _effective_secondary,
+                ) if (has_tmdb_id and effective_tmdb_key) else _resolved(None),
+                return_exceptions=True,
+            )
+            if isinstance(_anime_meta, BaseException):
+                logger.warning(f"Anime metadata fetch failed for {anime_key}: {_anime_meta}")
+                _anime_meta = None
+            # A failed logo lookup is never fatal — it just means no logo.
+            if isinstance(_logo_meta, BaseException):
+                logger.warning(f"TMDB logo lookup failed for {tmdb_id}: {_logo_meta}")
+                _logo_meta = None
+
+            using_anime_art = _anime_meta is not None
+            if _anime_meta is None and _logo_meta is not None:
+                # The provider has no entry, or was throttled or unreachable.
+                # TMDB's metadata is already in hand (fetched for the logo), so
+                # serve its art rather than dropping to a genre canvas — a
+                # strictly better poster, and it degrades gracefully if the
+                # provider has an outage. Rendering reverts to the normal TMDB
+                # rules; only the anime-specific ART behaviour is skipped.
+                logger.info(
+                    f"No {anime_namespace} entry for {anime_key} — falling back to TMDB art"
+                )
+                _anime_meta = _logo_meta
+                _anime_art_missing = True
+            elif _anime_meta is None:
+                # Nothing from either source — same genre canvas path a TMDB
+                # title with no art takes.
+                _anime_meta = anime.empty_metadata(anime_namespace)
+                _anime_art_missing = True
+            else:
+                _anime_art_missing = False
+
+            (
+                genre_ids, is_textless, logos, release_year, title,
+                poster_path, backdrop_path, tmdb_data,
+            ) = _anime_meta
+            if using_anime_art and _logo_meta is not None:
+                logos = _logo_meta[2]
+        else:
+            genre_ids, is_textless, logos, release_year, title, poster_path, backdrop_path, tmdb_data = (
+                await _coalesced_fetch_poster_metadata(
+                    client, tmdb_id, effective_tmdb_key, type, rcfg.logo_language,
+                    _effective_secondary,
+                )
+            )
+        # Canonical IMDb id for downstream lookups (e.g. TVDB remoteid resolution):
+        # the request param if supplied, else the one TMDB returned in external_ids.
+        # Optional: TMDB returns imdb_id: null for titles it has no IMDb link for.
+        effective_imdb_id = (imdb_id or "").strip() or tmdb_data.get("imdb_id") or None
+
+        # ------------------------------------------------------------------
+        # Quality tokens — cache checked exactly once here; fetch fn only writes.
+        #
+        # This runs *after* metadata on purpose. The id a quality source will
+        # recognise is not always one the caller sent: for an ordinary title
+        # whose URL carries no imdb_id, the IMDb id TMDB just returned is the
+        # only thing Torrentio/Comet/AIOStreams/QualiCache can be asked about.
+        # Resolving quality before metadata would have silently dropped the
+        # badges from every normally-linked title the moment generated templates
+        # stopped sending imdb_id.
+        #
+        # quality_id is None when nothing upstream would recognise the title —
+        # then the lookup is skipped rather than issued in a form that can only
+        # 404. An explicit quality= override needs no lookup and is unaffected.
+        # ------------------------------------------------------------------
+        quality_id = _quality_identity(imdb_id, anime_key, effective_imdb_id)
+
+        if quality:
+            quality_tokens = parse_quality(quality)
+            cached_tokens  = None
+        elif quality_id is None:
+            cached_tokens  = None
+            quality_tokens = []
+        else:
+            cached_tokens  = get_cached_quality(quality_id, release_date_for_quality_ttl)
+            quality_tokens = cached_tokens or []
+
+        # A quality source is available when the backend QUALITY_SOURCE selects has
+        # the settings it needs — AIOStreams URL + auth, SCRAPER_URL, or QUALICACHE_URL.
+        _has_quality_source = quality_source_configured()
+        _quality_cooldown_active = _has_quality_source and _quality_backoff_remaining() > 0
+
+        # The landscape renderer has no quality badges — build_landscape drops the
+        # tokens — so fetching them buys nothing and costs plenty: wait_for_quality
+        # would block every landscape request on a provider whose answer is thrown
+        # away, and a pending fetch would keep the composite out of the cache, so a
+        # slow source turned every request into a fresh render.
+        _is_landscape = rcfg.shape == "landscape"
+
+        quality_needs_fetch = (
+            rcfg.badge_display_mode in (1, 2, 4, 5, 6)
+            and not quality
+            and quality_id is not None
+            and cached_tokens is None
+            and _has_quality_source
+            and not _quality_cooldown_active
+            and not _is_landscape
         )
+
+        quality_pending = bool(
+            _quality_cooldown_active
+            and quality_id is not None
+            and cached_tokens is None
+            and not _is_landscape
+        )
+        if quality_needs_fetch and not rcfg.wait_for_quality:
+            # Fire-and-forget background fetch — poster is served immediately
+            # without badges; the cache will be warm on the next request.
+            # Torrentio, Comet and AIOStreams all accept an anime-native stream id
+            # ("kitsu:12345:1:1") because that is exactly what Stremio sends them
+            # for Kitsu-catalogue items, so that form passes straight through and
+            # the quality badge keeps working without an IMDb id.
+            if quality_id not in _quality_bg_inflight:
+                _quality_bg_inflight.add(quality_id)
+                asyncio.create_task(
+                    _background_quality_fetch(
+                        quality_id, type, season, episode,
+                        release_date_for_quality_ttl,
+                    )
+                )
+                logger.info(f"Quality fetch deferred to background for {quality_id}")
+            else:
+                logger.info(f"Quality background fetch already in progress for {quality_id}")
+            quality_needs_fetch = False
+            quality_pending = True
         _text_titles = tuple(dict.fromkeys(
             value for value in (title, tmdb_data.get("original_title")) if value
         ))
@@ -3238,7 +7235,10 @@ async def get_poster(
         # fallback if the rating fetch fails or is skipped entirely.
         _gid_set = set(genre_ids)
         _tmdb_genre = "Unknown"
-        for _gid in _cfg.GENRE_PRIORITY:
+        _genre_priority = (
+            _cfg.ANIME_GENRE_PRIORITY if is_anime else _cfg.GENRE_PRIORITY
+        )
+        for _gid in _genre_priority:
             if _gid in _gid_set:
                 _candidate = _cfg.GENRE_MAP.get(_gid, "")
                 if _candidate:
@@ -3268,7 +7268,7 @@ async def get_poster(
         _p_default = tmdb_data.get("original_poster_path")
         _original_lang = tmdb_data.get("original_language") or ""
         _poster_language_order = image_language_order(
-            rcfg.logo_language, _original_lang, rcfg.logo_priority
+            rcfg.logo_language, _original_lang, rcfg.logo_priority, _effective_secondary
         )
         _priority_lang = _poster_language_order[0] if _poster_language_order else ""
         _ranked_posters = [
@@ -3297,24 +7297,90 @@ async def get_poster(
             logger.info(f"Original-art mode for {tmdb_id} — poster {poster_path} "
                         f"(priority={rcfg.logo_priority})")
 
-        if rating_already_cached or not effective_mdblist_key:
-            rating_coro = _resolved(
-                (cached_ratings_dict, cached_genre, cached_release_date, [], cached_age_rating)
-            )
+        # Anime providers ship exactly one cover image per title and it
+        # essentially always has the title logotype baked into the art, so it is
+        # served as-is under the same rules as original-art mode: no logo
+        # composited over it, no burned-in-text scan (it would reject nearly
+        # every one, at the cost of an OCR pass), and no backdrop rescue —
+        # AniList banners are 1900x400 and the portrait crop would destroy them.
+        #
+        # ANIME_COMPOSITE_LOGO (default on) overrides the logo half of that.
+        # In practice anime cover art either carries no logotype at all or a
+        # small block of Japanese text in a corner that most viewers can't read,
+        # so a composited title logo is an improvement often enough to be worth
+        # doing unconditionally. Text detection stays off either way: it would
+        # flag that Japanese corner text on most titles and suppress the logo
+        # inconsistently, which reads worse than always printing it.
+        # Gated on using_anime_art, not is_anime: when the provider missed and we
+        # fell back to TMDB art, that art follows the ordinary TMDB rules
+        # (textless selection, backdrop rescue, text detection) as it would for
+        # any other title.
+        if using_anime_art and poster_path:
+            _use_original_art = True
+            _use_backdrop     = False
+            is_textless       = bool(_cfg.ANIME_COMPOSITE_LOGO)
+
+        if is_anime and not rating_already_cached and not effective_mdblist_key:
+            # No IMDb id (or no key), so MDBList can't be asked. Supply what the
+            # provider gave us instead of nothing. With an IMDb id this branch is
+            # skipped and the normal MDBList fetch runs; the provider score is
+            # merged into its result below either way.
+            rating_coro = _resolved((
+                None,
+                (
+                    {},
+                    _tmdb_genre,
+                    tmdb_data.get("tmdb_release_date"),
+                    [],
+                    tmdb_data.get("anime_age_rating"),
+                ),
+            ))
+        elif rating_already_cached or not effective_mdblist_key:
+            rating_coro = _resolved((
+                None,
+                (cached_ratings_dict, cached_genre, cached_release_date, [], cached_age_rating),
+            ))
         else:
             global _mdblist_semaphore
             if _mdblist_semaphore is None:
                 _mdblist_semaphore = asyncio.Semaphore(_cfg.MDBLIST_CONCURRENCY)
 
             async def _fetch_rating_gated(
-                _key: str, _client=client, _imdb_id=imdb_id,
-                _gids=genre_ids, _type=type,
+                _key: str, _client=client, _media_id=rating_media_id,
+                _provider=rating_provider, _gids=genre_ids, _type=type,
                 _mw=effective_movie_weights, _tw=effective_tv_weights,
             ):
+                nonlocal _rating_backoff_active, _mdblist_unavailable_reason
                 async with _mdblist_semaphore:
-                    return await _with_retry(
-                        fetch_rating,
-                        _client, _imdb_id, _key, _gids, _type,
+                    _fetch_key = _key
+                    _fetch_now = asyncio.get_running_loop().time()
+                    if (
+                        _fetch_key in _cfg.SERVER_MDBLIST_KEYS
+                        and _fetch_now < _mdblist_key_cooldown.get(_fetch_key, 0.0)
+                    ):
+                        _replacement_key = _next_mdblist_server_key(_fetch_key, _fetch_now)
+                        if _replacement_key is None:
+                            _remaining = _mdblist_key_cooldown.get(_fetch_key, 0.0) - _fetch_now
+                            logger.debug(
+                                f"Rating fetch for {canonical_id} skipped "
+                                f"({_mdblist_server_key_label(_fetch_key)} cooling down; "
+                                f"{_remaining:.0f}s remaining)"
+                            )
+                            _rating_backoff_active = True
+                            _mdblist_unavailable_reason = "selected key is cooling down"
+                            return None, (
+                                cached_ratings_dict, cached_genre,
+                                cached_release_date, [], cached_age_rating,
+                            )
+                        logger.info(
+                            f"MDBList key rotated from {_mdblist_server_key_label(_fetch_key)} "
+                            f"to {_mdblist_server_key_label(_replacement_key)} for {canonical_id} "
+                            "before outbound fetch"
+                        )
+                        _fetch_key = _replacement_key
+                    return _fetch_key, await fetch_rating(
+                        _client, _fetch_key, _gids, _type,
+                        media_id=_media_id, provider=_provider,
                         movie_weights=_mw, tv_weights=_tw,
                     )
 
@@ -3327,8 +7393,73 @@ async def get_poster(
         _detection_deferred = False
         _vc = tmdb_data.get("vote_count")
         _vote_detection_ok = _detection_vote_ok(_vc)
+
+        async def _tvdb_is_clean(cand_image, art_id, *, source="backdrop", kind="bd") -> bool:
+            """Inline burned-in-text vet for a TVDB candidate (background or poster),
+            mirroring the TMDB text-backdrop rescue.  Returns True only when detection
+            is available, vote-gated, and reports no text.  Memoised per (tvdb id,
+            kind, crop, detector)."""
+            if not (_cfg.TEXTLESS_TEXT_DETECTION and _vote_detection_ok):
+                return False
+            try:
+                from text_detect import DETECT_RES_SIG
+                _src = f"tvdb_{kind}:{art_id}:{_CROP_VERSION}:ta"
+                _key = f"{_src}|conf={_cfg.PPOCR_BOX_THRESHOLD}:{DETECT_RES_SIG}"
+                _res = get_cached_text_detection(_key)
+                if _res is None:
+                    _res = await asyncio.shield(_start_text_detection(
+                        _key, cand_image, title=_text_titles, source=source,
+                        tmdb_id=tmdb_id, vote_count=_vc, source_key=_src))
+                return _res is False
+            except Exception as exc:
+                logger.warning(f"TVDB {kind} vet failed for {tmdb_id}: {exc}")
+                return False
+
         is_no_poster = poster_path is None and not _use_backdrop
-        if _use_backdrop:
+
+        # ------------------------------------------------------------------
+        # Landscape short-circuit.
+        #
+        # The whole portrait art chain above — textless poster selection,
+        # backdrop-to-portrait rescue, TVDB fallbacks — exists to manufacture a
+        # 2:3 image.  Landscape wants the backdrop as shot, so none of it
+        # applies: pick a backdrop, fit it, done.  Falls back to the portrait
+        # decisions only for the genre canvas, which has no aspect of its own.
+        #
+        #   textless — the language-neutral backdrop; our logo goes on top
+        #   original — the highest-voted language-tagged one, title treatment
+        #              already in the art, so is_textless stays False and every
+        #              existing gate skips our logo for us
+        #
+        # Both modes fall back, and the fallback flips that: a title with no
+        # text-bearing backdrop lands on the neutral one (or the genre canvas),
+        # which carries no title, so is_textless goes True and our logo IS
+        # wanted.  is_textless — not the requested mode — is what the renderer
+        # must key off; deciding it from cfg.landscape_art downstream is how
+        # these fallbacks ended up rendering with no title at all.
+        # ------------------------------------------------------------------
+        if _is_landscape:
+            _ls_text_bd = tmdb_data.get("text_backdrop_path")
+            if rcfg.landscape_art == "original":
+                _ls_path = _ls_text_bd or backdrop_path
+                # Only the text-bearing pick carries its own title; if the title
+                # had none and we fell back to the neutral backdrop, our logo is
+                # wanted after all.
+                is_textless = _ls_text_bd is None and _ls_path is not None
+            else:
+                _ls_path = backdrop_path or _ls_text_bd
+                # Falling through to a text-bearing backdrop means the title is
+                # already in the art; don't double it with our logo.
+                is_textless = bool(backdrop_path)
+            _use_backdrop = False
+            is_no_poster  = _ls_path is None
+            if _ls_path is None:
+                logger.info(f"No backdrop for {tmdb_id} — landscape falls back to genre canvas")
+                _image_coro = _resolved(_make_landscape_canvas(genre_ids))
+                is_textless = True
+            else:
+                _image_coro = fetch_landscape_image(client, tmdb_id, _ls_path)
+        elif _use_backdrop:
             # Text-aware backdrop cropping also invokes PP-OCR, so apply the
             # same foreground vote gate used by the final burned-in-text scan.
             _backdrop_avoid_text = (
@@ -3337,11 +7468,52 @@ async def get_poster(
             _image_coro = fetch_backdrop_image(
                 client, tmdb_id, backdrop_path, avoid_text=_backdrop_avoid_text)
         elif is_no_poster:
-            # Prefer the atmospheric genre background (minimal or photoreal set,
-            # per the request); fall back to the flat genre-tinted gradient if no
-            # background art exists for this genre in either set.
-            _bg = _load_genre_background(_tmdb_genre, rcfg.fallback_bg_style)
-            _image_coro = _resolved(_bg if _bg is not None else _make_fallback_canvas(genre_ids))
+            # No poster art at all.  Before settling for the genre canvas, try a
+            # TVDB background (curated fanart — usually textless).  Strictly an
+            # upgrade over a flat canvas.  Vet for burned-in text where possible;
+            # composite our logo only on a clean one, otherwise show it as-is.
+            _tvdb_bg = None
+            _tvdb_bg_id = None
+            if _cfg.TVDB_USE_BACKDROPS and tvdb.tvdb_enabled():
+                _bd_avoid = _cfg.TEXTLESS_TEXT_DETECTION and _vote_detection_ok
+                _tvdb_bg, _tvdb_bg_id = await tvdb.tvdb_backdrop(
+                    client, media_type=type, imdb_id=effective_imdb_id,
+                    tmdb_id=tmdb_id, avoid_text=_bd_avoid,
+                )
+            # Opt-in TVDB poster as a further no-art rescue (TVDB_USE_POSTERS).
+            # A real poster — even one carrying its own title — beats a genre
+            # canvas; we composite our logo only when it vets clean.
+            _tvdb_ps = None
+            _tvdb_ps_id = None
+            if (_tvdb_bg is None and _cfg.TVDB_USE_POSTERS and tvdb.tvdb_enabled()):
+                _tvdb_ps, _tvdb_ps_id = await tvdb.tvdb_poster(
+                    client, media_type=type, language=rcfg.logo_language,
+                    imdb_id=effective_imdb_id, tmdb_id=tmdb_id,
+                )
+            if _tvdb_bg is not None:
+                if await _tvdb_is_clean(_tvdb_bg, _tvdb_bg_id):
+                    is_textless = True           # clean art → composite our logo
+                    logger.info(f"TVDB background for {tmdb_id} clean — using with logo")
+                else:
+                    logger.info(f"TVDB background for {tmdb_id} unvetted/texted — using as-is")
+                is_no_poster = False
+                _backdrop_rescued = True          # pre-vetted → skip the scan block
+                _image_coro = _resolved(_tvdb_bg)
+            elif _tvdb_ps is not None:
+                if await _tvdb_is_clean(_tvdb_ps, _tvdb_ps_id, source="poster", kind="ps"):
+                    is_textless = True
+                    logger.info(f"TVDB poster for {tmdb_id} clean — using with logo")
+                else:
+                    logger.info(f"TVDB poster for {tmdb_id} unvetted/texted — using as-is")
+                is_no_poster = False
+                _backdrop_rescued = True
+                _image_coro = _resolved(_tvdb_ps)
+            else:
+                # Prefer the atmospheric genre background (minimal or photoreal set,
+                # per the request); fall back to the flat genre-tinted gradient if no
+                # background art exists for this genre in either set.
+                _bg = _load_genre_background(_tmdb_genre, rcfg.fallback_bg_style)
+                _image_coro = _resolved(_bg if _bg is not None else _make_fallback_canvas(genre_ids))
         else:
             # Option A: the title has only text-bearing art (no textless poster
             # or backdrop).  Before settling for the busy official poster, try a
@@ -3382,7 +7554,45 @@ async def get_poster(
                 _backdrop_rescued = True
                 _image_coro = _resolved(_rescued)
             else:
-                _image_coro = fetch_poster_image(client, tmdb_id, type, poster_path)
+                # Second rescue tier: a TVDB background, vetted the same way.  Only
+                # for text-bearing posters (not a clean TMDB textless one), gated to
+                # low-vote titles like the TMDB rescue above.  Falls through to the
+                # official poster when TVDB has nothing clean.
+                _tvdb_bg = None
+                _tvdb_bg_id = None
+                if (_cfg.TVDB_USE_BACKDROPS and tvdb.tvdb_enabled()
+                        and not is_textless and not _use_original_art
+                        and _detection_vote_ok(_vc)):
+                    _tvdb_bg, _tvdb_bg_id = await tvdb.tvdb_backdrop(
+                        client, media_type=type, imdb_id=effective_imdb_id,
+                        tmdb_id=tmdb_id, avoid_text=True,
+                    )
+                # Third rescue tier (opt-in, TVDB_USE_POSTERS): a TVDB poster.
+                # These usually have title text baked in, so it's only used when
+                # text detection confirms it's clean — otherwise we keep the
+                # official poster.  Same low-vote gate.
+                _tvdb_ps = None
+                _tvdb_ps_id = None
+                if (_tvdb_bg is None and _cfg.TVDB_USE_POSTERS and tvdb.tvdb_enabled()
+                        and not is_textless and not _use_original_art
+                        and _detection_vote_ok(_vc)):
+                    _tvdb_ps, _tvdb_ps_id = await tvdb.tvdb_poster(
+                        client, media_type=type, language=rcfg.logo_language,
+                        imdb_id=effective_imdb_id, tmdb_id=tmdb_id,
+                    )
+                if _tvdb_bg is not None and await _tvdb_is_clean(_tvdb_bg, _tvdb_bg_id):
+                    is_textless = True
+                    _backdrop_rescued = True
+                    _image_coro = _resolved(_tvdb_bg)
+                    logger.info(f"TVDB background rescue clean for {tmdb_id} — using with logo")
+                elif _tvdb_ps is not None and await _tvdb_is_clean(
+                        _tvdb_ps, _tvdb_ps_id, source="poster", kind="ps"):
+                    is_textless = True
+                    _backdrop_rescued = True
+                    _image_coro = _resolved(_tvdb_ps)
+                    logger.info(f"TVDB poster rescue clean for {tmdb_id} — using with logo")
+                else:
+                    _image_coro = fetch_poster_image(client, tmdb_id, type, poster_path)
 
         # Start eligible foreground OCR as soon as the image arrives. Higher-vote
         # assets are recorded as deferred work instead: the request keeps waiting
@@ -3396,6 +7606,14 @@ async def get_poster(
             and is_textless
             and not is_no_poster
             and not _backdrop_rescued
+            # Anime art is deliberately composited with a logo regardless of any
+            # Japanese corner text, so the scan would only burn an OCR pass to
+            # produce an inconsistent result. See the is_textless assignment.
+            # TMDB fallback art is scanned normally.
+            and not using_anime_art
+            # Landscape picks its art by TMDB's own language tag rather than by
+            # scanning it, so there is nothing here for OCR to decide.
+            and not _is_landscape
         )
         if _scan_selected_image:
             from text_detect import DETECT_RES_SIG
@@ -3460,80 +7678,136 @@ async def get_poster(
 
                 _image_coro = _fetch_image_and_schedule_detection()
 
+        # Logo resolution across TMDB, the Metahub CDN, and (optionally) TVDB.
+        # TVDB's position in the chain is set by TVDB_LOGO_PRIORITY:
+        #   1 = TVDB first, 2 = after TMDB but before Metahub, 3 = last resort.
+        # Priority 3 (default) and a missing TVDB key both reduce to the original
+        # TMDB -> Metahub -> (TVDB) behaviour, so existing output is unchanged.
+        _tvdb_logo_pri = _cfg.TVDB_LOGO_PRIORITY if tvdb.tvdb_enabled() else 3
+
+        async def _resolve_logo():
+            async def _tmdb(use_metahub):
+                return await fetch_logo(
+                    client, logos, rcfg.logo_language,
+                    imdb_id=effective_imdb_id,
+                    original_language=tmdb_data.get("original_language"),
+                    logo_priority=rcfg.logo_priority,
+                    use_metahub=use_metahub,
+                    secondary_language=_effective_secondary,
+                )
+
+            async def _tvdb():
+                return await tvdb.tvdb_logo(
+                    client, media_type=type, logo_language=rcfg.logo_language,
+                    original_language=tmdb_data.get("original_language"),
+                    logo_priority=rcfg.logo_priority,
+                    secondary_language=_effective_secondary,
+                    imdb_id=effective_imdb_id, tmdb_id=tmdb_id,
+                )
+
+            async def _metahub():
+                return (await _fetch_metahub_logo(client, effective_imdb_id)
+                        if effective_imdb_id else None)
+
+            # These modes have their own explicit order: TMDB language buckets
+            # (native, then custom/original for the native_custom_* variants) ->
+            # TMDB English -> Metahub -> TMDB neutral -> rendered text.
+            if rcfg.logo_priority in _TEXT_FORWARD_LOGO_PRIORITIES:
+                return await _tmdb(use_metahub=True)
+
+            if _tvdb_logo_pri == 1:
+                return (await _tvdb()) or (await _tmdb(use_metahub=True))
+            if _tvdb_logo_pri == 2:
+                return (await _tmdb(use_metahub=False)) or (await _tvdb()) or (await _metahub())
+            # priority 3 — TMDB -> Metahub -> TVDB
+            return (await _tmdb(use_metahub=True)) or (await _tvdb())
+
         (
             image,
             logo,
-            rating_result,
+            rating_fetch_result,
             trending_rank,
         ) = await asyncio.gather(
             _image_coro,
-            fetch_logo(client, logos, rcfg.logo_language, imdb_id=imdb_id, original_language=tmdb_data.get("original_language"), logo_priority=rcfg.logo_priority) if (is_textless and not is_no_poster) else _resolved(None),
+            _resolve_logo() if (is_textless and not is_no_poster) else _resolved(None),
             rating_coro,
-            fetch_trending_rank(client, tmdb_id, effective_tmdb_key, type),
+            # Trending rank is a TMDB list lookup, so it needs a real tmdb_id —
+            # which AIOMetadata does send alongside the anime id when it has one.
+            fetch_trending_rank(client, tmdb_id, effective_tmdb_key, type)
+            if has_tmdb_id and effective_tmdb_key else _resolved(None),
         )
+
+        rating_key_used, rating_result = rating_fetch_result
+        if rating_key_used is not None:
+            effective_mdblist_key = rating_key_used
+        elif _rating_backoff_active:
+            effective_mdblist_key = None
 
         # A rate-limited server key gets one same-request rescue attempt on the
         # next healthy configured key. Query-supplied keys remain isolated.
+        #
+        # This rescue is hand-rolled rather than routed through _with_retry on
+        # purpose: _with_retry re-calls blindly on FETCH_FAILED, so wrapping the
+        # rating fetch would fire a second request at the key that just returned
+        # 429 — before the cooldown below can register it — doubling load on a
+        # key that explicitly asked us to back off. Rotate first, then retry.
         if isinstance(rating_result, _RateLimited) and effective_mdblist_key:
             _failed_key = effective_mdblist_key
             _backoff_secs, _rescue_key = _mark_mdblist_rate_limit(
-                imdb_id, _failed_key, rating_result
+                canonical_id, _failed_key, rating_result
             )
             logger.warning(
-                f"MDBList key rate-limited for {imdb_id}; cooling down for "
-                f"{_backoff_secs:.0f}s"
+                f"MDBList {_mdblist_server_key_label(_failed_key)} rate-limited "
+                f"for {canonical_id}; cooling down for {_backoff_secs:.0f}s"
             )
-            # ElfHosted fork: raise a fleet-wide cooldown too, so sibling
-            # replicas (sharing the same MDBList keys) back off instead of
-            # each discovering the 429 independently. No-op beyond the
-            # per-process cooldown above on the in-process coordinator.
-            with suppress(Exception):
-                await coord.set_backoff(
-                    coord.NS_MDBLIST_GLOBAL_COOLDOWN, coord.MDBLIST_GLOBAL_KEY,
-                    ttl_seconds=_backoff_secs,
-                )
+            await _publish_fleet_mdblist_cooldown(_failed_key, _backoff_secs)
             if _rescue_key is not None:
                 effective_mdblist_key = _rescue_key
                 logger.warning(
-                    f"Retrying MDBList for {imdb_id} with configured key "
-                    f"#{_mdblist_active_key_idx + 1}"
+                    f"Retrying MDBList for {canonical_id} with "
+                    f"{_mdblist_server_key_label(_rescue_key)}"
                 )
-                rating_result = await _fetch_rating_gated(_rescue_key)
+                _rescue_used_key, rating_result = await _fetch_rating_gated(_rescue_key)
+                if _rescue_used_key is not None:
+                    effective_mdblist_key = _rescue_used_key
+                elif _rating_backoff_active:
+                    effective_mdblist_key = None
 
         # Inline quality wait — runs after gather so rating coalescing is never
         # blocked.  Used for poster-warm workflows where latency doesn't matter.
         if quality_needs_fetch and rcfg.wait_for_quality:
-            async def _inline_fetch():
-                if _cfg.QUALITY_SOURCE == "scraper" and _cfg.SCRAPER_URL:
-                    return await _with_retry(
-                        fetch_quality_from_scraper,
-                        client, _cfg.SCRAPER_URL,
-                        imdb_id, type, season, episode, release_date_for_quality_ttl,
-                    )
-                return await _with_retry(
-                    fetch_quality_from_aiostreams,
-                    client, imdb_id, type, season, episode, release_date_for_quality_ttl,
-                )
             try:
                 fetched = await asyncio.wait_for(
-                    _inline_fetch(), timeout=_cfg.QUALITY_WAIT_TIMEOUT
+                    _with_retry(
+                        fetch_quality,
+                        client, quality_id, type, season, episode, release_date_for_quality_ttl,
+                    ),
+                    timeout=_cfg.QUALITY_WAIT_TIMEOUT,
                 )
                 _record_quality_result(fetched)
-                if fetched is not FETCH_FAILED:
+                if fetched is QUALITY_PENDING:
+                    # QualiCache has queued this title but has no value yet.
+                    # Waiting longer wouldn't help — it collects out of band.
+                    logger.info(
+                        f"Inline quality fetch pending for {quality_id} "
+                        "— serving without quality, composite not cached"
+                    )
+                    quality_pending = True
+                elif fetched is not FETCH_FAILED:
                     quality_tokens = fetched
-                    logger.info(f"Inline quality fetch complete for {imdb_id}: {quality_tokens}")
+                    logger.info(f"Inline quality fetch complete for {quality_id}: {quality_tokens}")
                 else:
-                    # AIOStreams/scraper returned a transient error — don't cache
+                    # The quality source returned a transient error — don't cache
                     # the composite poster without quality so the next request retries.
                     logger.warning(
-                        f"Inline quality fetch failed for {imdb_id} "
+                        f"Inline quality fetch failed for {quality_id} "
                         "— serving without quality, composite not cached"
                     )
                     quality_pending = True
             except asyncio.TimeoutError:
                 _record_quality_result(FETCH_FAILED)
                 logger.warning(
-                    f"Quality wait timed out for {imdb_id} "
+                    f"Quality wait timed out for {quality_id} "
                     f"after {_cfg.QUALITY_WAIT_TIMEOUT:.0f}s — serving without quality, "
                     "composite not cached so next request retries"
                 )
@@ -3552,47 +7826,84 @@ async def get_poster(
 
         if rating_failed:
             if rate_limited:
-                _retry_key = _rating_retry_key(imdb_id, effective_mdblist_key)
+                _retry_key = _rating_retry_key(canonical_id, effective_mdblist_key)
                 if _retry_key not in _rating_backoff:
                     backoff_secs, _ = _mark_mdblist_rate_limit(
-                        imdb_id, effective_mdblist_key, rating_result
+                        canonical_id, effective_mdblist_key, rating_result
                     )
                     logger.warning(
-                        f"MDBList rate-limited {imdb_id}; key cooling down for "
+                        f"MDBList rate-limited {canonical_id}; key cooling down for "
                         f"{backoff_secs:.0f}s"
+                    )
+                    await _publish_fleet_mdblist_cooldown(
+                        effective_mdblist_key, backoff_secs
                     )
             else:
                 # Network / timeout failure — escalating back-off so a transient
                 # hiccup retries quickly while a sustained outage backs off further.
                 # Ladder: 30 s → 2 min → 8 min → 1 h (cap), using 4× multiplier.
-                _failed_retry_key = _rating_retry_key(imdb_id, effective_mdblist_key)
+                _failed_retry_key = _rating_retry_key(canonical_id, effective_mdblist_key)
                 fail_n = _rating_fail_count.get(_failed_retry_key, 0) + 1
                 _rating_fail_count[_failed_retry_key] = fail_n
                 backoff_secs = min(30 * (4 ** (fail_n - 1)), 3600.0)
                 logger.warning(
-                    f"Rating fetch failed for {imdb_id} (attempt {fail_n}) "
+                    f"Rating fetch failed for {canonical_id} (attempt {fail_n}) "
                     f"— back-off {backoff_secs:.0f}s"
                 )
             if not rate_limited:
-                _failed_retry_key = _rating_retry_key(imdb_id, effective_mdblist_key)
+                _failed_retry_key = _rating_retry_key(canonical_id, effective_mdblist_key)
                 _rating_backoff[_failed_retry_key] = asyncio.get_running_loop().time() + backoff_secs
-            ratings_dict   = {}
-            genre          = cached_genre or _tmdb_genre
-            rel            = cached_release_date
-            score          = "N/A"
-            keywords       = []
-            award_wins     = cached_award_wins
-            award_noms     = cached_award_noms
-            festival_label = cached_festival_label
-            age_rating     = cached_age_rating
-            is_cult        = cached_is_cult
-            is_true_story  = cached_is_true_story
-            is_metacritic  = cached_is_metacritic
+            ratings_dict     = {}
+            genre            = cached_genre or _tmdb_genre
+            rel              = cached_release_date
+            # MDBList failed (or was never reachable), but the IMDb dataset and
+            # TMDB's own vote average are independent, MDBList-free sources - try
+            # them before giving up on a score entirely. calculate_weighted_score
+            # returns "N/A" itself when ratings_dict has nothing usable, so this
+            # is safe even when neither source has anything to offer.
+            ratings_dict     = _merge_imdb_dataset_rating(ratings_dict, effective_imdb_id, rcfg)
+            ratings_dict     = _merge_direct_tmdb_rating(ratings_dict, tmdb_data, rcfg)
+            rating_weights   = _weights_for(ratings_dict)
+            score            = calculate_weighted_score(
+                ratings_dict,
+                rating_weights,
+                fallback_to_imdb=rcfg.fallback_to_imdb,
+                fallback_source=anime_namespace if is_anime else None,
+            )
+            keywords         = []
+            award_wins       = cached_award_wins
+            award_noms       = cached_award_noms
+            festival_keyword = cached_festival_keyword
+            age_rating       = cached_age_rating
+            is_cult          = cached_is_cult
+            is_true_story    = cached_is_true_story
+            is_metacritic    = cached_is_metacritic
         else:
             ratings_dict, genre, rel, keywords, age_rating = rating_result
             # genre from MDBlist/cache may be None when the key is absent and
             # nothing is cached yet — fall back to the TMDB-derived genre.
-            genre = genre or _tmdb_genre
+            #
+            # On the anime path the genre is always derived here from the
+            # provider's own genre list rather than read back from the cached
+            # rating row. The row's genre column exists to carry MDBList's
+            # answer, which anime titles never have; trusting it would pin a
+            # title to whatever ANIME_GENRE_PRIORITY said when it was first
+            # cached, so a reordering wouldn't take effect until the TTL expired.
+            genre = _tmdb_genre if is_anime else (genre or _tmdb_genre)
+
+            # The provider's score rides along in the art response, so merge it
+            # into whatever MDBList returned — or into an empty dict when there
+            # was no IMDb id to ask about. Done here rather than at the fetch so
+            # it also covers the cached path, where the row may have been first
+            # written by a request that carried no anime id.
+            if is_anime and isinstance(ratings_dict, dict):
+                _provider_score = tmdb_data.get("anime_score")
+                if _provider_score is not None:
+                    ratings_dict = {**ratings_dict, anime_namespace: _provider_score}
+            # Likewise the age rating: MDBList supplies one for titles it knows,
+            # but Kitsu's ageRating covers those it doesn't.
+            if is_anime and age_rating is None:
+                age_rating = tmdb_data.get("anime_age_rating")
 
             # Fresh successful fetch — clear any escalation state so future
             # failures start back at the shortest interval.
@@ -3602,68 +7913,75 @@ async def get_poster(
                 and effective_mdblist_key
             ):
                 _rating_fail_count.pop(
-                    _rating_retry_key(imdb_id, effective_mdblist_key), None
+                    _rating_retry_key(canonical_id, effective_mdblist_key), None
                 )
 
+            ratings_dict = _ratings_base(ratings_dict)
             if isinstance(ratings_dict, dict):
-                weights = (
-                    effective_tv_weights
-                    if type in ("tv", "series")
-                    else effective_movie_weights
-                )
+                ratings_dict = _merge_imdb_dataset_rating(ratings_dict, effective_imdb_id, rcfg)
+                ratings_dict = _merge_direct_tmdb_rating(ratings_dict, tmdb_data, rcfg)
+                rating_weights = _weights_for(ratings_dict)
                 score = calculate_weighted_score(
                     ratings_dict,
-                    weights,
+                    rating_weights,
                     fallback_to_imdb=rcfg.fallback_to_imdb,
+                    # The provider's score is the only rating an anime-native
+                    # title has, and existing weights strings name none of the
+                    # anime sources, so fall back to it rather than showing N/A.
+                    # Giving anilist/kitsu a real weight overrides this.
+                    fallback_source=anime_namespace if is_anime else None,
                 )
             else:
                 score = ratings_dict
+                rating_weights = None
 
             if rating_already_cached:
-                award_wins     = cached_award_wins
-                award_noms     = cached_award_noms
-                festival_label = cached_festival_label
-                age_rating     = cached_age_rating
-                is_cult        = cached_is_cult
-                is_true_story  = cached_is_true_story
-                is_metacritic  = cached_is_metacritic
+                award_wins       = cached_award_wins
+                award_noms       = cached_award_noms
+                festival_keyword = cached_festival_keyword
+                age_rating       = cached_age_rating
+                is_cult          = cached_is_cult
+                is_true_story    = cached_is_true_story
+                is_metacritic    = cached_is_metacritic
             else:
                 award_wins, award_noms = parse_mdblist_awards(
                     keywords,
                     tmdb_id=tmdb_id,
+                    media_type=type,
                 )
                 kw_names = {(kw.get("name") or "").lower().strip() for kw in keywords}
-                festival_label = next(
-                    (label for kw, label in FESTIVAL_KEYWORDS.items() if kw in kw_names),
-                    None,
-                )
+                festival_keyword = match_festival_keyword(kw_names)
                 is_cult       = bool({"cult-classic", "cult-film"} & kw_names)
                 is_true_story = "based-on-true-story" in kw_names
                 is_metacritic = "metacritic-must-see" in kw_names
-                logger.info(f"Awards for {imdb_id}: wins={award_wins} noms={award_noms} "
-                            f"festival={festival_label} age_rating={age_rating} "
+                logger.info(f"Awards for {canonical_id}: wins={award_wins} noms={award_noms} "
+                            f"festival={festival_keyword} age_rating={age_rating} "
                             f"cult={is_cult} true_story={is_true_story} metacritic={is_metacritic}")
 
         # ------------------------------------------------------------------
         # Write rating + awards to cache (only on a fresh fetch).
         # ------------------------------------------------------------------
-        if not rating_failed and not rating_already_cached and effective_mdblist_key:
+        # Anime ratings come from the provider rather than MDBList, so they are
+        # cached on the same terms but gated on is_anime instead of a key.
+        if not rating_failed and not rating_already_cached and (
+            effective_mdblist_key or is_anime
+        ):
             set_cached_rating(
-                imdb_id,
+                canonical_id,
                 ratings_dict if isinstance(ratings_dict, dict) else {},
                 genre,
                 rel,
                 award_wins,
                 award_noms,
                 awards_fetched=True,
-                festival_label=festival_label,
+                festival_keyword=festival_keyword,
                 age_rating=age_rating,
                 is_cult=is_cult,
                 is_true_story=is_true_story,
                 is_metacritic=is_metacritic,
             )
-            logger.info(f"Rating cached for {imdb_id}: score={score} genre={genre} "
-                        f"wins={award_wins} noms={award_noms} festival={festival_label} "
+            logger.info(f"Rating cached for {canonical_id}: score={score} genre={genre} "
+                        f"wins={award_wins} noms={award_noms} festival={festival_keyword} "
                         f"age_rating={age_rating}")
 
         # Publish completion only after success is cached or failure backoff is
@@ -3671,31 +7989,79 @@ async def get_poster(
         # the same MDBList request.
         if _rating_event_to_set is not None:
             _rating_event_to_set.set()
-            _rating_fetch_inflight.pop(imdb_id, None)
+            _rating_fetch_inflight.pop(canonical_id, None)
             _rating_event_to_set = None
 
-        logger.info(f"Quality for {imdb_id}: tokens={quality_tokens} year={release_year}")
+        logger.info(
+            f"Quality for {canonical_id}: tokens={quality_tokens} year={release_year} "
+            f"(quality_id={quality_id})"
+        )
 
         # ------------------------------------------------------------------
-        # Release status (opt-in via sash_priority — movies make an extra
-        # /release_dates API call; TV is free, mapped from tmdb_status)
+        # Release status / freshness facts. TV status is mapped from already
+        # fetched metadata. Movie digital freshness uses the cached TMDB
+        # /release_dates helper only when the Just Added sash is enabled.
         # ------------------------------------------------------------------
         _release_status: str | None = None
-        if "release_status" in rcfg.sash_priority:
-            _release_status = await fetch_release_status(
-                client, tmdb_id, effective_tmdb_key, type,
-                tmdb_data.get("tmdb_status"),
-            )
+        _recent_digital_release_date: str | None = None
+        _rs_slots = {"release_status", "cinema", "streaming", "physical", "production", "ended", "cancelled", "airing"}
+        if any(s in rcfg.sash_priority for s in _rs_slots):
+            # Resolved for every title regardless of age.  There used to be an
+            # age gate here that skipped the lookup for anything older than a
+            # configurable limit, but it silently blanked the status on older
+            # titles — which read as a bug rather than a setting.  Results are
+            # cached, and stale "Cinema" on an old film is handled properly by
+            # CINEMA_MAX_AGE_YEARS, which downgrades it to "Streaming".
+            # For series this is a pure mapping of the status field already in
+            # hand — no API call — so anime series get their lifecycle sashes
+            # from the provider's status. The movie branch needs TMDB's
+            # /release_dates, so it runs only when a real tmdb_id and key came
+            # with the request; otherwise the slot simply doesn't fire.
+            if (type in ("tv", "series")
+                    or (has_tmdb_id and effective_tmdb_key)):
+                _release_status = await fetch_release_status(
+                    client, tmdb_id, effective_tmdb_key, type,
+                    tmdb_data.get("tmdb_status"),
+                )
             # r/movieleaks confirmation overrides TMDB's theatrical/production
             # status — if the film is in the digital-release cache it's already
             # streaming regardless of what the official release dates say.
-            if _release_status in ("Cinema", "Production") and is_digital_release(imdb_id):
+            if (_release_status in ("Cinema", "Production")
+                    and effective_imdb_id
+                    and is_digital_release(effective_imdb_id)):
                 _release_status = "Streaming"
             # Cinema-only mode: keep the badge purely as an "unavailable" marker —
             # show only Cinema / Production and drop the rest so the slot is
             # skipped (and lower-priority sashes can surface) for released titles.
             if rcfg.release_status_cinema_only and _release_status not in ("Cinema", "Production"):
                 _release_status = None
+
+        # An unreleased movie with a published date wears the date and the
+        # window it opens instead of the bare status ("Oct 16 Cinema").
+        # Resolved after the overrides above so a leaked title that just became
+        # "Streaming" is not dated.  Reads the same cached release-dates row the
+        # status came from, so this is not a second TMDB call.
+        _upcoming_release_date: str | None = None
+        _upcoming_release_window: str | None = None
+        if (rcfg.release_status_dates
+                and _release_status in ("Cinema", "Production")
+                and type not in ("tv", "series")
+                and has_tmdb_id and effective_tmdb_key):
+            _upcoming = await fetch_upcoming_movie_release(
+                client, tmdb_id, effective_tmdb_key,
+                tmdb_data.get("tmdb_status"),
+                status=_release_status,
+                primary_release_date=tmdb_data.get("tmdb_release_date"),
+            )
+            if _upcoming:
+                _upcoming_release_date, _upcoming_release_window = _upcoming
+
+        if (type not in ("tv", "series") and "just_added" in rcfg.sash_priority
+                and has_tmdb_id and effective_tmdb_key):
+            _recent_digital_release_date = await fetch_recent_movie_digital_release_date(
+                client, tmdb_id, effective_tmdb_key,
+                tmdb_data.get("tmdb_status"),
+            )
 
         # ------------------------------------------------------------------
         # Build DiscoveryMeta
@@ -3706,15 +8072,23 @@ async def get_poster(
             award_wins=award_wins,
             award_noms=award_noms,
             trending_rank=trending_rank,
+            tmdb_id=tmdb_id,
             release_date=rel,
             keywords=keywords if not rating_already_cached else [],
-            festival_label_override=festival_label,
+            festival_keyword=festival_keyword,
             is_cult_override=is_cult,
             is_true_story_override=is_true_story,
             is_metacritic_override=is_metacritic,
-            is_digital_release_override=is_digital_release(imdb_id),
+            is_digital_release_override=bool(
+                effective_imdb_id and is_digital_release(effective_imdb_id)
+            ),
             release_status_override=_release_status,
+            upcoming_release_date=_upcoming_release_date,
+            upcoming_release_window=_upcoming_release_window,
+            recent_digital_release_date=_recent_digital_release_date,
         )
+
+        _sash_priority = rcfg.sash_priority
 
         # ------------------------------------------------------------------
         # Debug mode: return diagnostic JSON instead of rendering the poster.
@@ -3722,12 +8096,23 @@ async def get_poster(
         # Activate with ?debug=1 (never cached, never stored).
         # ------------------------------------------------------------------
         if debug and debug.strip() in ("1", "true"):
-            _sash_result = pick_sash(discovery_meta, rcfg.sash_priority)
+            _sash_result = pick_sash(discovery_meta, _sash_priority)
             return JSONResponse({
-                "imdb_id":           imdb_id,
+                "imdb_id":           imdb_id or None,
+                "effective_imdb_id": effective_imdb_id,
+                "canonical_id":      canonical_id,
+                "rating_provider":   rating_provider,
+                "rating_media_id":   rating_media_id,
+                "imdb_rating_source": rcfg.imdb_rating_source,
+                "tmdb_rating_source": rcfg.tmdb_rating_source,
+                "quality_id":        quality_id,
                 "tmdb_id":           tmdb_id,
                 "type":              type,
                 "score":             score if isinstance(score, str) else int(score),
+                "is_anime":          is_anime or (
+                    isinstance(ratings_dict, dict) and is_anime_rated(ratings_dict)
+                ),
+                "rating_weights":    rating_weights,
                 "genre":             genre,
                 "release_year":      release_year,
                 "release_date":      rel,
@@ -3735,20 +8120,29 @@ async def get_poster(
                 "age_rating":        age_rating,
                 "award_wins":        award_wins,
                 "award_noms":        award_noms,
-                "festival_label":    festival_label,
+                "festival_keyword":  festival_keyword,
+                "festival_label":    discovery_meta.festival_label,
                 "sash":              {"label": _sash_result[0], "type": _sash_result[1]} if _sash_result else None,
                 "is_cult":           discovery_meta.is_cult,
                 "is_true_story":     discovery_meta.is_true_story,
                 "is_metacritic":     discovery_meta.is_metacritic_must_see,
                 "is_new_release":    discovery_meta.is_new_release,
                 "is_digital_release":discovery_meta.is_digital_release,
+                "recent_digital_release_date": _recent_digital_release_date,
+                "is_premiere":       discovery_meta.is_premiere,
+                "is_just_added":     discovery_meta.is_just_added,
+                "is_new_season":     discovery_meta.is_new_season,
+                "is_returning":      discovery_meta.is_returning,
+                "is_season_finale":  discovery_meta.is_season_finale,
                 "trending_rank":     discovery_meta.trending_rank,
                 "original_language": discovery_meta.original_language,
                 "matched_studios":   discovery_meta.matched_studios,
                 "matched_directors": discovery_meta.matched_directors,
                 "matched_cast":      discovery_meta.matched_cast,
                 "release_status":    discovery_meta.release_status,
-                "sash_priority":     rcfg.sash_priority,
+                "upcoming_release_date": discovery_meta.upcoming_release_date,
+                "upcoming_release_window": discovery_meta.upcoming_release_window,
+                "sash_priority":     _sash_priority,
                 "badge_display_mode":rcfg.badge_display_mode,
                 "rating_display_mode":rcfg.rating_display_mode,
             })
@@ -3814,42 +8208,25 @@ async def get_poster(
             release_year=release_year,
             age_rating=age_rating,
             no_poster=is_no_poster,
+            # Only a confirmed True suppresses the tinted vignette. _suppress_overlay
+            # is None when the scan was skipped or unavailable, which must not be
+            # read as "clean" or as "has text" — it means we do not know, and an
+            # unknown poster keeps its existing appearance.
+            has_burned_in_text=(_suppress_overlay is True),
         )
 
         def _composite_and_encode() -> bytes:
-            result = build_poster(image, score, genre, rcfg, **_bp_args)
+            _render = build_landscape if _is_landscape else build_poster
+            result = _render(image, score, genre, rcfg, **_bp_args)
             buf = io.BytesIO()
-            result.convert("RGB").save(buf, format="JPEG", quality=_cfg.JPEG_QUALITY)
+            _quality = _cfg.WEBP_QUALITY if _cfg.IMAGE_FORMAT == "webp" else _cfg.JPEG_QUALITY
+            result.convert("RGB").save(buf, format=_cfg.IMAGE_FORMAT.upper(), quality=_quality)
             return buf.getvalue()
 
-        # ElfHosted fork: bounded render concurrency. Acquire a render slot;
-        # if RENDER_QUEUE_TIMEOUT is exceeded, return 503 + Retry-After so the
-        # client backs off instead of compounding the saturation. The
-        # semaphore is created lazily inside the event loop on first use.
-        global _render_semaphore
-        if _render_semaphore is None:
-            _render_semaphore = asyncio.Semaphore(_cfg.RENDER_CONCURRENCY)
-        try:
-            if _cfg.RENDER_QUEUE_TIMEOUT > 0:
-                await asyncio.wait_for(
-                    _render_semaphore.acquire(),
-                    timeout=_cfg.RENDER_QUEUE_TIMEOUT,
-                )
-            else:
-                await _render_semaphore.acquire()
-        except asyncio.TimeoutError:
-            _metrics.render_saturated_total.inc()
-            logger.warning(
-                f"Render queue saturated (cap={_cfg.RENDER_CONCURRENCY}); "
-                f"returning 503 for tmdb_id={tmdb_id}"
-            )
-            if _render_fut is not None and not _render_fut.done():
-                _render_fut.set_exception(HTTPException(status_code=503))
-            raise HTTPException(
-                status_code=503,
-                detail="Server saturated — try again shortly",
-                headers={"Retry-After": "5"},
-            )
+        # ElfHosted fork: meter the Pillow composite itself. The admission
+        # semaphore above covers the whole render pipeline including upstream
+        # calls, so its occupancy does not tell an operator how much of a slow
+        # render is CPU; this does.
         try:
             _metrics.render_inflight.inc()
             with _metrics.render_duration_seconds.time():
@@ -3858,7 +8235,6 @@ async def get_poster(
                 )
         finally:
             _metrics.render_inflight.dec()
-            _render_semaphore.release()
 
         # Persist the finished poster so future requests skip the pipeline.
         # Skipped when:
@@ -3868,23 +8244,51 @@ async def get_poster(
         #   _rating_backoff_active — a previous failure is still in its cool-down window;
         #                            backoff nullifies effective_mdblist_key so rating_failed
         #                            would evaluate False without this separate flag
-        if (final_cache_key is not None and not quality_pending and not _detection_deferred
-                and not rating_failed and not _rating_backoff_active):
-            await set_cached_final_poster(final_cache_key, img_bytes)
+        #   _anime_art_missing     — the provider had nothing this time, usually a
+        #                            throttle or a blip rather than a real absence.
+        #                            Caching the fallback would pin TMDB art for
+        #                            the whole composite TTL, so let it re-render.
+        #
+        # The same flag decides what the *client* is told: a render we won't
+        # keep must not be handed an ETag either (see _apply_poster_cache_headers).
+        _render_provisional = bool(
+            quality_pending or _detection_deferred or rating_failed
+            or _rating_backoff_active or _anime_art_missing
+        )
+        _composite_expires_at: int | None = None
+        if final_cache_key is not None and not _render_provisional:
+            # A composite must not outlive the facts baked into it.  Trending
+            # rank turns over daily; release status has its own tier (Cinema and
+            # Production re-check every day, Physical every 90).  Without this
+            # the render kept a "Cinema" sash — and the greyscale treatment that
+            # keys off the same field — for the flat 7-day composite TTL, long
+            # after the status row it came from had moved on.
+            _ttl_override = None
+            if discovery_meta is not None:
+                _sash_result = pick_sash(discovery_meta, _sash_priority)
+                if _sash_result and _sash_result[1] in ("trending", "trending_broad"):
+                    _ttl_override = 86400
+            if _release_status:
+                _status_ttl = release_status_ttl_seconds(_release_status)
+                _ttl_override = (
+                    _status_ttl if _ttl_override is None
+                    else min(_ttl_override, _status_ttl)
+                )
+
+            _composite_expires_at = await set_cached_final_poster(
+                final_cache_key,
+                img_bytes,
+                request_params=_sanitize_request_params(request.url.query),
+                ttl_override=_ttl_override
+            )
             logger.info(f"Final poster cached for {final_cache_key}")
 
         if _render_fut is not None:
-            _render_fut.set_result(img_bytes)
+            _render_fut.set_result((img_bytes, _render_provisional, _composite_expires_at))
 
-        response = Response(content=img_bytes, media_type="image/jpeg")
-        if final_cache_key is not None:
-            response.headers["ETag"] = f'"{final_cache_key}"'
-        if _cfg.DISABLE_COMPOSITE_CACHE:
-            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
-            response.headers["Pragma"] = "no-cache"
-        elif _cfg.CDN_CACHE_TTL > 0:
-            response.headers["Cache-Control"] = f"public, max-age={_cfg.CDN_CACHE_TTL}"
-        return response
+        return _poster_response(
+            request, img_bytes, final_cache_key, _render_provisional, _composite_expires_at
+        )
 
     except ValueError as exc:
         if _render_fut is not None and not _render_fut.done():
@@ -3894,7 +8298,7 @@ async def get_poster(
     except httpx.TimeoutException as exc:
         if _render_fut is not None and not _render_fut.done():
             _render_fut.set_exception(exc)
-        logger.warning(f"Upstream timeout for tmdb_id={tmdb_id}: {type(exc).__name__}")
+        logger.warning(f"Upstream timeout for tmdb_id={tmdb_id}: {exc.__class__.__name__}")
         raise HTTPException(status_code=504, detail="Upstream request timed out")
     except httpx.HTTPStatusError as exc:
         if _render_fut is not None and not _render_fut.done():
@@ -3922,11 +8326,12 @@ async def get_poster(
         raise HTTPException(status_code=500, detail="Failed to build poster")
     finally:
         _active_poster_renders = max(0, _active_poster_renders - 1)
+        _render_sem.release()
         # Fire the rating event so any coalesced waiters unblock. Under normal
         # operation this was set after cache persistence; this is the safety
         # net for error paths that exit before reaching that point.
         if _rating_event_to_set is not None:
             _rating_event_to_set.set()
-            _rating_fetch_inflight.pop(imdb_id, None)
+            _rating_fetch_inflight.pop(canonical_id, None)
         if final_cache_key is not None:
             _render_inflight.pop(final_cache_key, None)

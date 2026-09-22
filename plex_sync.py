@@ -81,7 +81,8 @@ configurator's "Copy URL" button — e.g.
     POSTERSPLUS_URL="http://localhost:8000/poster?bar_style=frosted&sash_badge_inset=0.000&..."
 — in which case every one of those query parameters (gradients, bar/badge
 styles, weighting profiles, everything) is applied as a default to every
-synced poster. Only tmdb_id/imdb_id/type/quality/primary_client are always
+synced poster. Only tmdb_id/type/quality/primary_client (and imdb_id, when the
+item has one) are always
 computed per-item and override whatever the recipe URL says for those keys.
 """
 
@@ -483,16 +484,20 @@ def inspect_item(item) -> None:
 # PostersPlus fetch
 # ---------------------------------------------------------------------------
 
-def build_poster_request(*, imdb_id: str, tmdb_id: str, media_type: str, quality_tokens: list[str]) -> httpx.Request:
+def build_poster_request(*, imdb_id: str | None, tmdb_id: str, media_type: str, quality_tokens: list[str]) -> httpx.Request:
     # Start from whatever recipe defaults came from POSTERSPLUS_URL (gradients,
     # bar/badge styles, weighting profiles, ...), then layer the per-item
     # dynamic values on top — those five always win, since a value baked into
     # a copy-pasted recipe URL (e.g. a literal tmdb_id, or a stale `quality`)
     # would be wrong for every title except the one the URL was copied from.
     params = dict(POSTERSPLUS_RECIPE_DEFAULTS)
+    # A recipe url copied from the configurator may itself contain an
+    # imdb_id. Drop it before layering ours on: for an item with no IMDb
+    # id of its own it would otherwise survive and stamp one title's IMDb
+    # id onto every TMDB-only item in the library.
+    params.pop("imdb_id", None)
     params.update({
         "tmdb_id": tmdb_id,
-        "imdb_id": imdb_id,
         "type": media_type,
         # No-op today (only Stremio profiles exist server-side as of this
         # writing) but forward-looking: a "plex" entry has been added to
@@ -501,6 +506,11 @@ def build_poster_request(*, imdb_id: str, tmdb_id: str, media_type: str, quality
         # primary_client a copy-pasted Stremio recipe URL might specify.
         "primary_client": "plex",
     })
+    # Optional: Plex has no IMDb id for every item. tmdb_id identifies the
+    # title on its own; sending imdb_id when we do have it keys the rating
+    # cache by IMDb id, which shares the row with every other client.
+    if imdb_id:
+        params["imdb_id"] = imdb_id
     if quality_tokens:
         params["quality"] = ",".join(quality_tokens)
     else:
@@ -570,8 +580,11 @@ def iter_library_items(plex):
 def sync_item(item, *, client: httpx.Client, state: dict, dry_run: bool) -> str:
     """Sync one item; returns a short status string used for the run summary."""
     imdb_id, tmdb_id = extract_ids(item)
-    if not (imdb_id and tmdb_id):
-        logger.info(f"Skipping {item.title!r} — no imdb/tmdb id in Plex metadata")
+    # tmdb_id alone is enough: it identifies the title to PostersPlus. imdb_id is
+    # optional enrichment, and plenty of library items legitimately have no IMDb
+    # guid — skipping them left those posters unsynced for no reason.
+    if not tmdb_id:
+        logger.info(f"Skipping {item.title!r} — no tmdb id in Plex metadata")
         return "skipped (no ids)"
 
     media_type = "movie" if item.TYPE == "movie" else "tv"
@@ -601,7 +614,9 @@ def sync_item(item, *, client: httpx.Client, state: dict, dry_run: bool) -> str:
     # and triggers a re-render/re-upload on the next run — rather than the
     # old behaviour of skipping every item forever because only the ids and
     # quality tokens were tracked, not the rendering recipe itself.
-    fingerprint = f"{imdb_id}:{tmdb_id}:{','.join(quality_tokens)}:{RECIPE_FINGERPRINT}"
+    # Same string as before for any item that has an IMDb id, so switching to
+    # the optional form does not invalidate a single cached fingerprint.
+    fingerprint = f"{imdb_id or f'tmdb:{tmdb_id}'}:{tmdb_id}:{','.join(quality_tokens)}:{RECIPE_FINGERPRINT}"
     state_key = str(item.ratingKey)
     if state.get(state_key) == fingerprint:
         return "unchanged"

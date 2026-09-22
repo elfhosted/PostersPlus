@@ -1,6 +1,7 @@
 #ratings.py
 import logging
 import math
+import time
 import httpx
 import numpy as np
 
@@ -14,8 +15,11 @@ except ImportError:
     _HAS_CAIRO = False
     logger.warning("pycairo not available — shape edges will use PIL (no antialiasing)")
 
-from awards import FETCH_FAILED, _FetchFailed, _RateLimited
+from awards import (FETCH_FAILED, _FetchFailed, _RateLimited, dominant_frost_rgb,
+                    _frost_ink, _frosted_tint)
 from config import (
+    MDBLIST_API_BASE,
+    ANIME_RATING_SOURCES,
     GENRE_MAP,
     GENRE_PRIORITY,
     SCORE_NORMALISERS,
@@ -27,6 +31,76 @@ from config import (
 
 
 _RATING_VOTE_KEYS = ("vote_count", "votes", "count", "rating_count", "ratings_count")
+
+
+# ---------------------------------------------------------------------------
+# MDBList daily quota tracking
+# ---------------------------------------------------------------------------
+# MDBList's limit is a per-key *daily* request quota (1000/day on the free
+# tier, more on paid tiers), not a burst limit, and every response reports it:
+#
+#   x-ratelimit-limit: 1000
+#   x-ratelimit-remaining: 647
+#   x-ratelimit-reset: 1789948800     (epoch seconds, midnight UTC)
+#
+# Each fetch_rating call refreshes the snapshot for the key it used, so the
+# cache warmer can stop spending the key before live traffic runs dry, and a
+# quota 429 (which comes with no Retry-After) can cool the key down until the
+# real reset instead of guessing.
+
+class MDBListQuota:
+    __slots__ = ("limit", "remaining", "reset_at", "observed_at")
+
+    def __init__(self, limit: int | None, remaining: int | None, reset_at: float | None, observed_at: float):
+        self.limit       = limit
+        self.remaining   = remaining
+        self.reset_at    = reset_at
+        self.observed_at = observed_at
+
+    def is_current(self, now: float | None = None) -> bool:
+        """False once the quota window this snapshot describes has rolled over."""
+        if self.reset_at is None:
+            return True
+        if now is None:
+            now = time.time()
+        return now < self.reset_at
+
+    def __repr__(self):
+        return f"MDBListQuota(limit={self.limit}, remaining={self.remaining}, reset_at={self.reset_at})"
+
+
+# api key -> latest quota snapshot seen for it
+MDBLIST_QUOTA: dict[str, MDBListQuota] = {}
+
+
+def _header_int(headers, name: str) -> int | None:
+    raw = headers.get(name)
+    if raw is None:
+        return None
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_mdblist_quota(mdblist_key: str, headers) -> MDBListQuota | None:
+    """Refresh the per-key quota snapshot from a response's X-RateLimit-* headers."""
+    limit     = _header_int(headers, "x-ratelimit-limit")
+    remaining = _header_int(headers, "x-ratelimit-remaining")
+    reset_raw = _header_int(headers, "x-ratelimit-reset")
+    if limit is None and remaining is None and reset_raw is None:
+        return None
+    quota = MDBListQuota(limit, remaining, float(reset_raw) if reset_raw else None, time.time())
+    MDBLIST_QUOTA[mdblist_key] = quota
+    return quota
+
+
+def mdblist_quota_remaining(mdblist_key: str, now: float | None = None) -> int | None:
+    """Remaining daily requests for *mdblist_key*, or None when unknown / stale."""
+    quota = MDBLIST_QUOTA.get(mdblist_key)
+    if quota is None or quota.remaining is None or not quota.is_current(now):
+        return None
+    return quota.remaining
 
 
 def _rating_vote_count(raw: dict) -> int | None:
@@ -47,17 +121,27 @@ def _rating_vote_count(raw: dict) -> int | None:
 
 async def fetch_rating(
     client: httpx.AsyncClient,
-    imdb_id: str,
     mdblist_key: str,
     genre_ids: list[int],
     media_type: str = "movie",
     *,
+    media_id: str,
+    provider: str = "imdb",
     movie_weights: dict | None = None,
     tv_weights: dict | None = None,
 ) -> "tuple[dict | str, str, str | None, list[dict], int | None] | _FetchFailed | _RateLimited":
     """
     Returns ``(ratings_dict, genre, release_date, keywords, age_rating)`` on
     success, or ``FETCH_FAILED`` on a network / API error.
+
+    MDBList serves the same record under several id namespaces, so *provider*
+    selects the route ("imdb" or "tmdb") and *media_id* is the id in that
+    namespace. A title TMDB has no IMDb link for still has ratings, awards,
+    keywords and an age rating here — it just has to be asked for by TMDB id.
+
+    *media_id* and *provider* are keyword-only, and the old positional id
+    argument is gone: a call site that still passed an IMDb id positionally
+    would otherwise have silently become the API key.
     """
 
     genre = "Unknown"
@@ -69,15 +153,20 @@ async def fetch_rating(
     mdb_type = "show" if media_type in ("tv", "series") else "movie"
 
     try:
-        logger.info(f"External API Call: Requested ratings+keywords from MDBlist for {imdb_id}")
+        logger.info(
+            "External API Call: Requested ratings+keywords from MDBlist for "
+            f"{provider}/{media_id}"
+        )
         resp = await client.get(
-            f"https://api.mdblist.com/imdb/{mdb_type}/{imdb_id}",
+            f"{MDBLIST_API_BASE}/{provider}/{mdb_type}/{media_id}",
             params={"apikey": mdblist_key, "append_to_response": "keyword"},
             timeout=10.0,
         )
     except Exception as exc:
-        logger.error(f"MDblist request error for {imdb_id}: {type(exc).__name__}: {exc}")
+        logger.error(f"MDblist request error for {media_id}: {type(exc).__name__}: {exc}")
         return FETCH_FAILED
+
+    quota = _record_mdblist_quota(mdblist_key, resp.headers)
 
     if resp.status_code == 429:
         retry_after: float | None = None
@@ -92,17 +181,24 @@ async def fetch_rating(
                     retry_after = parsed
             except ValueError:
                 pass
+        # Only treat the 429 as quota exhaustion when MDBList says the key is
+        # actually empty; a 429 with requests still remaining is some other
+        # throttle, and parking the key until midnight for it would be wrong.
+        reset_at = None
+        if quota and quota.reset_at and (quota.remaining is None or quota.remaining <= 0):
+            reset_at = quota.reset_at
         logger.warning(
-            f"MDblist rate-limited for {imdb_id} (retry-after={retry_after})"
+            f"MDblist rate-limited for {media_id} "
+            f"(retry-after={retry_after}, quota={quota})"
         )
-        return _RateLimited(retry_after)
+        return _RateLimited(retry_after, reset_at=reset_at)
 
     if resp.status_code == 404:
-        logger.info(f"MDblist 404 for {imdb_id} — title not found, returning empty result")
+        logger.info(f"MDblist 404 for {provider}/{media_id} — title not found, returning empty result")
         return {}, genre, None, [], None
 
     if resp.status_code != 200:
-        logger.warning(f"MDblist error {resp.status_code} for {imdb_id}")
+        logger.warning(f"MDblist error {resp.status_code} for {provider}/{media_id}")
         return FETCH_FAILED
 
     data         = resp.json()
@@ -126,7 +222,7 @@ async def fetch_rating(
         vote_count = _rating_vote_count(r)
         if source != "rogerebert" and vote_count is not None and vote_count < RATING_MIN_VOTES:
             logger.info(
-                f"Skipping {source} rating for {imdb_id}: "
+                f"Skipping {source} rating for {media_id}: "
                 f"vote_count={vote_count} < {RATING_MIN_VOTES}"
             )
             continue
@@ -139,6 +235,58 @@ async def fetch_rating(
 # ---------------------------------------------------------------------------
 # Score colour
 # ---------------------------------------------------------------------------
+
+CustomScorePalette = list[tuple[int, tuple[int, int, int]]]
+
+
+def parse_custom_score_palette(raw: str | None) -> CustomScorePalette | None:
+    if not raw:
+        return None
+    out: dict[int, tuple[int, int, int]] = {}
+    for part in raw.replace("\n", ",").replace(";", ",").split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        raw_score, raw_hex = part.split(":", 1)
+        try:
+            score = max(0, min(100, int(round(float(raw_score.strip())))))
+        except (TypeError, ValueError):
+            continue
+        hex_value = raw_hex.strip().lstrip("#")
+        if len(hex_value) != 6:
+            continue
+        try:
+            rgb = (
+                int(hex_value[0:2], 16),
+                int(hex_value[2:4], 16),
+                int(hex_value[4:6], 16),
+            )
+        except ValueError:
+            continue
+        out[score] = rgb
+    if not out:
+        return None
+    return sorted(out.items())
+
+
+def _darken(rgb: tuple[int, int, int], amount: float = 0.72) -> tuple[int, int, int]:
+    return tuple(max(0, min(255, int(c * amount))) for c in rgb)
+
+
+def _score_color_custom(
+    score: int,
+    custom_palette: CustomScorePalette | None,
+) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
+    if not custom_palette:
+        return None
+    score = max(0, min(int(score), 100))
+    selected = custom_palette[0][1]
+    for threshold, rgb in custom_palette:
+        if score < threshold:
+            break
+        selected = rgb
+    return selected, _darken(selected)
+
 
 def _score_color(score: int) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     if score < 50:
@@ -177,6 +325,18 @@ def _score_color_metal(score: int) -> tuple[tuple[int, int, int], tuple[int, int
         return (218, 224, 240), (155, 165, 195)
     else:             # gold
         return (255, 210,  60), (200, 150,  25)
+
+
+def score_color_for_mode(
+    score: int,
+    color_mode: int = 0,
+    custom_palette: CustomScorePalette | None = None,
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    if color_mode == 3:
+        custom = _score_color_custom(score, custom_palette)
+        if custom is not None:
+            return custom
+    return {1: _score_color_alt, 2: _score_color_metal}.get(color_mode, _score_color)(score)
 
 
 def _cairo_pill_mask(w: int, h: int, radius: int) -> Image.Image:
@@ -236,7 +396,9 @@ def draw_score_bar(
     glow_threshold: int = SCORE_GLOW_THRESHOLD,
     glow_blur: int = SCORE_GLOW_BLUR,
     glow_alpha: int = SCORE_GLOW_ALPHA,
+    glow_color: tuple[int, int, int] | str | None = None,
     color_mode: int = 0,
+    custom_palette: CustomScorePalette | None = None,
 ) -> None:
     if score is None:
         return
@@ -262,15 +424,16 @@ def draw_score_bar(
     track_mask = track_mask.point(lambda v: v * 45 // 255)   # scale to fill alpha
     track_strip = Image.new("RGBA", (bar_w, bar_h), (255, 255, 255, 0))
     track_strip.putalpha(track_mask)
-    track = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    track.paste(track_strip, (x0, y0))
-    image.alpha_composite(track)
+    # Composite the strip where it belongs rather than pasting it into a
+    # full-canvas transparent layer first: fully transparent pixels contribute
+    # nothing to an alpha composite, so the result is identical and the work is
+    # proportional to the bar (360x9) instead of the whole poster (500x750).
+    image.alpha_composite(track_strip, dest=(x0, y0))
 
     if fill_w <= 0:
         return
 
-    _color_fn = {1: _score_color_alt, 2: _score_color_metal}.get(color_mode, _score_color)
-    left_color, right_color = _color_fn(score)
+    left_color, right_color = score_color_for_mode(score, color_mode, custom_palette)
     left_color  = _soften(left_color,  0.90)
     right_color = _soften(right_color, 0.90)
 
@@ -296,18 +459,19 @@ def draw_score_bar(
         full_msk = _cairo_pill_mask(mask_w, bar_h, radius)
         mask_img = full_msk.crop((0, 0, fill_w, bar_h))
 
-    fill_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    fill_layer.paste(grad, (x0, y0), mask_img)
-    image.alpha_composite(fill_layer)
+    fill_layer = Image.new("RGBA", (bar_w, bar_h), (0, 0, 0, 0))
+    fill_layer.paste(grad, (0, 0), mask_img)
+    image.alpha_composite(fill_layer, dest=(x0, y0))
 
     # ── Highlight sliver ─────────────────────────────────────────────────
-    hl = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    # Drawn in bar-local coordinates; the strip is composited at (x0, y0).
+    hl = Image.new("RGBA", (bar_w, bar_h), (0, 0, 0, 0))
     ImageDraw.Draw(hl).line(
-        [(x0 + radius, y0 + 1), (x0 + fill_w - 1, y0 + 1)],
+        [(radius, 1), (fill_w - 1, 1)],
         fill=(255, 255, 255, 60),
         width=1,
     )
-    image.alpha_composite(hl)
+    image.alpha_composite(hl, dest=(x0, y0))
 
     # ── Glow ─────────────────────────────────────────────────────────────
     if score >= glow_threshold:
@@ -322,11 +486,19 @@ def draw_score_bar(
         pad = glow_blur * 3 + 2
         cx0, cy0 = max(0, rx0 - pad), max(0, ry0 - pad)
         cx1, cy1 = min(W, rx1 + pad), min(H, ry1 + pad)
+        # Glow colour: "match" blends the bar's own gradient ends for a cohesive
+        # coloured halo; a tuple is a custom colour; anything else stays white.
+        if glow_color == "match":
+            gc = tuple((left_color[i] + right_color[i]) // 2 for i in range(3))
+        elif isinstance(glow_color, (tuple, list)) and len(glow_color) == 3:
+            gc = tuple(int(c) for c in glow_color)
+        else:
+            gc = (255, 255, 255)
         glow = Image.new("RGBA", (cx1 - cx0, cy1 - cy0), (0, 0, 0, 0))
         ImageDraw.Draw(glow).rounded_rectangle(
             [(rx0 - cx0, ry0 - cy0), (rx1 - cx0, ry1 - cy0)],
             radius=radius + expand,
-            fill=(255, 255, 255, glow_alpha),
+            fill=(*gc, glow_alpha),
         )
         glow = glow.filter(ImageFilter.GaussianBlur(glow_blur))
         image.alpha_composite(glow, dest=(cx0, cy0))
@@ -356,9 +528,11 @@ def _draw_solid_pip(
     pip_mask  = _cairo_pill_mask(width, height, radius)
     pip_strip = Image.new("RGBA", (width, height), (*color, 0))
     pip_strip.putalpha(pip_mask)
-    pip_layer = Image.new("RGBA", image.size, (0, 0, 0, 0))
-    pip_layer.paste(pip_strip, (int(x), y0))
-    image.alpha_composite(pip_layer)
+    # Offset composite rather than a full-canvas transparent layer.  y0 can fall
+    # outside the canvas for a pip near the edge; alpha_composite clips exactly
+    # as paste did (verified pixel-identical across negative and overflowing
+    # offsets), so the edge cases behave the same.
+    image.alpha_composite(pip_strip, dest=(int(x), y0))
 
 
 def draw_score_bar_vertical(
@@ -370,6 +544,7 @@ def draw_score_bar_vertical(
     height: int = 36,
     width: int = 4,
     color_mode: int = 0,
+    custom_palette: CustomScorePalette | None = None,
 ) -> None:
     if score is None:
         return
@@ -380,35 +555,13 @@ def draw_score_bar_vertical(
             return
 
     score = max(0, min(int(score), 100))
-    _color_fn = {1: _score_color_alt, 2: _score_color_metal}.get(color_mode, _score_color)
-    left_color, _right_color = _color_fn(score)
+    left_color, _right_color = score_color_for_mode(score, color_mode, custom_palette)
     _draw_solid_pip(image, x=x, y_center=y_center, width=width, height=height, color=left_color)
 
 
 # ---------------------------------------------------------------------------
 # Frosted bar (rating_display_mode == 4)
 # ---------------------------------------------------------------------------
-
-def sample_frosted_bar_rgb(
-    image: Image.Image,
-    bar_height_ratio: float = 0.090,
-    bottom_inset: float = 0.0,
-) -> tuple[float, float, float]:
-    """Dominant RGB the frosted bar would sample from its bottom strip.
-
-    Mirrors the crop/blur/thumbnail in draw_frosted_bar's _build_frosted_base
-    so the colour-matching logic upstream can compare it against the notch.
-    """
-    width, height = image.size
-    bar_h = max(24, int(height * bar_height_ratio))
-    bar_y = height - bar_h - int(height * bottom_inset)
-    cy = max(0, bar_y); ch = min(bar_h, height - cy)
-    reg = image.crop((0, cy, width, cy + ch))
-    blr = reg.filter(ImageFilter.GaussianBlur(radius=max(6, int(bar_h * 0.45))))
-    th  = blr.resize((8, 8), Image.LANCZOS).convert("RGB")
-    ar  = np.array(th, dtype=np.float32)
-    return float(ar[:, :, 0].mean()), float(ar[:, :, 1].mean()), float(ar[:, :, 2].mean())
-
 
 def draw_frosted_bar(
     image: Image.Image,
@@ -418,11 +571,14 @@ def draw_frosted_bar(
     bar_height_ratio: float = 0.090,
     font_size_ratio: float = 0.40,
     frost_opacity: float = 0.75,
+    frost_saturation: float = 1.2,
+    frost_reference: bool = False,
     bottom_inset: float = 0.0,
     style: str = "frosted",
     score: int | str | None = None,
     fill_color: tuple[int, int, int] | None = None,
     tint_rgb: tuple[float, float, float] | None = None,
+    text_color: tuple[int, int, int] | None = None,
 ) -> Image.Image:
     """Full-width frosted glass or dark-body strip near the bottom of the poster.
 
@@ -477,18 +633,24 @@ def draw_frosted_bar(
         cy = max(0, bar_y); ch = min(bar_h, height - cy)
         reg = image.crop((0, cy, width, cy + ch))
         blr = reg.filter(ImageFilter.GaussianBlur(radius=blur_r))
+        # Colour comes from tint_rgb (a whole-poster sample the caller takes from
+        # the un-graded art); the blurred texture still comes from the image.
         if tint_rgb is not None:
             dr, dg, db = tint_rgb
         else:
-            th  = blr.resize((8, 8), Image.LANCZOS).convert("RGB")
-            ar  = np.array(th, dtype=np.float32)
-            dr, dg, db = ar[:,:,0].mean(), ar[:,:,1].mean(), ar[:,:,2].mean()
+            dr, dg, db = dominant_frost_rgb(image)
         _h2, _s2, _v2 = _cs.rgb_to_hsv(dr/255, dg/255, db/255)
-        tr, tg, tb = _cs.hsv_to_rgb(_h2, min(1.0, _s2*1.2), _v2*0.4+0.60)
-        r, g, b = int(tr*255*0.6+255*0.4), int(tg*255*0.6+255*0.4), int(tb*255*0.6+255*0.4)
-        base  = blr.resize((width, bar_h), Image.LANCZOS).convert("RGBA")
+        r, g, b = _frosted_tint(dr, dg, db, frost_saturation, frost_reference)
+        base  = blr.resize((width, bar_h), Image.Resampling.LANCZOS).convert("RGBA")
         frost = Image.new("RGBA", (width, bar_h), (r, g, b, int(frost_opacity*255)))
         return Image.alpha_composite(base, frost), _h2, _s2, _v2
+
+    def _frosted_ink() -> tuple[int, int, int]:
+        """Label colour for a frosted body — dark on a light bar, light on a dark
+        one.  The bar shares the notch's frosted colour, and one matched to a
+        tinted vignette can be genuinely dark where every other frost is light."""
+        dr, dg, db = tint_rgb if tint_rgb is not None else dominant_frost_rgb(image)
+        return _frost_ink(*_frosted_tint(dr, dg, db, frost_saturation, frost_reference))
 
     if style == "pure_black":
         ink = (*_SILVER, 248)
@@ -529,7 +691,7 @@ def draw_frosted_bar(
 
     elif style == "rating_frosted":
         stripe = _rating_stripe
-        ink = (15, 15, 15, 248)
+        ink = (*_frosted_ink(), 248)
         bar_img, _, _, _ = _build_frosted_base()
         if fill_color is not None:
             # Explicit colour chosen — use it directly.
@@ -560,9 +722,12 @@ def draw_frosted_bar(
         text_y += _stripe_nudge
 
     else:  # plain frosted — small nudge down, no stripe compensation needed
-        ink = (15, 15, 15, 248)
+        ink = (*_frosted_ink(), 248)
         bar_img, _, _, _ = _build_frosted_base()
         text_y += max(1, int(bar_h * 0.03))
+
+    if text_color is not None:
+        ink = (*text_color, 248)
 
     txt_layer = Image.new("RGBA", (width, bar_h), (0, 0, 0, 0))
     td        = ImageDraw.Draw(txt_layer)
@@ -586,12 +751,34 @@ def draw_frosted_bar(
 # Weighted score
 # ---------------------------------------------------------------------------
 
+def is_anime_rated(ratings: dict) -> bool:
+    """True when *ratings* carries a score from an anime source.
+
+    This is the whole test for whether a title scores with the anime weights:
+    a MyAnimeList, AniList or Kitsu rating is present, or it isn't. The
+    sources are only ever populated for anime, so no genre or keyword
+    guesswork is needed on top.
+    """
+    return any(source in ratings for source in ANIME_RATING_SOURCES)
+
+
 def calculate_weighted_score(
     ratings: dict,
     weights: dict,
     *,
     fallback_to_imdb: bool = False,
+    fallback_source: str | None = None,
 ) -> int | str:
+    """Blend the available ratings using *weights*, renormalised over the
+    sources actually present.
+
+    *fallback_source* names a source to fall back on when no weighted source is
+    present at all. Used by the anime path: the provider's score is the only
+    rating such a title has, and existing weights strings name none of the anime
+    sources, so without this the score would always be N/A on exactly the titles
+    that path exists for. Checked before *fallback_to_imdb* because an
+    anime-native request has no IMDb rating to fall back to.
+    """
 
     total_weight = 0.0
     weighted_sum = 0.0
@@ -614,6 +801,11 @@ def calculate_weighted_score(
         total_weight += weight
 
     if total_weight == 0:
+        if fallback_source:
+            fallback_value = ratings.get(fallback_source)
+            fallback_normaliser = SCORE_NORMALISERS.get(fallback_source)
+            if fallback_value is not None and fallback_normaliser:
+                return round(fallback_normaliser(fallback_value))
         imdb_value = ratings.get("imdb")
         imdb_normaliser = SCORE_NORMALISERS.get("imdb")
         if fallback_to_imdb and imdb_value is not None and imdb_normaliser:

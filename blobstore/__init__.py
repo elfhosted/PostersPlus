@@ -72,3 +72,101 @@ __all__ = list(_PUBLIC_API) + ["BACKEND_KIND"]
 # proxied TMDB poster/logo through this layer; Phase 10 reverted those
 # to direct filesystem access (per-pod ephemeral cache).
 BUCKET_COMPOSITES: str = "composites"
+
+
+# ---------------------------------------------------------------------------
+# Deferred deletes
+# ---------------------------------------------------------------------------
+#
+# Upstream's cache API deletes composites from synchronous code — a metadata
+# refresh that finds a stale row calls invalidate_final_posters() from a plain
+# def, and a trending snapshot diff can invalidate hundreds of keys in one go.
+# Upstream can do that cheaply because the bytes are a column in the row it is
+# already deleting; here they are an object-store round trip each.
+#
+# Rather than make those call sites async (which would fork the signatures away
+# from upstream and make every future merge harder), sync callers drop the key
+# here and the periodic prune drains the queue on the event loop.
+#
+# What makes a deferred delete safe is that composite blob keys are VERSIONED
+# (storage backends write each render under a fresh key and record it in the
+# row). A key only lands here after the row stopped naming it, and no row can
+# ever name it again, so a delete can never hit a live blob — regardless of
+# which worker or replica queued it, and with no locking. An earlier design
+# guarded reused keys with per-process locks and a row re-check instead; that
+# cannot be made atomic across pods.
+#
+# An orphaned blob is a storage cost, never a correctness bug, so when the
+# queue is full we log and discard rather than block a cache write on
+# object-store latency.
+import threading as _threading
+import time as _time
+
+DEFERRED_DELETE_MAX = 50_000
+
+# How long a superseded blob version is kept before it may be deleted. A CDN
+# redirect names a specific version, and a client or edge cache can replay
+# that 302 for as long as its max-age allows — so the version it names has to
+# outlive the redirect. Redirects are capped at REDIRECT_MAX_AGE_SECONDS; the
+# grace is comfortably longer.
+REDIRECT_MAX_AGE_SECONDS = 300
+DELETE_GRACE_SECONDS = 900
+
+# key -> the monotonic time it was queued.
+_deferred_deletes: "dict[tuple[str, str], float]" = {}
+_deferred_lock = _threading.Lock()
+_deferred_dropped = 0
+
+
+def delete_later(bucket: str, key: str) -> None:
+    """Queue a blob for deletion by the next drain. Safe from any thread and
+    from code that is not on the event loop."""
+    global _deferred_dropped
+    with _deferred_lock:
+        if (bucket, key) in _deferred_deletes:
+            return
+        if len(_deferred_deletes) >= DEFERRED_DELETE_MAX:
+            _deferred_dropped += 1
+            if _deferred_dropped % 1000 == 1:
+                logger.warning(
+                    "Deferred blob-delete queue full (%d); dropped %d keys so far. "
+                    "Orphaned objects will remain until an object-store lifecycle "
+                    "rule reaps them.",
+                    DEFERRED_DELETE_MAX, _deferred_dropped,
+                )
+            return
+        _deferred_deletes[(bucket, key)] = _time.monotonic()
+
+
+def deferred_delete_stats() -> dict:
+    with _deferred_lock:
+        return {"queued": len(_deferred_deletes), "dropped": _deferred_dropped}
+
+
+async def drain_deferred_deletes(
+    limit: int | None = None, min_age: float | None = None
+) -> int:
+    """Delete queued blobs that have been queued for at least *min_age*
+    seconds (default DELETE_GRACE_SECONDS). Returns how many were removed.
+
+    Best effort: a key whose delete raises is dropped rather than retried
+    forever, because the row that named it is already gone.
+    """
+    grace = DELETE_GRACE_SECONDS if min_age is None else min_age
+    cutoff = _time.monotonic() - grace
+    with _deferred_lock:
+        due = [k for k, t in _deferred_deletes.items() if t <= cutoff]
+        if limit is not None:
+            due = due[:limit]
+        for k in due:
+            _deferred_deletes.pop(k, None)
+    removed = 0
+    for bucket, key in due:
+        try:
+            await delete(bucket, key)
+        except Exception as exc:
+            logger.debug("Deferred blob delete failed for %s:%s — %s", bucket, key, exc)
+        removed += 1
+    if removed:
+        logger.info("Drained %d deferred blob deletes", removed)
+    return removed

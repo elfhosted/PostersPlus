@@ -116,13 +116,22 @@ async def sync_digital_releases(client: httpx.AsyncClient) -> int:
     return added
 
 
-async def digital_release_poll_loop(client: httpx.AsyncClient) -> None:
-    """Background task: initial sync shortly after startup, then every 24 h.
+async def digital_release_poll_loop(
+    client: httpx.AsyncClient,
+    initial_sync_done: asyncio.Event | None = None,
+) -> None:
+    """
+    Background task: initial sync shortly after startup, then every 24 h.
+
+    If *initial_sync_done* is given, it's set once the first sync attempt
+    finishes (success or failure) — other startup tasks (e.g. cache warming)
+    can wait on it so they don't run concurrently with this one.
 
     ElfHosted fork: leader-elected via the coordination layer so multi-replica
     deployments only have one replica polling the source. With the default
     in-process coordinator each worker leads its own iteration (matches
-    upstream)."""
+    upstream).
+    """
     lease_ttl = float(_POLL_INTERVAL + 3600)  # one polling cycle + headroom
     lease_token: str | None = None
 
@@ -141,13 +150,25 @@ async def digital_release_poll_loop(client: httpx.AsyncClient) -> None:
                 logger.info("Digital-release-poll lease lost")
                 lease_token = None
 
-            if lease_token is not None:
-                try:
-                    await sync_digital_releases(client)
-                except Exception as exc:
-                    logger.error(f"Digital release poll loop error: {exc}")
-            else:
-                logger.debug("Digital release poll skipped — another replica holds the lease")
+            try:
+                if lease_token is not None:
+                    try:
+                        await sync_digital_releases(client)
+                    except Exception as exc:
+                        logger.error(f"Digital release poll loop error: {exc}")
+                else:
+                    logger.debug(
+                        "Digital release poll skipped — another replica holds the lease"
+                    )
+            finally:
+                # Set on EVERY path, including the one where this replica never
+                # held the lease. Whoever waits on this event is waiting for
+                # "the feed has had its chance", not for this replica to have
+                # been the one to run it — a follower that never sets it would
+                # hang the startup tasks gated on it for the whole poll
+                # interval, on every replica but one.
+                if initial_sync_done is not None and not initial_sync_done.is_set():
+                    initial_sync_done.set()
 
             await asyncio.sleep(_POLL_INTERVAL)
     finally:

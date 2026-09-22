@@ -13,11 +13,6 @@ class NotchInsetDefaultTests(unittest.TestCase):
 
     def test_drawing_helper_defaults(self):
         self.assertEqual(
-            inspect.signature(awards.sample_frosted_notch_rgb)
-            .parameters["notch_inset"].default,
-            0.004,
-        )
-        self.assertEqual(
             inspect.signature(awards.draw_award_badge)
             .parameters["notch_inset"].default,
             0.004,

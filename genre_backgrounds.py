@@ -58,7 +58,7 @@ def _value_noise(seed: int, scale: int) -> np.ndarray:
     rng = np.random.default_rng(seed)
     sw, sh = max(2, W // scale), max(2, H // scale)
     small = (rng.random((sh, sw)) * 255).astype(np.uint8)
-    img = Image.fromarray(small, "L").resize((W, H), Image.BICUBIC)
+    img = Image.fromarray(small, "L").resize((W, H), Image.Resampling.BICUBIC)
     return np.asarray(img, dtype=np.float32) / 255.0
 
 

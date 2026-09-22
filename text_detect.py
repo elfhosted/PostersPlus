@@ -16,6 +16,8 @@ import urllib.request
 
 import numpy as np
 
+from config import EFFECTIVE_CPUS, TEXTLESS_DETECTION_CONCURRENCY as _CONCURRENCY
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -42,8 +44,34 @@ _MODEL_PATH = os.environ.get("PPOCR_MODEL_PATH") or (
     else "/app/cache/ch_PP-OCRv5_det_mobile.onnx"
 )
 _RAPIDOCR_MODELS = importlib.resources.files("rapidocr").joinpath("models") if _HAS_RAPIDOCR else None
-_CLS_MODEL_PATH = str(_RAPIDOCR_MODELS.joinpath("ch_ppocr_mobile_v2.0_cls_infer.onnx")) if _RAPIDOCR_MODELS else ""
-_REC_MODEL_PATH = str(_RAPIDOCR_MODELS.joinpath("ch_PP-OCRv4_rec_infer.onnx")) if _RAPIDOCR_MODELS else ""
+
+
+def _find_bundled_model(models_path, keyword: str) -> str:
+    """Find a bundled rapidocr .onnx model by keyword, tolerating version renames."""
+    if models_path is None:
+        return ""
+    import pathlib
+    d = pathlib.Path(str(models_path))
+    if not d.exists():
+        return ""
+    try:
+        matches = sorted(
+            str(f) for f in d.iterdir()
+            if f.suffix == ".onnx" and keyword in f.stem.lower()
+        )
+        if not matches:
+            logger.warning(
+                f"No bundled rapidocr model found for keyword '{keyword}' in {d}; "
+                f"available: {[f.name for f in d.iterdir() if f.suffix == '.onnx']}"
+            )
+        return matches[0] if matches else ""
+    except Exception as exc:
+        logger.warning(f"Could not scan rapidocr models dir {d}: {exc}")
+        return ""
+
+
+_CLS_MODEL_PATH = _find_bundled_model(_RAPIDOCR_MODELS, "cls")
+_REC_MODEL_PATH = _find_bundled_model(_RAPIDOCR_MODELS, "rec")
 
 try:
     _BOX_THRESHOLD = float(os.environ.get("PPOCR_BOX_THRESHOLD", "0.70"))
@@ -83,12 +111,26 @@ except (TypeError, ValueError):
     _SCAN_TOP = 0.08
 _SCAN_TOP = max(0.0, min(0.9, _SCAN_TOP))
 
+# NOTE: RapidOCR does not actually honour this — the detector receives the poster
+# at its native size rounded up to multiples of 32 (a 500x750 poster arrives as
+# 736x512, ~377 kpx, not the 352x512 / ~180 kpx this value implies).  Leave it.
+# Forcing the configured limit through a pre-resize is ~1.37x faster but loses
+# 7 of 26 detections on known-positive posters, and recall is the whole point of
+# the feature.  It is kept here because DETECT_RES_SIG embeds it, so cached
+# verdicts stay tied to the value that was in force when they were written.
 _LIMIT_SIDE_LEN = 512
-_MODEL_SESSIONS = max(1, min(
-    4, os.cpu_count() or 1,
-    int(os.environ.get("TEXTLESS_DETECTION_CONCURRENCY", "2")),
-))
-_ORT_THREADS = max(1, min(4, (os.cpu_count() or 1) // _MODEL_SESSIONS))
+
+# Sizing is driven by the cores this process may actually use, not the host's
+# core count — see config.effective_cpus().  Sessions divide the thread budget
+# between them, and ONNX throughput degrades sharply once the total exceeds the
+# real budget, so the split has to come out of a correct figure.
+_MODEL_SESSIONS = max(1, min(EFFECTIVE_CPUS, _CONCURRENCY))
+# No arbitrary ceiling: scaling was still near-linear at 4 threads on 4 cores
+# (3.2x vs one thread) with no sign of saturation, so a 16-core host should get
+# 16.  The floor of 1 matters more than any cap — oversubscription is far more
+# expensive than undersubscription (on a 2-CPU budget: 135 ms at 2 threads,
+# 299 ms at 6, 409 ms at 8).
+_ORT_THREADS = max(1, EFFECTIVE_CPUS // _MODEL_SESSIONS)
 DETECT_RES_SIG = (
     f"ppocrv5m-r7-s{_LIMIT_SIDE_LEN}-c{int(round(_BOX_THRESHOLD * 100))}"
     f"-wc{int(round(_WIDE_BOX_THRESHOLD * 100))}"
@@ -137,7 +179,7 @@ def _valid_model(path: str) -> bool:
 
 
 def _new_ocr_session():
-    return RapidOCR(params={
+    params = {
         "Global.use_cls": False,
         "Global.use_rec": False,
         "Global.log_level": "error",
@@ -145,14 +187,22 @@ def _new_ocr_session():
         "Det.limit_side_len": _LIMIT_SIDE_LEN,
         "Det.limit_type": "max",
         "Det.box_thresh": 0.3,
-        # RapidOCR initialises these engines even when disabled. Point it at
-        # the bundled read-only models rather than its writable aliases.
-        "Cls.model_path": _CLS_MODEL_PATH,
-        "Rec.model_path": _REC_MODEL_PATH,
         "EngineConfig.onnxruntime.intra_op_num_threads": _ORT_THREADS,
         "EngineConfig.onnxruntime.inter_op_num_threads": 1,
-        "EngineConfig.onnxruntime.enable_cpu_mem_arena": True,
-    })
+        # Disable the ORT CPU memory arena so freed tensor allocations are
+        # returned to the OS rather than held at the inference high-water mark
+        # indefinitely.  Slightly slower first inference; no steady-state cost.
+        "EngineConfig.onnxruntime.enable_cpu_mem_arena": False,
+    }
+    # Point RapidOCR at the bundled read-only models so it doesn't try to write
+    # to a writable alias path.  Omit the key entirely when the model wasn't
+    # found (e.g. rapidocr renamed it in a minor release) — RapidOCR will use
+    # its own default, which is safer than a guaranteed FileNotFoundError.
+    if _CLS_MODEL_PATH:
+        params["Cls.model_path"] = _CLS_MODEL_PATH
+    if _REC_MODEL_PATH:
+        params["Rec.model_path"] = _REC_MODEL_PATH
+    return RapidOCR(params=params)
 
 
 def _ensure_model():
@@ -232,11 +282,16 @@ def _detect(image):
     pil_image = image.convert("RGB")
     width, height = pil_image.size
     if not height or not width:
+        pil_image.close()
         return None, None, width, height
-    with _borrow_ocr() as ocr:
-        result = ocr(pil_image, use_det=True, use_cls=False, use_rec=False)
-    boxes = [] if result.boxes is None else result.boxes
-    scores = [] if result.scores is None else result.scores
+    try:
+        with _borrow_ocr() as ocr:
+            result = ocr(pil_image, use_det=True, use_cls=False, use_rec=False)
+        boxes  = [] if result.boxes is None else list(result.boxes)
+        scores = [] if result.scores is None else list(result.scores)
+        del result
+    finally:
+        pil_image.close()
     return boxes, scores, width, height
 
 
@@ -291,64 +346,72 @@ def _recognised_title_match(
         return False, [], 0
 
     source = image.convert("RGB")
-    width, height = source.size
-    image_area = max(1, width * height)
-    texts = []
-    centred_lines = 0
-    for box, score in zip(boxes, scores):
-        box = np.asarray(box, dtype=np.float32)
-        box_width = float(box[:, 0].max() - box[:, 0].min())
-        box_height = float(box[:, 1].max() - box[:, 1].min())
-        aspect = box_width / max(1.0, box_height)
-        area_ratio = (box_width * box_height) / image_area
-        centre_x = float(box[:, 0].mean()) / max(1, width)
-        title_candidate = aspect >= 1.5 and area_ratio >= _WIDE_MIN_AREA
-        centred_candidate = (
-            aspect >= _WIDE_MIN_ASPECT
-            and area_ratio >= 0.0015
-            and 0.25 <= centre_x <= 0.75
-        )
-        if (
-            float(score) < _WIDE_BOX_THRESHOLD
-            or not (title_candidate or centred_candidate)
-        ):
-            continue
+    try:
+        width, height = source.size
+        image_area = max(1, width * height)
+        texts = []
+        centred_lines = 0
+        for box, score in zip(boxes, scores):
+            box = np.asarray(box, dtype=np.float32)
+            box_width = float(box[:, 0].max() - box[:, 0].min())
+            box_height = float(box[:, 1].max() - box[:, 1].min())
+            aspect = box_width / max(1.0, box_height)
+            area_ratio = (box_width * box_height) / image_area
+            centre_x = float(box[:, 0].mean()) / max(1, width)
+            title_candidate = aspect >= 1.5 and area_ratio >= _WIDE_MIN_AREA
+            centred_candidate = (
+                aspect >= _WIDE_MIN_ASPECT
+                and area_ratio >= 0.0015
+                and 0.25 <= centre_x <= 0.75
+            )
+            if (
+                float(score) < _WIDE_BOX_THRESHOLD
+                or not (title_candidate or centred_candidate)
+            ):
+                continue
 
-        pad = max(3, int(box_height * 0.2))
-        left = max(0, int(box[:, 0].min()) - pad)
-        top = max(0, int(box[:, 1].min()) - pad)
-        right = min(width, int(box[:, 0].max()) + pad)
-        bottom = min(height, int(box[:, 1].max()) + pad)
-        crop = np.asarray(source.crop((left, top, right, bottom)))
-
-        with _borrow_ocr() as ocr:
-            result = ocr(crop, use_det=False, use_cls=False, use_rec=True)
-        recognised = [] if result.txts is None else [
-            str(text) for text in result.txts
-        ]
-        texts.extend(recognised)
-        if centred_candidate and any(
-            len(re.sub(r"[^a-z]", "", text.lower())) >= 5
-            for text in recognised
-        ):
-            centred_lines += 1
-        if title_candidate and any(
-            _text_matches_title(text, alias)
-            for text in recognised
-            for alias in titles
-        ):
-            return True, texts, centred_lines
-        if float(score) >= 0.80 and area_ratio >= 0.10:
-            for text in recognised:
-                candidate = _normalise_text(text)
-                if any(
-                    len(candidate) >= 6
-                    and len(expected) >= 6
-                    and SequenceMatcher(None, candidate, expected).ratio() >= 0.70
-                    for expected in expected_titles
-                ):
-                    return True, texts, centred_lines
-    return False, texts, centred_lines
+            pad = max(3, int(box_height * 0.2))
+            left   = max(0,     int(box[:, 0].min()) - pad)
+            top    = max(0,     int(box[:, 1].min()) - pad)
+            right  = min(width, int(box[:, 0].max()) + pad)
+            bottom = min(height, int(box[:, 1].max()) + pad)
+            pil_crop = source.crop((left, top, right, bottom))
+            try:
+                crop = np.asarray(pil_crop)
+                with _borrow_ocr() as ocr:
+                    result = ocr(crop, use_det=False, use_cls=False, use_rec=True)
+            finally:
+                pil_crop.close()
+                del crop
+            recognised = [] if result.txts is None else [
+                str(text) for text in result.txts
+            ]
+            del result
+            texts.extend(recognised)
+            if centred_candidate and any(
+                len(re.sub(r"[^a-z]", "", text.lower())) >= 5
+                for text in recognised
+            ):
+                centred_lines += 1
+            if title_candidate and any(
+                _text_matches_title(text, alias)
+                for text in recognised
+                for alias in titles
+            ):
+                return True, texts, centred_lines
+            if float(score) >= 0.80 and area_ratio >= 0.10:
+                for text in recognised:
+                    candidate = _normalise_text(text)
+                    if any(
+                        len(candidate) >= 6
+                        and len(expected) >= 6
+                        and SequenceMatcher(None, candidate, expected).ratio() >= 0.70
+                        for expected in expected_titles
+                    ):
+                        return True, texts, centred_lines
+        return False, texts, centred_lines
+    finally:
+        source.close()
 
 
 def _qualifying_boxes(

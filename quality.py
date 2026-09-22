@@ -7,7 +7,8 @@ import httpx
 logger = logging.getLogger(__name__)
 from PIL import Image, ImageDraw, ImageFont
 
-from awards import FETCH_FAILED
+import config as _cfg
+from awards import FETCH_FAILED, _FetchFailed
 from cache import set_cached_quality
 from config import (
     AIOSTREAMS_AUTH,
@@ -17,6 +18,34 @@ from config import (
     BADGE_HEIGHT,
     QUALITY_LABELS,
 )
+
+
+# ---------------------------------------------------------------------------
+# Sentinel — "not an answer yet"
+# ---------------------------------------------------------------------------
+# Distinct from FETCH_FAILED: the quality source is healthy and reachable, it
+# just doesn't have a result for *this* title yet.  Only QualiCache can return
+# this — it answers from cache and collects in the background, so a first
+# request for an uncrawled title is normal rather than an error.
+#
+# Callers must treat it as "serve without badges, don't cache the composite,
+# don't count it against the source's failure budget".  Backing off the whole
+# source because one cold title is still warming would stall every other title.
+
+class _QualityPending:
+    """Singleton sentinel returned when a source has no result for a title yet."""
+    _instance = None
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    def __repr__(self):
+        return "QUALITY_PENDING"
+
+QUALITY_PENDING = _QualityPending()
+
+# Union of everything a fetch function may return.
+QualityResult = "list[str] | _FetchFailed | _QualityPending"
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +72,7 @@ def _extract_tokens_from_parsed_file(parsed: dict) -> set[str]:
     quality = parsed.get("quality", "").upper()
     if "REMUX" in quality:
         tokens.add("REMUX")
-    elif quality == "WEB-DL":
+    elif "WEB-DL" in quality or "WEBDL" in quality:
         tokens.add("WEBDL")
 
     audio_tags = {t.upper() for t in parsed.get("audioTags", [])}
@@ -52,6 +81,26 @@ def _extract_tokens_from_parsed_file(parsed: dict) -> set[str]:
     if "DTS:X" in audio_tags or "DTSX" in audio_tags or "DTS-X" in audio_tags:
         tokens.add("DTSX")
 
+    return tokens
+
+
+def _ordered_tokens(seen: set[str]) -> list[str]:
+    """Reduce a set of detected tokens to one token per category, badge order.
+
+    At most one resolution, one source, one visual tag and one audio tag are
+    kept, each in descending preference, so the badge row is deterministic.
+    """
+    tokens: list[str] = []
+    for group in (
+        ("4K", "1080P"),
+        ("REMUX", "WEBDL"),
+        ("DV", "HDR10+", "HDR10"),
+        ("ATMOS", "DTSX"),
+    ):
+        for token in group:
+            if token in seen:
+                tokens.append(token)
+                break
     return tokens
 
 
@@ -140,23 +189,7 @@ async def fetch_quality_from_aiostreams(
         for result in results[:5]:
             seen |= _extract_tokens_from_parsed_file(result.get("parsedFile") or {})
 
-        tokens = []
-        for res in ("4K", "1080P"):
-            if res in seen:
-                tokens.append(res)
-                break
-        for source in ("REMUX", "WEBDL"):
-            if source in seen:
-                tokens.append(source)
-                break
-        for visual in ("DV", "HDR10+", "HDR10"):
-            if visual in seen:
-                tokens.append(visual)
-                break
-        for audio in ("ATMOS", "DTSX"):
-            if audio in seen:
-                tokens.append(audio)
-                break
+        tokens = _ordered_tokens(seen)
 
         logger.info(f"AIOStreams quality for {imdb_id}: {tokens}")
         set_cached_quality(imdb_id, tokens, release_date)
@@ -322,23 +355,7 @@ async def fetch_quality_from_scraper(
                 stream.get("behaviorHints"),
             )
 
-        tokens = []
-        for res in ("4K", "1080P"):
-            if res in seen:
-                tokens.append(res)
-                break
-        for source in ("REMUX", "WEBDL"):
-            if source in seen:
-                tokens.append(source)
-                break
-        for visual in ("DV", "HDR10+", "HDR10"):
-            if visual in seen:
-                tokens.append(visual)
-                break
-        for audio in ("ATMOS", "DTSX"):
-            if audio in seen:
-                tokens.append(audio)
-                break
+        tokens = _ordered_tokens(seen)
 
         logger.info(f"Scraper quality for {imdb_id}: {tokens}")
         set_cached_quality(imdb_id, tokens, release_date)
@@ -347,6 +364,219 @@ async def fetch_quality_from_scraper(
     except Exception as exc:
         logger.error(f"Scraper fetch error for {imdb_id}: {type(exc).__name__}: {exc}")
         return FETCH_FAILED
+
+
+# ---------------------------------------------------------------------------
+# QualiCache (cached quality API)
+# ---------------------------------------------------------------------------
+# QualiCache <https://github.com/UmbraProjects/QualiCache> sits in front of the
+# same Stremio addons the scraper path talks to, but inverts the timing: it
+# crawls catalogues on its own schedule, picks one best trusted release per
+# title, and serves only what is already in its SQLite cache.  A read never
+# waits on an addon, so a slow Torrentio/Comet can't slow down poster rendering.
+#
+# The trade-off is that a title nobody has crawled yet answers "pending".  That
+# is not an error and must not trip the per-source backoff — see QUALITY_PENDING.
+#
+# QualiCache also ships an AIOStreams-shaped compatibility endpoint, so it can
+# be used with QUALITY_SOURCE=aiostreams and no code change.  This native client
+# is preferred: it reads QualiCache's own tokens directly instead of round-
+# tripping them through the AIOStreams parsedFile shape, and it can tell
+# "pending" apart from "failed", which the compat endpoint cannot express.
+
+
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+# QualiCache names more sources than PostersPlus has badges for. The badge set
+# only ever promised "1080p web-quality or better": a WEBRip and a BluRay
+# *encode* both meet that bar, so they fold into the silver Web badge, and only
+# a true remux keeps the gold one. Sub-1080p resolutions (720P, SD) and HDTV
+# are still dropped — nothing below that bar was meant to display.
+_QUALICACHE_TOKEN_FOLD = {"WEBRIP": "WEBDL", "BLURAY": "WEBDL"}
+
+
+def _normalize_qualicache_url(url: str) -> str:
+    """Normalise a QualiCache origin and discard pasted endpoint parameters."""
+    # QUALICACHE_URL is an origin/path prefix, not a request URL. If a user
+    # pastes ``?min_trust=low`` here and we append the endpoint naively, the
+    # endpoint becomes part of that query value and the server receives `/`.
+    # Minimum trust has its own setting and is added to ``params`` below.
+    url = url.strip().split("#", 1)[0].split("?", 1)[0].rstrip("/")
+    for suffix in ("/v1/quality", "/v1"):
+        if url.endswith(suffix):
+            url = url[: -len(suffix)]
+            break
+    return url.rstrip("/")
+
+
+async def fetch_quality_from_qualicache(
+    client: httpx.AsyncClient,
+    qualicache_url: str,
+    imdb_id: str,
+    media_type: str = "movie",
+    season: int = 1,
+    episode: int = 1,
+    release_date: str | None = None,
+) -> "list[str] | _FetchFailed | _QualityPending":
+    """
+    Read cached quality tokens from a QualiCache instance.
+
+    Returns a list of quality tokens on success (possibly empty when QualiCache
+    has decided no trusted release exists), ``QUALITY_PENDING`` when QualiCache
+    is still collecting for this title, or ``FETCH_FAILED`` when QualiCache
+    itself is unreachable or misconfigured.
+
+    A per-title ``error`` status is reported as pending, not as a failure:
+    QualiCache is healthy and running its own exponential retry for that title,
+    so backing off every other title would be counterproductive.
+
+    The caller is responsible for checking the quality cache before calling
+    this function; only a resolved result is written back.
+    """
+    base = _normalize_qualicache_url(qualicache_url)
+    if not base:
+        logger.info("QUALICACHE_URL not configured — skipping quality fetch")
+        return []
+
+    qc_type = "series" if media_type in ("tv", "series") else "movie"
+    params: dict[str, str | int] = {
+        "min_trust": _cfg.QUALICACHE_MIN_TRUST,
+    }
+    if qc_type == "series":
+        params["season"] = season
+        params["episode"] = episode
+    # QualiCache uses the release date to pick a refresh policy; passing ours
+    # spares it a TMDB lookup when it has no TMDB key configured.  It wants a
+    # full ISO date and rejects anything else with a 422 — callers here supply
+    # either YYYY-MM-DD or a bare YYYY (the cache-warm path), so send only what
+    # QualiCache can parse and let it resolve the rest itself.
+    if release_date and _ISO_DATE.fullmatch(release_date):
+        params["release_date"] = release_date
+
+    api_key = _cfg.QUALICACHE_API_KEY
+    headers = {"X-API-Key": api_key} if api_key else {}
+    url = f"{base}/v1/quality/{qc_type}/{imdb_id}"
+
+    try:
+        logger.info(f"External API Call: QualiCache quality fetch for {imdb_id}")
+        resp = await client.get(url, params=params, headers=headers, timeout=20.0)
+
+        if resp.status_code == 401:
+            logger.error(
+                "QualiCache rejected our credentials (401) — check that "
+                "QUALICACHE_API_KEY matches QualiCache's ACCESS_KEY"
+            )
+            return FETCH_FAILED
+        if resp.status_code != 200:
+            logger.warning(f"QualiCache error {resp.status_code} for {imdb_id}")
+            return FETCH_FAILED
+
+        payload = resp.json()
+        status = payload.get("status") or ""
+
+        if status == "pending":
+            logger.info(f"QualiCache still collecting quality for {imdb_id}")
+            return QUALITY_PENDING
+
+        if status == "error":
+            # QualiCache reached its addons and they failed. It owns the retry.
+            logger.info(
+                f"QualiCache has no result for {imdb_id} yet "
+                f"(last error: {payload.get('last_error') or 'unknown'})"
+            )
+            return QUALITY_PENDING
+
+        if status == "empty":
+            logger.info(f"QualiCache found no trusted release for {imdb_id}")
+            tokens: list[str] = []
+            set_cached_quality(imdb_id, tokens, release_date)
+            return tokens
+
+        if status != "ready":
+            logger.warning(f"QualiCache returned unknown status {status!r} for {imdb_id}")
+            return FETCH_FAILED
+
+        # QualiCache emits the same token vocabulary PostersPlus uses, plus a
+        # few we have no badge for (8K, 1440P, 720P, SD, BLURAY, WEBRIP, HDTV).
+        # Sources with a close-enough badge fold into it (see
+        # _QUALICACHE_TOKEN_FOLD); the rest are dropped rather than guessed.
+        raw_tokens = payload.get("tokens") or []
+        seen = {
+            _QUALICACHE_TOKEN_FOLD.get(token, token)
+            for token in (str(t).upper() for t in raw_tokens)
+        }
+        unsupported = sorted(seen - set(QUALITY_LABELS))
+        if unsupported:
+            logger.debug(
+                f"QualiCache tokens without a PostersPlus badge for {imdb_id}: "
+                f"{', '.join(unsupported)}"
+            )
+
+        tokens = _ordered_tokens(seen)
+
+        logger.info(f"QualiCache quality for {imdb_id}: {tokens}")
+        set_cached_quality(imdb_id, tokens, release_date)
+        return tokens
+
+    except Exception as exc:
+        logger.error(f"QualiCache fetch error for {imdb_id}: {type(exc).__name__}: {exc}")
+        return FETCH_FAILED
+
+
+# ---------------------------------------------------------------------------
+# Source selection
+# ---------------------------------------------------------------------------
+
+QUALITY_SOURCES = ("aiostreams", "scraper", "qualicache")
+
+# These helpers read the config module by attribute rather than binding values
+# at import time, so a redeployed instance (or a test) can flip the backend
+# without a reimport.
+
+
+def active_quality_source() -> str:
+    """Name of the quality backend in use. Unknown values fall back to aiostreams."""
+    source = _cfg.QUALITY_SOURCE
+    return source if source in QUALITY_SOURCES else "aiostreams"
+
+
+def quality_source_configured() -> bool:
+    """True when the selected backend has everything it needs to answer."""
+    source = active_quality_source()
+    if source == "scraper":
+        return bool(_cfg.SCRAPER_URL)
+    if source == "qualicache":
+        return bool(_cfg.QUALICACHE_URL)
+    return bool(_cfg.AIOSTREAMS_URL and _cfg.AIOSTREAMS_AUTH)
+
+
+async def fetch_quality(
+    client: httpx.AsyncClient,
+    imdb_id: str,
+    media_type: str = "movie",
+    season: int = 1,
+    episode: int = 1,
+    release_date: str | None = None,
+) -> "list[str] | _FetchFailed | _QualityPending":
+    """
+    Fetch quality tokens from whichever backend QUALITY_SOURCE selects.
+
+    Single entry point for every call site so the backends stay interchangeable
+    and adding one doesn't mean touching each caller.  The caller checks the
+    quality cache first; these functions only write on a resolved result.
+    """
+    source = active_quality_source()
+    if source == "scraper":
+        return await fetch_quality_from_scraper(
+            client, _cfg.SCRAPER_URL, imdb_id, media_type, season, episode, release_date,
+        )
+    if source == "qualicache":
+        return await fetch_quality_from_qualicache(
+            client, _cfg.QUALICACHE_URL, imdb_id, media_type, season, episode, release_date,
+        )
+    return await fetch_quality_from_aiostreams(
+        client, imdb_id, media_type, season, episode, release_date,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +629,7 @@ def _warm_badge_cache(height: int) -> None:
             continue
         w, h = raw.size
         new_w = max(1, round(w * height / h))
-        _BADGE_CACHE[(token, height)] = raw.resize((new_w, height), Image.LANCZOS)
+        _BADGE_CACHE[(token, height)] = raw.resize((new_w, height), Image.Resampling.LANCZOS)
 
 
 def _init_badge_cache() -> None:
@@ -433,7 +663,7 @@ def get_resized_badge(token: str, height: int) -> Image.Image | None:
 
     w, h = raw.size
     new_w = max(1, round(w * height / h))
-    resized = raw.resize((new_w, height), Image.LANCZOS)
+    resized = raw.resize((new_w, height), Image.Resampling.LANCZOS)
     _BADGE_CACHE[key] = resized
     return resized
 
@@ -461,7 +691,7 @@ def _resize_premultiplied(img: Image.Image, size: tuple[int, int]) -> Image.Imag
     alpha = arr[..., 3:4] / 255.0                  # normalised alpha, H×W×1
     arr[..., :3] *= alpha                           # premultiply RGB
     pre = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGBA")
-    pre = pre.resize(size, Image.LANCZOS)
+    pre = pre.resize(size, Image.Resampling.LANCZOS)
     arr2 = np.array(pre, dtype=np.float32)
     alpha2 = arr2[..., 3:4] / 255.0
     nonzero = alpha2[..., 0] > 0
@@ -602,6 +832,6 @@ def render_badges_left(
             text_h = bb[3] - bb[1]
             ty = y_top + (badge_height - text_h) // 2
             draw.text((x, ty), label, font=_FALLBACK_FONT, fill=(255, 255, 255, 220))
-            x += (bb[2] - bb[0]) + badge_gap
+            x += int(bb[2] - bb[0]) + badge_gap
 
 

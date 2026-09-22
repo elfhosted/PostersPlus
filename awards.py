@@ -3,6 +3,7 @@ import os
 import math
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from typing import Any
 
 try:
     import cairo as _cairo
@@ -36,14 +37,20 @@ class _RateLimited:
     provided one, so the caller can honour it instead of the default fixed
     back-off. Always distinct from FETCH_FAILED so the standard retry path
     skips immediate re-attempts (retrying a 429 is counterproductive).
-    """
-    __slots__ = ("retry_after",)
 
-    def __init__(self, retry_after: float | None = None):
+    *reset_at* is the epoch second the key's daily quota rolls over, taken
+    from MDBList's X-RateLimit-Reset header. A quota-exhausted 429 comes
+    without Retry-After, so this is what tells the caller how long the key
+    is actually dead for.
+    """
+    __slots__ = ("retry_after", "reset_at")
+
+    def __init__(self, retry_after: float | None = None, reset_at: float | None = None):
         self.retry_after = retry_after
+        self.reset_at = reset_at
 
     def __repr__(self):
-        return f"RATE_LIMITED(retry_after={self.retry_after})"
+        return f"RATE_LIMITED(retry_after={self.retry_after}, reset_at={self.reset_at})"
 
 
 # ---------------------------------------------------------------------------
@@ -737,6 +744,14 @@ GOLDEN_GLOBE_TV_LIMITED_NOM_TMDB_IDS: set[int] = {
 # ---------------------------------------------------------------------------
 
 EMMY_DRAMA_NOM_TMDB_IDS: set[int] = {
+    # 2026 (78th)
+    203857,   # The Diplomat
+    81723,    # The Gilded Age
+    224372,   # A Knight of the Seven Kingdoms
+    245927,   # Paradise
+    225171,   # Pluribus
+    95480,    # Slow Horses
+    241609,   # Your Friends & Neighbors
     # 2025 (77th)
     83867,    # Star Wars: Andor
     203857,   # The Diplomat
@@ -819,6 +834,14 @@ EMMY_DRAMA_NOM_TMDB_IDS: set[int] = {
 }
 
 EMMY_COMEDY_NOM_TMDB_IDS: set[int] = {
+    # 2026 (78th)
+    125935,   # Abbott Elementary
+    136315,   # The Bear
+    124101,   # Hacks
+    245318,   # Margo's Got Money Troubles
+    250923,   # Nobody Wants This
+    107113,   # Only Murders in the Building
+    136311,   # Shrinking
     # 2025 (77th)
     125935,   # Abbott Elementary
     136315,   # The Bear
@@ -928,6 +951,11 @@ EMMY_COMEDY_NOM_TMDB_IDS: set[int] = {
 }
 
 EMMY_LIMITED_NOM_TMDB_IDS: set[int] = {
+    # 2026 (78th)
+    246386,   # All Her Fault
+    250504,   # The Beast in Me
+    154385,   # Beef
+    131142,   # Love Story: John F. Kennedy Jr. & Carolyn Bessette
     # 2025 (77th)
     42009,    # Black Mirror
     241405,   # Dying for Sex
@@ -1028,18 +1056,27 @@ EMMY_LIMITED_NOM_TMDB_IDS: set[int] = {
 # Combined lookup sets — used in parse_mdblist_awards for O(1) checks
 # ---------------------------------------------------------------------------
 
-_GG_ALL_WINNERS: set[int] = (
+# TMDB movie and TV ids are separate namespaces — movie/105 is Back to the
+# Future, tv/105 is Sex and the City — so the film and series sets must never
+# be searched together.  They are kept apart here and picked by media type.
+_GG_FILM_WINNERS: set[int] = (
     GOLDEN_GLOBE_DRAMA_WINNER_TMDB_IDS
     | GOLDEN_GLOBE_COMEDY_WINNER_TMDB_IDS
-    | GOLDEN_GLOBE_TV_DRAMA_WINNER_TMDB_IDS
+)
+
+_GG_FILM_NOMS: set[int] = (
+    GOLDEN_GLOBE_DRAMA_NOM_TMDB_IDS
+    | GOLDEN_GLOBE_COMEDY_NOM_TMDB_IDS
+)
+
+_GG_TV_WINNERS: set[int] = (
+    GOLDEN_GLOBE_TV_DRAMA_WINNER_TMDB_IDS
     | GOLDEN_GLOBE_TV_COMEDY_WINNER_TMDB_IDS
     | GOLDEN_GLOBE_TV_LIMITED_WINNER_TMDB_IDS
 )
 
-_GG_ALL_NOMS: set[int] = (
-    GOLDEN_GLOBE_DRAMA_NOM_TMDB_IDS
-    | GOLDEN_GLOBE_COMEDY_NOM_TMDB_IDS
-    | GOLDEN_GLOBE_TV_DRAMA_NOM_TMDB_IDS
+_GG_TV_NOMS: set[int] = (
+    GOLDEN_GLOBE_TV_DRAMA_NOM_TMDB_IDS
     | GOLDEN_GLOBE_TV_COMEDY_NOM_TMDB_IDS
     | GOLDEN_GLOBE_TV_LIMITED_NOM_TMDB_IDS
 )
@@ -1057,6 +1094,7 @@ _EMMY_ALL_NOMS: set[int] = (
 
 EMMY_WINNER_TMDB_IDS: set[int] = {
     # Comedy
+    270476,  # Widow's Bay
     247767,  # The Studio
     124101,  # Hacks
     136315,  # The Bear
@@ -1119,6 +1157,7 @@ EMMY_WINNER_TMDB_IDS: set[int] = {
     1103,    # Elizabeth R
     3213,    # Marcus Welby M.D.
     # Limited Series
+    206828,  # DTF St. Louis
     249042,  # Adolescence
     154385,  # Beef
     111803,  # The White Lotus
@@ -1152,9 +1191,75 @@ EMMY_WINNER_TMDB_IDS: set[int] = {
 # Award parsing from MDblist keywords
 # ---------------------------------------------------------------------------
 
+# Labels derived purely from the TMDB id (see tmdb_id_awards).  They are
+# re-derived on every cache read, so the stored copies are never trusted.
+_ID_DERIVED_LABELS = frozenset({
+    "Globe Winner", "Globe Nominee", "Emmy Winner", "Emmy Nominee",
+})
+
+
+def tmdb_id_awards(
+    tmdb_id: int | str | None,
+    media_type: str | None,
+) -> tuple[list[str], list[str]]:
+    """Golden Globe and Emmy wins / noms for a TMDB id, in its own namespace.
+
+    Movies are checked against the film Globe categories only; series against
+    the TV Globe categories and the Emmys.  An unknown media type is treated as
+    a movie, the /poster default.
+    """
+    try:
+        numeric = int(tmdb_id) if tmdb_id is not None else None
+    except (ValueError, TypeError):
+        numeric = None
+    if numeric is None:
+        return [], []
+
+    wins: list[str] = []
+    noms: list[str] = []
+    is_tv = media_type in ("tv", "series")
+
+    # --- Golden Globe ---
+    gg_winners, gg_noms = (_GG_TV_WINNERS, _GG_TV_NOMS) if is_tv else (_GG_FILM_WINNERS, _GG_FILM_NOMS)
+    if numeric in gg_winners:
+        wins.append("Globe Winner")
+    elif numeric in gg_noms:
+        noms.append("Globe Nominee")
+
+    # --- Emmy (television only) ---
+    if is_tv:
+        if numeric in EMMY_WINNER_TMDB_IDS:
+            wins.append("Emmy Winner")
+        elif numeric in _EMMY_ALL_NOMS:
+            noms.append("Emmy Nominee")
+
+    return wins, noms
+
+
+def reconcile_cached_awards(
+    wins: list[str],
+    noms: list[str],
+    tmdb_id: int | str | None,
+    media_type: str | None,
+) -> tuple[list[str], list[str]]:
+    """Rebuild the id-derived labels in a cached award pair.
+
+    Keyword-derived labels (the Oscars) are kept as stored — the keywords are
+    not cached, so they cannot be re-checked.  Globe and Emmy labels are thrown
+    away and re-derived from the id, so a row written before the namespaces
+    were separated (or before a list was corrected) stops carrying the error.
+    """
+    id_wins, id_noms = tmdb_id_awards(tmdb_id, media_type)
+    return (
+        [w for w in wins if w not in _ID_DERIVED_LABELS] + id_wins,
+        [n for n in noms if n not in _ID_DERIVED_LABELS] + id_noms,
+    )
+
+
 def parse_mdblist_awards(
     keywords: list[dict],
     tmdb_id: int | str | None = None,
+    media_type: str | None = None,
 ) -> tuple[list[str], list[str]]:
     """
     Derive award wins and nominations from MDblist keyword objects.
@@ -1168,8 +1273,9 @@ def parse_mdblist_awards(
     Series categories only, replacing the broad emmy-award-nominated keyword
     which fired on acting/directing/writing nominations too.
 
-    Golden Globe wins/noms cover all top film and TV categories via the
-    combined _GG_ALL_WINNERS / _GG_ALL_NOMS sets.
+    Golden Globe wins/noms cover the top film categories for movies and the
+    top TV categories for series — *media_type* picks the namespace, since
+    TMDB movie and TV ids overlap (see tmdb_id_awards).
 
     Returns (wins, noms) where each is a list of human-readable strings.
     """
@@ -1181,31 +1287,16 @@ def parse_mdblist_awards(
     wins: list[str] = []
     noms: list[str] = []
 
-    numeric_tmdb_id: int | None = None
-    if tmdb_id is not None:
-        try:
-            numeric_tmdb_id = int(tmdb_id)
-        except (ValueError, TypeError):
-            pass
-
     # --- Best Picture (Oscar) ---
     if "best-picture-winner" in keyword_names:
-        wins.append("Best Picture")
+        wins.append("Oscar Winner")
     elif "best-picture-nominated" in keyword_names:
-        noms.append("Best Picture")
+        noms.append("Oscar Nominee")
 
-    # --- Golden Globe (all top film + TV categories) ---
-    if numeric_tmdb_id is not None:
-        if numeric_tmdb_id in _GG_ALL_WINNERS:
-            wins.append("Golden Globe")
-        elif numeric_tmdb_id in _GG_ALL_NOMS:
-            noms.append("Golden Globe")
-
-    # --- Emmy ---
-    if numeric_tmdb_id is not None and numeric_tmdb_id in EMMY_WINNER_TMDB_IDS:
-        wins.append("Emmy Winner")
-    elif numeric_tmdb_id is not None and numeric_tmdb_id in _EMMY_ALL_NOMS:
-        noms.append("Emmy Nominee")
+    # --- Golden Globe / Emmy — from the id, in its own namespace ---
+    id_wins, id_noms = tmdb_id_awards(tmdb_id, media_type)
+    wins.extend(id_wins)
+    noms.extend(id_noms)
 
     return wins, noms
 
@@ -1217,7 +1308,7 @@ def parse_mdblist_awards(
 def _text_center(
     draw: ImageDraw.ImageDraw,
     text: str,
-    font: ImageFont.ImageFont,
+    font: Any,
     cx: float,
     cy: float,
 ) -> tuple[float, float]:
@@ -1296,62 +1387,161 @@ def _sash_body_cairo(
     return Image.fromarray(rgba, "RGBA")
 
 
-# Awards whose winner and nominee share the same label text (see
-# parse_mdblist_awards), so the notch badge — which can't use colour for win/nom
-# because notch_style owns the trim colour — prefixes a ★ to mark the winner,
-# mirroring the star convention in score/compact modes.  Emmy is excluded (its
-# labels already say "Winner"/"Nominee"); festival winners are intentionally
-# left unmarked.  Strings must match the labels emitted by parse_mdblist_awards.
-_STAR_WIN_AWARDS = {"Best Picture", "Golden Globe"}
+# Formerly used to auto-star awards whose winner and nominee shared the same
+# label text ("Best Picture", "Golden Globe").  Those labels were renamed to
+# "Oscar Winner"/"Oscar Nominee" and "Globe Winner"/"Globe Nominee" so the
+# auto-star is no longer needed.  The set is kept empty for safety; the star
+# prefix is now controlled by the sash_winner_star URL parameter instead.
+_STAR_WIN_AWARDS: set[str] = set()
 
 
-def sample_frosted_notch_rgb(
-    image: Image.Image,
-    label: str,
-    sash_type: str = "win",
-    size_ratio_w: float = 1.0,
-    size_ratio_h: float = 1.0,
-    font_size_ratio: float = 0.43,
-    notch_inset: float = 0.004,
-    star: bool | None = None,
-) -> tuple[float, float, float]:
-    """Dominant RGB the frosted notch would sample from its crop region.
+# Below this Value the source carries no reliable hue (see _frosted_tint); below
+# this Saturation it is essentially white/grey. When the local region is either,
+# a broader fallback region (typically the whole poster) is borrowed so the frost
+# matches a real poster colour instead of going dark/neutral or washing out white.
+_FROST_CONFIDENT_V = 0.22
+# At/above this Saturation a cluster counts as a genuine colour (vs white/grey).
+_FROST_CHROMATIC_S = 0.20
+# A coloured cluster must cover at least this fraction of the region to be chosen
+# over a white/grey majority. Small enough to catch modest colour accents (so the
+# frost leans colour, not white), but above thin title text (e.g. the red "RUN" on
+# an otherwise black-and-white poster) so that doesn't override an honest white.
+_FROST_CHROMATIC_W = 0.08
+# A cluster this dark carries no usable colour for a frosted element — it would
+# only make the frost muddy — so it is skipped entirely.
+_FROST_MIN_V = 0.16
 
-    Replicates draw_award_badge's geometry + sampling so the colour-matching
-    logic upstream can compare it against the frosted bar.  Keep the constants
-    here in sync with draw_award_badge.  `star` overrides the ★ decision when
-    the caller already resolved it on the canonical (pre-translation) label.
-    """
-    width, height = image.size
-    SS = 3
-    if star if star is not None else (sash_type == "win" and label in _STAR_WIN_AWARDS):
-        label = f"★  {label}"
 
-    badge_h = int(height * 0.075 * size_ratio_h)
-    _fonts_dir   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
-    font_size_ss = int(badge_h * font_size_ratio) * SS
+def _is_skin_tone(r: float, g: float, b: float) -> bool:
+    """Rough skin-tone test for faces (tan/beige/brown): warm with R>G>B and a
+    moderate saturation. Deliberately excludes vivid reds and oranges so genuine
+    poster colours aren't mistaken for skin. Skin is de-prioritised — but not
+    banned — as a frost colour, since a face shouldn't drive the tint when the
+    poster offers a real colour elsewhere."""
+    import colorsys
+    if not (r > g > b):
+        return False
+    h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+    return 0.015 <= h <= 0.11 and 0.20 <= s <= 0.68 and v >= 0.35
+
+
+def _dominant_cluster(
+    region: Image.Image,
+) -> tuple[tuple[float, float, float] | None, float, float, bool]:
+    """Most prominent *actual* colour of a region → ((r,g,b), value, saturation,
+    is_skin).
+
+    Quantises the region into a handful of real colour clusters, rather than
+    taking a flat mean of every pixel — a mean of several distinct colours lands
+    on a muddy grey/brown that appears nowhere in the art (the "invented colour"
+    problem). Near-black clusters are skipped so the tint is never derived from
+    shadows or letterboxing.
+
+    Preference order among clusters that clear _FROST_CHROMATIC_S / _W:
+      1. a genuine non-skin colour   (e.g. a teal background)
+      2. a skin tone                 (only if no other colour qualifies)
+    then, if nothing is chromatic, the best white/grey, then the brightest
+    cluster. So white is only chosen when the region truly has no colour, and a
+    face's skin only when the poster offers nothing else. Returns ``(None, 0, 0,
+    False)`` only for an empty region; the trailing fields let the caller judge
+    reliability and whether the pick was skin."""
+    import colorsys
+    if region.width == 0 or region.height == 0:
+        return None, 0.0, 0.0, False
+    # A modest downsample preserves the real colours; the old heavy-blur + 8x8
+    # mean is exactly what smeared them into an invented average.
+    small = region.convert("RGB")
+    if max(small.size) > 64:
+        small = small.resize((48, 48), Image.Resampling.LANCZOS)
     try:
-        font = ImageFont.truetype(os.path.join(_fonts_dir, "Inter-Bold.ttf"), font_size_ss)
-    except IOError:
-        font = ImageFont.load_default()
+        q = small.quantize(colors=12, method=Image.Quantize.FASTOCTREE)
+    except Exception:
+        q = small.quantize(colors=12)
+    palette = q.getpalette() or []
+    counts  = q.getcolors() or []
+    if not counts or not palette:
+        arr = np.array(small, dtype=np.float32)
+        rgb = (float(arr[:, :, 0].mean()), float(arr[:, :, 1].mean()), float(arr[:, :, 2].mean()))
+        _hh, ss, vv = colorsys.rgb_to_hsv(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255)
+        return rgb, vv, ss, _is_skin_tone(*rgb)
 
-    _tmp_d    = ImageDraw.Draw(Image.new("L", (1, 1)))
-    _tbbox    = _tmp_d.textbbox((0, 0), label, font=font)
-    text_w_ss = _tbbox[2] - _tbbox[0]
+    total = float(sum(c for c, _ in counts)) or 1.0
+    # best_colour: best non-skin chromatic cluster (preferred).
+    # best_skin:   best skin-tone chromatic cluster (used only if no other colour).
+    # best_any:    best cluster overall incl. white/grey (used if nothing chromatic).
+    best_colour, best_colour_score, best_colour_hsv = None, -1.0, (0.0, 0.0)
+    best_skin, best_skin_score, best_skin_hsv = None, -1.0, (0.0, 0.0)
+    best_any, best_any_score, best_any_hsv = None, -1.0, (0.0, 0.0)
+    brightest, brightest_hsv = None, (-1.0, 0.0)
+    for count, idx in counts:
+        r, g, b = palette[idx * 3:idx * 3 + 3]
+        _h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+        if v > brightest_hsv[0]:
+            brightest_hsv, brightest = (v, s), (float(r), float(g), float(b))
+        if v < _FROST_MIN_V:               # near-black — never a tint source
+            continue
+        weight = count / total
+        # Population-led, biased toward *chroma* (saturation × value), not raw
+        # saturation — otherwise a small, dark-but-saturated shadow (e.g. a deep
+        # purple corner) outscores the poster's larger, brighter real palette.
+        score = weight * (0.3 + s * v)
+        rgb = (float(r), float(g), float(b))
+        if score > best_any_score:
+            best_any_score, best_any, best_any_hsv = score, rgb, (v, s)
+        if s >= _FROST_CHROMATIC_S and weight >= _FROST_CHROMATIC_W:
+            if _is_skin_tone(r, g, b):
+                if score > best_skin_score:
+                    best_skin_score, best_skin, best_skin_hsv = score, rgb, (v, s)
+            elif score > best_colour_score:
+                best_colour_score, best_colour, best_colour_hsv = score, rgb, (v, s)
 
-    _h_pad      = int(badge_h * 0.70)
-    min_badge_w = int(width * 0.28 * size_ratio_w)
-    max_badge_w = int(width * 0.70)
-    badge_w     = max(min_badge_w, min(max_badge_w, text_w_ss // SS + _h_pad))
+    if best_colour is not None:
+        return best_colour, best_colour_hsv[0], best_colour_hsv[1], False
+    if best_skin is not None:
+        return best_skin, best_skin_hsv[0], best_skin_hsv[1], True
+    if best_any is not None:
+        return best_any, best_any_hsv[0], best_any_hsv[1], False
+    return (brightest or (128.0, 128.0, 128.0)), max(brightest_hsv[0], 0.0), brightest_hsv[1], False
 
-    bx = (width - badge_w) // 2
-    by_composite = max(-badge_h, int(height * notch_inset))
-    crop_y = max(0, by_composite)
-    region = image.crop((bx, crop_y, bx + badge_w, crop_y + badge_h))
-    blurred = region.filter(ImageFilter.GaussianBlur(radius=max(4, int(badge_h * 0.35))))
-    thumb = blurred.resize((8, 8), Image.LANCZOS).convert("RGB")
-    arr = np.array(thumb, dtype=np.float32)
-    return float(arr[:, :, 0].mean()), float(arr[:, :, 1].mean()), float(arr[:, :, 2].mean())
+
+def _frost_rank(v: float, s: float, is_skin: bool) -> int:
+    """Desirability of a candidate frost colour, high = better:
+      3 = a genuine non-skin colour   2 = a skin tone
+      1 = white / grey (bright but colourless)   0 = too dark to trust.
+    Used to decide whether the whole-poster fallback beats the local region. A
+    colour is only "too dark to trust" when it is dark AND lacks chroma (near-black
+    noise); a dark but vivid hue (deep navy/teal) stays a usable colour."""
+    if v < _FROST_CONFIDENT_V and v * s < 0.05:
+        return 0
+    if s < _FROST_CHROMATIC_S:
+        return 1
+    return 2 if is_skin else 3
+
+
+def dominant_frost_rgb(
+    region: Image.Image, fallback: Image.Image | None = None
+) -> tuple[float, float, float]:
+    """Representative *actual* colour of a poster region for frosted tinting.
+
+    Returns the region's most prominent real colour (see _dominant_cluster). When
+    that colour is not the best kind available — it's too dark to carry a hue,
+    washed out to white/grey, or merely a skin tone — and a broader ``fallback``
+    region (typically the whole poster) offers a strictly better one (by
+    _frost_rank: real colour > skin > white/grey > dark), that is borrowed
+    instead. This keeps the frost matching a real poster colour, avoiding white
+    and faces whenever the art offers something better, and only ever returns a
+    colour genuinely present in the poster.
+    """
+    rgb, v, s, skin = _dominant_cluster(region)
+    if rgb is None:
+        rgb, v, s, skin = (128.0, 128.0, 128.0), 0.5, 0.0, False
+    if fallback is not None:
+        local_rank = _frost_rank(v, s, skin)
+        if local_rank < 3:
+            fb_rgb, fb_v, fb_s, fb_skin = _dominant_cluster(fallback)
+            if fb_rgb is not None and _frost_rank(fb_v, fb_s, fb_skin) > local_rank:
+                return fb_rgb
+    return rgb
 
 
 def draw_award_badge(
@@ -1362,15 +1552,27 @@ def draw_award_badge(
     size_ratio_h: float = 1.0,     # vertical scale multiplier
     notch_style: str = "frosted",     # "silver" | "gold" | "frosted"
     notch_inset: float = 0.004,        # top-edge offset as fraction of poster height (± small)
+    notch_pad_ratio: float = 1.0,     # vertical padding scale; <1 tightens top/bottom space
     font_size_ratio: float = 0.43,    # font size as fraction of badge height
     frost_opacity: float = 0.75,      # frosted overlay opacity (0.0–1.0)
-    tint_rgb: tuple[float, float, float] | None = None,  # override sampled colour (frosted)
+    frost_saturation: float = 1.2,    # frosted colour-cast strength (0 = grey)
+    frost_reference: bool = False,    # match the poster colour instead of the pastel tint
+    tint_rgb: tuple[float, float, float] | None = None,  # whole-poster colour (from un-graded art)
     star: bool | None = None,         # override ★ decision (resolved on canonical label)
+    text_color: tuple[int, int, int] | None = None,  # override default white text
 ) -> Image.Image:
     """
     Centred notch badge that emerges from the top edge of the poster.
     Always horizontally centred; notch_inset nudges it up/down so users
     can control whether the top border is hidden or visible in their client.
+
+    Vertical space is controlled by two independent knobs: size_ratio_h sets the
+    nominal height (and with it the font scale), while notch_pad_ratio trims the
+    empty space above and below the text without touching the font or the badge
+    width.  Reach for notch_pad_ratio when the label looks lost in the notch.
+    Trimming stops once the label's ink reaches the edges, and scales the corner
+    radius and border with it; at font sizes that already fill the notch there is
+    no empty space to reclaim and the control has no effect.
 
     Three styles:
       silver  — dark gradient body with silver trim, white text
@@ -1416,29 +1618,65 @@ def draw_award_badge(
         label = f"★  {label}"
 
     # ── Dimensions ───────────────────────────────────────────────────────────
-    badge_h = int(height * 0.075 * size_ratio_h)
-    bh      = badge_h * SS  # SS-space height (independent of width)
+    # base_h is the nominal height size_ratio_h asks for.  It drives the font
+    # size and the horizontal padding; notch_pad_ratio then scales only the
+    # *drawn* height around that already-sized text.  Keeping the two separate
+    # is what lets padding tighten without shrinking the label or narrowing the
+    # badge — changing size_ratio_h alone moves both, which is rarely wanted.
+    base_h = int(height * 0.075 * size_ratio_h)
 
     # ── Font: fixed size so every label renders at the same scale ────────────
     _fonts_dir   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
-    font_size_ss = int(badge_h * font_size_ratio) * SS
+    font_size_ss = int(base_h * font_size_ratio) * SS
     try:
         font = ImageFont.truetype(os.path.join(_fonts_dir, "Inter-Bold.ttf"), font_size_ss)
     except IOError:
         font = ImageFont.load_default()
 
-    # Measure rendered text width at SS resolution
+    # Measure rendered text at SS resolution — the ink extents drive both the
+    # badge width and the vertical padding floor below.
     _tmp_d  = ImageDraw.Draw(Image.new("L", (1, 1)))
     _tbbox  = _tmp_d.textbbox((0, 0), label, font=font)
-    text_w_ss = _tbbox[2] - _tbbox[0]
+    text_w_ss = int(_tbbox[2] - _tbbox[0])
+
+    # Vertical padding.  Floored so an aggressive notch_pad_ratio crops the empty
+    # space but never the glyphs.  _text_center places the line box at
+    # bh/2 - (ascent+descent)/2 - descent + int(ascent*0.22), so ink spans
+    # bh/2 + _k + bbox[1] .. bh/2 + _k + bbox[3]; solving both ends for [0, bh]
+    # gives the smallest height that still fits.  Measured against a reference
+    # string of the tallest and deepest glyphs rather than the label itself, so
+    # every award trims to the same height (cf. _REF in ratings.py) while
+    # accented capitals still clear the border.
+    _PAD_REF = "ÅÄÖÜÀÁÉÓÊÎÑÇgjpqy0★"
+    _ref_bbox = _tmp_d.textbbox((0, 0), _PAD_REF, font=font)
+    try:
+        _ascent, _descent = font.getmetrics()
+    except AttributeError:
+        _ascent, _descent = 0, 0  # matches _text_center's own fallback
+    _k = -(_ascent + _descent) / 2 - _descent + int(_ascent * 0.22)
+    _ink_h_ss = max(-2 * (_k + _ref_bbox[1]), 2 * (_k + _ref_bbox[3]))
+    _min_badge_h = math.ceil(_ink_h_ss * 1.05 / SS)  # 5% keeps ink off the border
+    # The floor may only ever tighten the notch, never grow it past the height
+    # the size and font ratios already asked for.  Without this clamp a
+    # font_size_ratio above ~0.78 would raise badge_h even at the 1.0 default,
+    # re-rendering saved URLs that predate this control.
+    _min_badge_h = min(_min_badge_h, base_h)
+    badge_h = max(_min_badge_h, int(base_h * notch_pad_ratio))
+    bh      = badge_h * SS  # SS-space height (independent of width)
 
     # Badge width: minimum is size_ratio_w-scaled default; expands to fit text
     # with horizontal padding of ~45% of badge_h (22.5% each side).
-    _h_pad    = int(badge_h * 0.70)
+    # Derived from base_h, not badge_h, so tightening the vertical padding
+    # leaves the badge exactly as wide as it was.
+    _h_pad    = int(base_h * 0.70)
     min_badge_w = int(width * 0.28 * size_ratio_w)
     max_badge_w = int(width * 0.70)
     badge_w   = max(min_badge_w, min(max_badge_w, text_w_ss // SS + _h_pad))
 
+    # Corner radius and border scale with the drawn height, not base_h: a radius
+    # derived from the untrimmed height would exceed half of a tightened badge
+    # and distort the rounded rectangle.  Tightening therefore also thins the
+    # border slightly, which keeps the notch in proportion.
     radius   = int(badge_h * 0.32)
     border_w = max(1, int(badge_h * 0.055))
     bw    = badge_w * SS
@@ -1459,30 +1697,23 @@ def draw_award_badge(
         region = image.crop((bx, crop_y, bx + badge_w, crop_y + badge_h))
         blur_r = max(4, int(badge_h * 0.35))
         blurred = region.filter(ImageFilter.GaussianBlur(radius=blur_r))
-        blurred_ss = blurred.resize((bw, bh), Image.LANCZOS).convert("RGBA")
+        blurred_ss = blurred.resize((bw, bh), Image.Resampling.LANCZOS).convert("RGBA")
 
-        # Sample dominant colour from the (lightly blurred) region — use a small
-        # thumbnail so the mean is fast and noise-free.  tint_rgb (when supplied)
-        # overrides the colour so the notch can match the frosted rating bar.
+        # Dominant colour of the actual poster region (a real cluster, not a
+        # muddy mean — see dominant_frost_rgb).  tint_rgb (when supplied) overrides
+        # it so the notch can match the frosted rating bar.
+        # Colour comes from tint_rgb (a whole-poster sample the caller takes from
+        # the un-graded art); the blurred texture still comes from the image.
         if tint_rgb is not None:
             dr, dg, db = tint_rgb
         else:
-            thumb = blurred.resize((8, 8), Image.LANCZOS).convert("RGB")
-            arr_thumb = np.array(thumb, dtype=np.float32)
-            dr, dg, db = arr_thumb[:, :, 0].mean(), arr_thumb[:, :, 1].mean(), arr_thumb[:, :, 2].mean()
+            dr, dg, db = dominant_frost_rgb(image)
 
         # Boost toward a bright, saturated version of that colour so the tint
-        # reads clearly: push V toward 1.0 while keeping H+S, then mix 60 % of
-        # that tint with 40 % white so very dark posters still look "frosted".
-        import colorsys as _cs
-        _h, _s, _v = _cs.rgb_to_hsv(dr / 255, dg / 255, db / 255)
-        _v_boost = _v * 0.4 + 0.60          # floor V at 60% so dark regions lift
-        _s_boost = min(1.0, _s * 1.2)       # slightly push saturation
-        tr, tg, tb = _cs.hsv_to_rgb(_h, _s_boost, _v_boost)
-        # Mix tinted colour with white (60/40) for the frosted feel
-        fr_r = int(tr * 255 * 0.6 + 255 * 0.4)
-        fr_g = int(tg * 255 * 0.6 + 255 * 0.4)
-        fr_b = int(tb * 255 * 0.6 + 255 * 0.4)
+        # reads clearly: floor V so dark regions lift, scale S by frost_saturation,
+        # then mix 60 % of that tint with 40 % white for the frosted feel (or, in
+        # reference mode, hew to the poster's true colour).
+        fr_r, fr_g, fr_b = _frosted_tint(dr, dg, db, frost_saturation, frost_reference)
 
         # Notch shape mask (square top, rounded bottom)
         rr_mask_ss = Image.new("L", (bw, bh), 0)
@@ -1498,14 +1729,17 @@ def draw_award_badge(
         frost.putalpha(Image.fromarray((rr_f * frost_opacity * 255).astype(np.uint8), "L"))
         badge_ss = Image.alpha_composite(blurred_ss, frost)
 
-        # Dark text
+        # Text: dark on a light panel, light on a dark one (a matched panel can be
+        # either — every other frost is light by construction).
         txt_layer = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
         td = ImageDraw.Draw(txt_layer)
         tx, ty = _text_center(td, label, font, bw / 2, text_cy_ss)
-        td.text((tx, ty), label, font=font, fill=(0, 0, 0, 245))
+        # (text_color is deliberately not consulted here: this style has always
+        # ignored it, and honouring it now would restyle existing posters.)
+        td.text((tx, ty), label, font=font, fill=(*_frost_ink(fr_r, fr_g, fr_b), 245))
         badge_ss = Image.alpha_composite(badge_ss, txt_layer)
 
-        badge_final = badge_ss.resize((badge_w, badge_h), Image.LANCZOS)
+        badge_final = badge_ss.resize((badge_w, badge_h), Image.Resampling.LANCZOS)
         result = image.copy()
         result.alpha_composite(badge_final, (bx, by_composite))
         return result
@@ -1524,9 +1758,10 @@ def draw_award_badge(
         txt_layer = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
         td = ImageDraw.Draw(txt_layer)
         tx, ty = _text_center(td, label, font, bw / 2, text_cy_ss)
-        td.text((tx, ty), label, font=font, fill=(210, 210, 218, 245))
+        _txt_rgb_black = text_color if text_color is not None else (210, 210, 218)
+        td.text((tx, ty), label, font=font, fill=(*_txt_rgb_black, 245))
         badge_ss = Image.alpha_composite(badge_ss, txt_layer)
-        badge_final = badge_ss.resize((badge_w, badge_h), Image.LANCZOS)
+        badge_final = badge_ss.resize((badge_w, badge_h), Image.Resampling.LANCZOS)
         result = image.copy()
         result.alpha_composite(badge_final, (bx, by_composite))
         return result
@@ -1601,7 +1836,7 @@ def draw_award_badge(
             g_s = np.clip(arr[:, :, 1].astype(np.float32) * 255.0 / safe_a, 0, 255).astype(np.uint8)
             b_s = np.clip(arr[:, :, 0].astype(np.float32) * 255.0 / safe_a, 0, 255).astype(np.uint8)
             rgba  = np.stack([r_s, g_s, b_s, arr[:, :, 3]], axis=2)
-            badge = Image.fromarray(rgba, "RGBA")
+            badge = Image.fromarray(rgba)
         except Exception:
             badge = None
 
@@ -1614,7 +1849,7 @@ def draw_award_badge(
         b_arr[:, :, 1] = darkness[:, np.newaxis]
         b_arr[:, :, 2] = np.minimum(255, (darkness * 1.3).astype(np.uint8))[:, np.newaxis]
         b_arr[:, :, 3] = body_alpha
-        body = Image.fromarray(b_arr, "RGBA")
+        body = Image.fromarray(b_arr)
 
         _nc = dict(corners=(False, False, True, True))
         body_mask = Image.new("L", (bw, bh), 0)
@@ -1637,9 +1872,10 @@ def draw_award_badge(
     # ── Text: white on dark body, with drop shadow ───────────────────────────
     txt_layer = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
     td = ImageDraw.Draw(txt_layer)
-    tx, ty = _text_center(td, label, font, bw / 2, text_cy_ss)
+    tx, ty = _text_center(td, label, font, bw // 2, text_cy_ss)
+    _txt_rgb = text_color if text_color is not None else (255, 255, 255)
     td.text((tx + SS, ty + SS), label, font=font, fill=(0, 0, 0, 160))
-    td.text((tx, ty),           label, font=font, fill=(255, 255, 255, 235))
+    td.text((tx, ty),           label, font=font, fill=(*_txt_rgb, 235))
     badge = Image.alpha_composite(badge, txt_layer)
 
     # ── Downscale → composite ────────────────────────────────────────────────
@@ -1649,23 +1885,87 @@ def draw_award_badge(
     return result
 
 
-def _frosted_tint(dr: float, dg: float, db: float) -> tuple[int, int, int]:
-    """Poster dominant RGB → the same boosted/whitened tint the frosted notch
-    uses, so the sash / notch / bar all derive a consistent colour."""
+def _frost_ink(r: float, g: float, b: float) -> tuple[int, int, int]:
+    """Label colour for a frosted panel of this colour — dark on light, light on
+    dark.
+
+    Every frosted surface was light by construction until matching let one take a
+    tinted vignette's own colour, which can be genuinely dark; its label has to
+    follow or the badge stops reading.  The threshold sits well below any colour
+    the other two modes produce (their luminance floor is 0.60), so this only ever
+    changes what a matched panel does.
+    """
+    lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+    return (0, 0, 0) if lum >= 0.45 else (238, 238, 240)
+
+
+def _frosted_tint(
+    dr: float, dg: float, db: float, saturation: float = 1.2,
+    reference: bool | str = False,
+) -> tuple[int, int, int]:
+    """Poster dominant RGB → the frosted tint shared by the bar, notch and sash so
+    they stay consistent.
+
+    Three modes:
+
+    • Saturation (default) — a light "frosted glass" pastel. ``saturation`` scales
+      the source S (1.2 = historical default; 0 = neutral grey). The colour is
+      lifted to ~60 %+ Value and mixed 60/40 with white.
+
+    • Match (``reference="match"``) — the frost is standing in for a colour that
+      is already on the poster (a tinted vignette), so it must be *that colour*,
+      lightness included.  Anything else is visibly a different colour sitting
+      next to it: holding hue and chroma while lifting Value for legibility still
+      reads as pale khaki beside dark olive, because lightness is most of what the
+      eye calls "colour".  So the source is returned as it came, floored only
+      short of black, and the caller flips its label to light ink — see
+      _frost_ink.  ``saturation`` is ignored.
+
+    • Reference (``reference=True``) — hew to the poster's *true* hue and
+      saturation, dropping the pastel whitening so the frost closely matches the
+      art. White is then added only as far as needed to lift the colour to a
+      legibility floor, so the dark frosted text stays readable (an inherently
+      dark hue like deep blue still gets enough white; an already-light gold keeps
+      its full colour). ``saturation`` is ignored in this mode.
+
+    Both key the colour's reliability on *chroma* (value × saturation), not Value,
+    so a near-black noise pixel like (14, 4, 3) fades to neutral (no invented
+    salmon) while a dark-but-vivid navy like (9, 35, 72) keeps its hue."""
     import colorsys
     h, s, v = colorsys.rgb_to_hsv(dr / 255, dg / 255, db / 255)
-    tr, tg, tb = colorsys.hsv_to_rgb(h, min(1.0, s * 1.2), v * 0.4 + 0.60)
+    # Confidence the source hue is real, from its chroma (v*s): ~0 below 0.05
+    # (near-black/grey noise), full by 0.18 (a clear hue, however dark).
+    conf = max(0.0, min(1.0, (v * s - 0.05) / 0.13))
+
+    _PANEL_V = 0.85     # how light a dark-text frosted panel has to be
+    _MATCH_MIN_V = 0.12  # ...and how dark a matched one is allowed to get
+
+    if reference == "match":
+        # The source colour, as it is.  Floored just clear of black so the panel
+        # is still a surface rather than a hole; the caller's own gate is what
+        # decides whether there was a colour worth matching in the first place.
+        # No `conf` fade either — that judgement has already been made, and a
+        # source close to neutral should come back close to neutral, not twice
+        # faded.
+        v_out = max(v, _MATCH_MIN_V)
+        return tuple(int(c * 255) for c in colorsys.hsv_to_rgb(h, s, v_out))
+    if reference:
+        # True poster hue + saturation at a bright value, then just enough white
+        # to reach a luminance floor for the dark text — vivid, not pastel.
+        s_eff = min(1.0, s) * conf
+        br, bg, bb = (c * 255 for c in colorsys.hsv_to_rgb(h, s_eff, max(v, _PANEL_V)))
+        # White is added only as far as the dark text needs, so an already-light
+        # colour keeps all of its own.
+        lum = (0.299 * br + 0.587 * bg + 0.114 * bb) / 255
+        _FLOOR = 0.60
+        w = (_FLOOR - lum) / (1.0 - lum) if lum < _FLOOR else 0.0
+        return (int(br * (1 - w) + 255 * w),
+                int(bg * (1 - w) + 255 * w),
+                int(bb * (1 - w) + 255 * w))
+
+    s_eff = min(1.0, s * max(0.0, saturation)) * conf
+    tr, tg, tb = colorsys.hsv_to_rgb(h, s_eff, v * 0.4 + 0.60)
     return (int(tr*255*0.6 + 255*0.4), int(tg*255*0.6 + 255*0.4), int(tb*255*0.6 + 255*0.4))
-
-
-def sample_frosted_sash_rgb(image: Image.Image) -> tuple[float, float, float]:
-    """Dominant RGB of the top-right corner region the diagonal sash overlays."""
-    width, height = image.size
-    reg = image.crop((int(width * 0.55), 0, width, int(height * 0.22)))
-    blr = reg.filter(ImageFilter.GaussianBlur(radius=max(6, int(height * 0.02))))
-    th  = blr.resize((8, 8), Image.LANCZOS).convert("RGB")
-    ar  = np.array(th, dtype=np.float32)
-    return float(ar[:, :, 0].mean()), float(ar[:, :, 1].mean()), float(ar[:, :, 2].mean())
 
 
 def draw_award_sash(
@@ -1676,7 +1976,13 @@ def draw_award_sash(
     length_ratio: float = 1.15,
     height_ratio: float = 0.12,
     poster_color: tuple[float, float, float] | None = None,
+    frost_saturation: float = 1.2,
+    frost_reference: bool = False,
+    star: bool = False,
+    text_color: tuple[int, int, int] | None = None,
 ) -> Image.Image:
+    if star:
+        label = f"★  {label}"
     width, height = image.size
 
     # SS = supersample factor. 2× supersample + LANCZOS downsample gives edges
@@ -1692,7 +1998,7 @@ def draw_award_sash(
     if poster_color is not None:
         # Poster-derived colour: tint the band edges / border from the art (same
         # logic the frosted notch uses).  The dark centre + light text are kept.
-        _t = _frosted_tint(*poster_color)
+        _t = _frosted_tint(*poster_color, saturation=frost_saturation, reference=frost_reference)
         hi            = (*_t, 255)
         lo            = tuple(max(0, int(c * 0.6)) for c in _t) + (255,)
         border_colour = (*_t, 255)
@@ -1740,6 +2046,7 @@ def draw_award_sash(
     adjusted_size = sash_height * 0.85 / (len(label) ** 0.35)
     font_size     = int(min(base_size, adjusted_size)) * SS
 
+    font: Any
     try:
         font = ImageFont.truetype(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "Inter-Bold.ttf"), font_size)
     except IOError:
@@ -1751,9 +2058,10 @@ def draw_award_sash(
     text_layer = Image.new("RGBA", sash.size, (0, 0, 0, 0))
     td         = ImageDraw.Draw(text_layer)
 
+    _txt_rgb = text_color if text_color is not None else (225, 225, 225)
     tx, ty = _text_center(td, label, font, band_cx, band_cy)
     td.text((tx + 2 * SS, ty + 2 * SS), label, font=font, fill=(0, 0, 0, 180))
-    td.text((tx, ty),                   label, font=font, fill=(225, 225, 225, 225))
+    td.text((tx, ty),                   label, font=font, fill=(*_txt_rgb, 225))
 
     sash = Image.alpha_composite(sash, text_layer)
 

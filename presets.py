@@ -16,17 +16,27 @@ CDN-cacheable, REGARDLESS of what a preset's params request:
     poster swap, with a short Cache-Control so the CDN isn't poisoned.
   * All preset traffic shares one operator-wide "preset" rate-limit bucket.
 
-These presets mirror upstream's configurator preset GALLERY one-for-one
-(same ids, same params), so a /p/<id> URL renders the same look as picking
-that gallery card — the public tier exposes exactly the curated set, while
-authenticated tenants keep the full configurator. Keep this list and the
-``PRESETS`` array in configurator.html in sync.
+These presets mirror upstream's configurator preset GALLERY (same ids, same
+params), so a /p/<id> URL renders the same look as picking that gallery card —
+the public tier exposes exactly the curated set, while authenticated tenants
+keep the full configurator. Keep this list and the ``PRESETS`` array in
+configurator.html in sync.
+
+The mirror is deliberately manual rather than parsed out of the gallery at
+import. A preset id here is a public URL that lives in metadata addon configs
+we do not control, so the gallery is a source to follow, not a source of
+truth to track automatically: upstream renaming a card must not 404 a URL
+someone is already using. That is why retired ids stay in ``PRESETS`` with
+their old params and are simply left out of ``preset_catalog()``.
 
 Cherry-pick guide:
   * Upstream has no server-side preset route — this whole module + the /p
     handler are ElfHosted-only. The param dicts are pure data extracted from
     the gallery; retuning a preset is a one-file change here (mirror it in
     configurator.html's PRESETS so the gallery card matches).
+  * When upstream changes the gallery, re-extract the current cards from
+    configurator.html's PRESETS array into the first block below, and move
+    any id that vanished into the retired block rather than deleting it.
 """
 from __future__ import annotations
 
@@ -36,6 +46,254 @@ from __future__ import annotations
 # to the matching gallery selection. tmdb_id/imdb_id/type are supplied by the
 # route path and are intentionally absent here.
 PRESETS: dict[str, dict[str, str]] = {
+    # --- Current gallery (upstream v1.2.0) --------------------------------
+    'tinted_mini_notch': {
+        'primary_client': 'stremio_tv_nuvio',
+        'top_gradient': 'medium',
+        'bottom_gradient': 'medium',
+        'top_vignette_sash_only': 'true',
+        'vignette_poster_color_bottom': 'true',
+        'vignette_color_local': 'false',
+        'fallback_to_imdb': 'true',
+        'imdb_rating_source': 'fallback',
+        'tmdb_rating_source': 'fallback',
+        'rating_display_mode': '3',
+        'minimalist_mode_font_size_ratio': '0.060',
+        'minimalist_mode_font_x_offset': '0.065',
+        'rating_text_color': 'FFFFFF',
+        'movie_weights': 'letterboxd:0.99,trakt:0.01',
+        'tv_weights': 'trakt:0.80,tomatoes:0.20',
+        'fallback_bg_style': 'photoreal',
+        'logo_max_h_ratio': '0.20',
+        'logo_bottom_ratio': '0.17',
+        'logo_bottom_anchor': 'true',
+        'sash_mode': 'notch',
+        'sash_badge_size_w': '1.80',
+        'sash_badge_size_h': '1.20',
+        'sash_badge_inset': '0.000',
+        'sash_badge_font_ratio': '0.46',
+        'notch_vignette_color': 'true',
+        'badge_display_mode': '0',
+    },
+    'tinted_mini_sash': {
+        'primary_client': 'stremio_tv_nuvio',
+        'top_gradient': 'medium',
+        'bottom_gradient': 'medium',
+        'top_vignette_sash_only': 'true',
+        'vignette_poster_color_bottom': 'true',
+        'vignette_color_local': 'false',
+        'fallback_to_imdb': 'true',
+        'imdb_rating_source': 'fallback',
+        'tmdb_rating_source': 'fallback',
+        'rating_display_mode': '3',
+        'minimalist_mode_font_size_ratio': '0.060',
+        'minimalist_mode_font_x_offset': '0.065',
+        'rating_text_color': 'FFFFFF',
+        'movie_weights': 'letterboxd:0.99,trakt:0.01',
+        'tv_weights': 'trakt:0.80,tomatoes:0.20',
+        'fallback_bg_style': 'photoreal',
+        'logo_max_h_ratio': '0.20',
+        'logo_bottom_ratio': '0.17',
+        'logo_bottom_anchor': 'true',
+        'sash_length_ratio': '1.20',
+        'sash_height_ratio': '0.135',
+        'badge_display_mode': '0',
+    },
+    'bar_notch': {
+        'primary_client': 'stremio_tv_nuvio',
+        'top_gradient': 'medium',
+        'bottom_gradient': 'medium',
+        'top_vignette_sash_only': 'true',
+        'fallback_to_imdb': 'true',
+        'imdb_rating_source': 'fallback',
+        'tmdb_rating_source': 'fallback',
+        'rating_display_mode': '4',
+        'frost_reference': 'true',
+        'bar_bottom_inset': '0.000',
+        'movie_weights': 'letterboxd:0.99,trakt:0.01',
+        'tv_weights': 'trakt:0.80,tomatoes:0.20',
+        'fallback_bg_style': 'photoreal',
+        'logo_max_h_ratio': '0.20',
+        'logo_bottom_ratio': '0.17',
+        'logo_bottom_anchor': 'true',
+        'sash_mode': 'notch',
+        'sash_badge_size_w': '1.80',
+        'sash_badge_size_h': '1.20',
+        'sash_badge_inset': '0.000',
+        'sash_badge_font_ratio': '0.46',
+        'badge_display_mode': '0',
+    },
+    'bar_sash': {
+        'primary_client': 'stremio_tv_nuvio',
+        'top_gradient': 'medium',
+        'bottom_gradient': 'medium',
+        'top_vignette_sash_only': 'true',
+        'fallback_to_imdb': 'true',
+        'imdb_rating_source': 'fallback',
+        'tmdb_rating_source': 'fallback',
+        'rating_display_mode': '4',
+        'frost_reference': 'true',
+        'bar_bottom_inset': '0.000',
+        'movie_weights': 'letterboxd:0.99,trakt:0.01',
+        'tv_weights': 'trakt:0.80,tomatoes:0.20',
+        'fallback_bg_style': 'photoreal',
+        'logo_max_h_ratio': '0.20',
+        'logo_bottom_ratio': '0.17',
+        'logo_bottom_anchor': 'true',
+        'sash_poster_color': 'true',
+        'sash_length_ratio': '1.20',
+        'sash_height_ratio': '0.135',
+        'badge_display_mode': '0',
+    },
+    'ratingbar_notch': {
+        'primary_client': 'stremio_tv_nuvio',
+        'top_gradient': 'medium',
+        'top_vignette_sash_only': 'true',
+        'fallback_to_imdb': 'true',
+        'imdb_rating_source': 'fallback',
+        'tmdb_rating_source': 'fallback',
+        'frost_reference': 'true',
+        'movie_weights': 'letterboxd:0.99,trakt:0.01',
+        'tv_weights': 'trakt:0.80,tomatoes:0.20',
+        'fallback_bg_style': 'photoreal',
+        'logo_max_h_ratio': '0.20',
+        'logo_bottom_ratio': '0.23',
+        'logo_bottom_anchor': 'true',
+        'sash_mode': 'notch',
+        'sash_badge_size_w': '1.80',
+        'sash_badge_size_h': '1.20',
+        'sash_badge_inset': '0.000',
+        'sash_badge_font_ratio': '0.46',
+        'badge_display_mode': '0',
+    },
+    'ratingbar_sash': {
+        'primary_client': 'stremio_tv_nuvio',
+        'top_gradient': 'medium',
+        'top_vignette_sash_only': 'true',
+        'fallback_to_imdb': 'true',
+        'imdb_rating_source': 'fallback',
+        'tmdb_rating_source': 'fallback',
+        'frost_reference': 'true',
+        'movie_weights': 'letterboxd:0.99,trakt:0.01',
+        'tv_weights': 'trakt:0.80,tomatoes:0.20',
+        'fallback_bg_style': 'photoreal',
+        'logo_max_h_ratio': '0.20',
+        'logo_bottom_ratio': '0.23',
+        'logo_bottom_anchor': 'true',
+        'sash_length_ratio': '1.20',
+        'sash_height_ratio': '0.135',
+        'badge_display_mode': '0',
+    },
+    'clean_notch': {
+        'primary_client': 'stremio_tv_nuvio',
+        'top_gradient': 'medium',
+        'top_vignette_sash_only': 'true',
+        'fallback_to_imdb': 'true',
+        'imdb_rating_source': 'fallback',
+        'tmdb_rating_source': 'fallback',
+        'rating_display_mode': '2',
+        'frost_reference': 'true',
+        'numeric_score_font_size_ratio': '0.090',
+        'numeric_score_y_offset': '0.91',
+        'movie_weights': 'letterboxd:0.99,trakt:0.01',
+        'tv_weights': 'trakt:0.80,tomatoes:0.20',
+        'fallback_bg_style': 'photoreal',
+        'logo_max_h_ratio': '0.20',
+        'logo_bottom_ratio': '0.21',
+        'logo_bottom_anchor': 'true',
+        'sash_mode': 'notch',
+        'sash_badge_size_w': '1.80',
+        'sash_badge_size_h': '1.20',
+        'sash_badge_inset': '0.000',
+        'sash_badge_font_ratio': '0.46',
+        'badge_display_mode': '0',
+    },
+    'clean_sash': {
+        'primary_client': 'stremio_tv_nuvio',
+        'top_gradient': 'medium',
+        'top_vignette_sash_only': 'true',
+        'fallback_to_imdb': 'true',
+        'imdb_rating_source': 'fallback',
+        'tmdb_rating_source': 'fallback',
+        'rating_display_mode': '2',
+        'frost_reference': 'true',
+        'numeric_score_font_size_ratio': '0.090',
+        'numeric_score_y_offset': '0.91',
+        'movie_weights': 'letterboxd:0.99,trakt:0.01',
+        'tv_weights': 'trakt:0.80,tomatoes:0.20',
+        'fallback_bg_style': 'photoreal',
+        'logo_max_h_ratio': '0.20',
+        'logo_bottom_ratio': '0.21',
+        'logo_bottom_anchor': 'true',
+        'sash_length_ratio': '1.20',
+        'sash_height_ratio': '0.135',
+        'badge_display_mode': '0',
+    },
+    'mini_sash_oa': {
+        'primary_client': 'stremio_tv_nuvio',
+        'top_gradient': 'low',
+        'bottom_gradient': 'medium',
+        'top_vignette_sash_only': 'true',
+        'fallback_to_imdb': 'true',
+        'imdb_rating_source': 'fallback',
+        'tmdb_rating_source': 'fallback',
+        'rating_display_mode': '3',
+        'minimalist_mode_font_size_ratio': '0.060',
+        'minimalist_mode_font_x_offset': '0.065',
+        'movie_weights': 'letterboxd:0.99,trakt:0.01',
+        'tv_weights': 'trakt:0.80,tomatoes:0.20',
+        'use_original_art': 'true',
+        'fallback_bg_style': 'photoreal',
+        'logo_max_h_ratio': '0.20',
+        'logo_bottom_ratio': '0.23',
+        'logo_bottom_anchor': 'true',
+        'sash_length_ratio': '1.20',
+        'sash_height_ratio': '0.135',
+        'badge_display_mode': '0',
+    },
+    'bar_notch_oa': {
+        'primary_client': 'stremio_tv_nuvio',
+        'top_gradient': 'medium',
+        'bottom_gradient': 'low',
+        'top_vignette_sash_only': 'true',
+        'fallback_to_imdb': 'true',
+        'imdb_rating_source': 'fallback',
+        'tmdb_rating_source': 'fallback',
+        'rating_display_mode': '4',
+        'frost_reference': 'true',
+        'bar_bottom_inset': '0.000',
+        'movie_weights': 'letterboxd:0.99,trakt:0.01',
+        'tv_weights': 'trakt:0.80,tomatoes:0.20',
+        'use_original_art': 'true',
+        'fallback_bg_style': 'photoreal',
+        'logo_max_h_ratio': '0.20',
+        'logo_bottom_ratio': '0.23',
+        'logo_bottom_anchor': 'true',
+        'sash_mode': 'notch',
+        'sash_badge_size_w': '1.80',
+        'sash_badge_size_h': '1.20',
+        'sash_badge_inset': '0.000',
+        'sash_badge_font_ratio': '0.46',
+        'badge_display_mode': '0',
+    },
+
+    # --- Retired ids, kept resolvable ------------------------------------
+    # v1.2.0 replaced the gallery outright: new ids, new params, new
+    # screenshots. Eight of the ten ids below are gone from it.
+    #
+    # They stay here because a preset id is not an internal name in this
+    # fork — it is a public URL. /p/black_rating_bar_oa/movie/tt0133093.jpg
+    # is sitting in metadata addon configs we do not control, and deleting
+    # the id turns every one of those into a 404. They keep their v1.1.0
+    # params, so an existing URL keeps rendering the look it has always
+    # rendered rather than silently becoming a different poster.
+    #
+    # They are deliberately absent from preset_catalog(), so the locked-mode
+    # UI offers only the current ten — and does not link screenshots that
+    # v1.2.0 deleted. clean_notch and clean_sash are NOT repeated here: they
+    # are still gallery ids, so they track the current definitions above. (A
+    # dict literal keeps the LAST duplicate key, so listing them here too
+    # would silently revert both cards to their v1.1.0 looks.)
     'prestige_rating_bar': {
         'primary_client': 'stremio_tv_nuvio',
         'top_gradient': 'medium',
@@ -116,72 +374,6 @@ PRESETS: dict[str, dict[str, str]] = {
         'badge_anchor_x': '0.060',
         'badge_anchor_y': '0.045',
         'badge_min_score': '5',
-    },
-    'clean_sash': {
-        'primary_client': 'stremio_tv_nuvio',
-        'top_gradient': 'medium',
-        'bottom_gradient': 'high',
-        'fallback_to_imdb': 'true',
-        'rating_display_mode': '2',
-        'numeric_score_font_size_ratio': '0.100',
-        'numeric_score_y_offset': '0.90',
-        'score_out_of_10': 'false',
-        'movie_weights': 'letterboxd:0.99,trakt:0.01,tomatoes:0.00,popcorn:0.00,imdb:0.00,metacritic:0.00,metacriticuser:0.00,tmdb:0.00,rogerebert:0.00,myanimelist:0.00',
-        'tv_weights': 'trakt:0.80,tomatoes:0.20,popcorn:0.00,imdb:0.00,metacritic:0.00,metacriticuser:0.00,tmdb:0.00,myanimelist:0.00',
-        'textless': 'false',
-        'use_original_art': 'false',
-        'original_art_source': 'primary',
-        'logo_language': 'en',
-        'logo_priority': 'native_original',
-        'fallback_bg_style': 'photoreal',
-        'logo_max_w_ratio': '0.75',
-        'logo_max_h_ratio': '0.25',
-        'logo_bottom_ratio': '0.28',
-        'sash_mode': 'sash',
-        'cinema_greyscale': 'true',
-        'cinema_greyscale_skip_if_available': 'false',
-        'release_status_cinema_only': 'true',
-        'muted': 'false',
-        'sash_poster_color': 'false',
-        'sash_length_ratio': '1.20',
-        'sash_height_ratio': '0.135',
-        'sash_priority': 'wins,gg_wins,festival,pic_noms,gg_noms,studio,director,cast,trending,cult,foreign,new_release,metacritic,true_story,structural,release_status',
-        'badge_display_mode': '1',
-        'badge_height': '36',
-        'badge_anchor_x': '0.060',
-        'badge_anchor_y': '0.055',
-        'badge_min_score': '2',
-    },
-    'clean_notch': {
-        'top_gradient': 'medium',
-        'bottom_gradient': 'high',
-        'fallback_to_imdb': 'true',
-        'rating_display_mode': '2',
-        'numeric_score_font_size_ratio': '0.100',
-        'numeric_score_y_offset': '0.90',
-        'score_out_of_10': 'false',
-        'movie_weights': 'letterboxd:0.99,trakt:0.01,tomatoes:0.00,popcorn:0.00,imdb:0.00,metacritic:0.00,metacriticuser:0.00,tmdb:0.00,rogerebert:0.00,myanimelist:0.00',
-        'tv_weights': 'trakt:0.80,tomatoes:0.20,popcorn:0.00,imdb:0.00,metacritic:0.00,metacriticuser:0.00,tmdb:0.00,myanimelist:0.00',
-        'textless': 'false',
-        'use_original_art': 'false',
-        'original_art_source': 'primary',
-        'logo_language': 'en',
-        'logo_priority': 'native_original',
-        'fallback_bg_style': 'photoreal',
-        'logo_max_w_ratio': '0.75',
-        'logo_max_h_ratio': '0.25',
-        'logo_bottom_ratio': '0.28',
-        'show_award_sash': 'true',
-        'sash_badge': 'true',
-        'sash_badge_style': 'frosted',
-        'sash_badge_size_w': '1.40',
-        'sash_badge_size_h': '1.20',
-        'sash_badge_font_ratio': '0.43',
-        'sash_badge_frost_opacity': '0.75',
-        'sash_priority': 'wins,gg_wins,festival,pic_noms,gg_noms,studio,director,cast,trending,cult,foreign,new_release,metacritic,true_story,structural,release_status',
-        'badge_display_mode': '0',
-        'cinema_greyscale': 'true',
-        'release_status_cinema_only': 'true',
     },
     'mini': {
         'primary_client': 'stremio_tv_nuvio',
@@ -388,16 +580,16 @@ PRESETS: dict[str, dict[str, str]] = {
 }
 
 _PRESET_META: dict[str, dict[str, str]] = {
-    'prestige_rating_bar': {'name': 'Prestige Rating Bar', 'description': 'Classic Posters+ design featuring a score bar using the prestige score palette, which uses grey, bronze and gold. Paired with the info sash and horizontal badge row.', 'screenshot': '/static/presets/prestige_rating_bar.jpg'},
-    'light_rating_bar': {'name': 'Light Rating Bar', 'description': 'Featuring a score bar using a light score palette of red, yellow, green and purple. Info is displayed as a frosted notch at the top of the poster.', 'screenshot': '/static/presets/light_rating_bar.jpg'},
-    'clean_sash': {'name': 'Clean Sash', 'description': 'Genre and rating at the bottom in text, quality displayed as an age rating.', 'screenshot': '/static/presets/clean_sash.jpg'},
-    'clean_notch': {'name': 'Clean Notch', 'description': 'Genre and rating at the bottom in text, with a frosted notch at the top.', 'screenshot': '/static/presets/clean_notch.jpg'},
-    'mini': {'name': 'Minimalist', 'description': 'Very compact mode. The separator color conveys rating using the light palette. In the top left you can find a small notch that reflects the quality.', 'screenshot': '/static/presets/mini.jpg'},
-    'frosted_notch': {'name': 'Frosted', 'description': "Both the bar and notch will reflect the poster's color, resulting in some beautifully colorful designs. Maintains a low footprint to show off as much of the art as possible.", 'screenshot': '/static/presets/frosted_notch.jpg'},
-    'black_rating_bar_light_notch': {'name': 'Black Rating Bar', 'description': 'A black bar displaying genre, rating and year with an adaptive rating bar that uses red, yellow, green and purple.', 'screenshot': '/static/presets/black_rating_bar_light_notch.jpg'},
-    'black_rating_bar_oa': {'name': 'Black Rating Bar OA', 'description': 'Black rating bar that swaps between red, yellow, green and purple based on score. Ideal preset if you enjoy the original art, rather than textless with a logo overlay. Uses very low vignette for maximum brightness.', 'screenshot': '/static/presets/black_rating_bar_oa.jpg'},
-    'frosted_rating_bar_oa': {'name': 'Frosted Rating Bar OA', 'description': 'Frosted bar with a silver rating accent bar. Displays the genre, info sash and rating in one place while taking up the least amount of space. Uses the original art with very low vignette for maximum brightness.', 'screenshot': '/static/presets/frosted_rating_bar_oa.jpg'},
-    'mini_oa': {'name': 'Minimalist OA', 'description': 'Minimalist mode and sash allow maximum compatibility with busy original art posters. The separator color conveys the approximate rating.', 'screenshot': '/static/presets/mini_oa.jpg'},
+    'tinted_mini_notch': {'name': 'Tinted Minimalist Notch', 'description': 'Tinted vignette with minimal rating mode displaying the rating color (gold, silver, bronze) genre and year. A matching notch at the top displays interesting information.', 'screenshot': '/static/presets/preset1.webp'},
+    'tinted_mini_sash': {'name': 'Tinted Minimalist Sash', 'description': 'Tinted vignette with minimal rating mode displaying the rating color (gold, silver, bronze) genre and year. A sash at the top displays interesting information, color matched to sash type.', 'screenshot': '/static/presets/preset2.webp'},
+    'bar_notch': {'name': 'Bar with matching notch', 'description': 'Notch and bar sampled from the posters colour, clean and easy to read.', 'screenshot': '/static/presets/preset3.webp'},
+    'bar_sash': {'name': 'Bar with matching sash', 'description': 'Sash and bar sampled from the posters colour, clean and easy to read.', 'screenshot': '/static/presets/preset4.webp'},
+    'ratingbar_notch': {'name': 'Rating Bar with Notch', 'description': 'The bar at the bottom is colored based on the rating for "at a glance" ratings, along with a notch sampled from the posters colour at the top.', 'screenshot': '/static/presets/preset5.webp'},
+    'ratingbar_sash': {'name': 'Rating Bar with Sash', 'description': 'The bar at the bottom is colored based on the rating for "at a glance" ratings, along with a sash colored based on the sash type at the top.', 'screenshot': '/static/presets/preset6.webp'},
+    'clean_notch': {'name': 'Clean Notch', 'description': 'Clear genre and rating text with a notch at the top sampled from the posters colour.', 'screenshot': '/static/presets/preset7.webp'},
+    'clean_sash': {'name': 'Clean Sash', 'description': 'Clean genre and rating text with a sash at the top, the colour is based on sash type.', 'screenshot': '/static/presets/preset8.webp'},
+    'mini_sash_oa': {'name': 'Original Art - Mini & Sash', 'description': 'Uses the original art mode with a minimal rating and sash that attempt to stay out of the way.', 'screenshot': '/static/presets/preset9.webp'},
+    'bar_notch_oa': {'name': 'Original Art - Bar & Notch', 'description': 'Uses the original art mode with a bar rating and notch that attempt to stay out of the way.', 'screenshot': '/static/presets/preset10.webp'},
 }
 
 

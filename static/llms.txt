@@ -4,26 +4,30 @@
 
 Posters+ runs in two postures:
 
-- **Public hosted** (this instance): anonymous, preset-only. Six fixed visual presets reachable at `/p/{preset}/{type}/{imdb_id}.jpg`. Free.
+- **Public hosted** (this instance): anonymous, preset-only. 10 fixed visual presets reachable at `/p/{preset}/{type}/{imdb_id}.jpg`. Free.
 - **Private managed**: full per-poster customisation (sliders, weights, sash priority, language, logo controls). Available via ElfHosted.
 - **Self-host**: the upstream open-source project is on GitHub.
 
 ## Endpoints
 
-- `GET /p/{preset}/{type}/{imdb_id}.jpg` — anonymous preset URL. `preset` is one of: default, awards, minimalist, letterboxd, cinephile, quality. `type` is `movie` or `tv`. CDN-cacheable, no per-user keys.
+- `GET /p/{preset}/{type}/{id}.jpg[?shape=landscape]` — anonymous preset URL. `id` is an IMDb id (`tt0111161`) or a TMDB id, bare (`278`) or namespaced (`tmdb:278`); `shape=landscape` renders the 16:9 layout (Nuvio's `{shape}` placeholder fills this). `preset` is one of: tinted_mini_notch, tinted_mini_sash, bar_notch, bar_sash, ratingbar_notch, ratingbar_sash, clean_notch, clean_sash, mini_sash_oa, bar_notch_oa. `type` is `movie` or `tv`. CDN-cacheable, no per-user keys.
 - `GET /poster?...` — full per-poster configuration via query params. Requires `access_key` on instances with `ACCESS_KEY` configured.
 - `GET /server-caps` — instance capability report (which keys are configured, whether presets are enabled, preset list).
 
 ## Presets
 
-| Name         | Look                                                        |
-| ------------ | ----------------------------------------------------------- |
-| default      | Standard rendering — score bar, genre, sash if applicable.  |
-| awards       | Sash-forward — score hidden, prestige sash dominates.       |
-| minimalist   | Small genre text bottom-right, no score bar.                |
-| letterboxd   | Numeric score weighted to Letterboxd, no sash.              |
-| cinephile    | Prestige sash priority (festival before commercial).        |
-| quality      | Score visible + cached quality badges (4K, HDR, etc).       |
+| Id | Name | Look |
+| --- | --- | --- |
+| tinted_mini_notch  | Tinted Minimalist Notch      | Tinted vignette with minimal rating mode displaying the rating color (gold, silver, bronze) genre and year. A matching notch at the top displays interesting information. |
+| tinted_mini_sash   | Tinted Minimalist Sash       | Tinted vignette with minimal rating mode displaying the rating color (gold, silver, bronze) genre and year. A sash at the top displays interesting information, color matched to sash type. |
+| bar_notch          | Bar with matching notch      | Notch and bar sampled from the posters colour, clean and easy to read. |
+| bar_sash           | Bar with matching sash       | Sash and bar sampled from the posters colour, clean and easy to read. |
+| ratingbar_notch    | Rating Bar with Notch        | The bar at the bottom is colored based on the rating for "at a glance" ratings, along with a notch sampled from the posters colour at the top. |
+| ratingbar_sash     | Rating Bar with Sash         | The bar at the bottom is colored based on the rating for "at a glance" ratings, along with a sash colored based on the sash type at the top. |
+| clean_notch        | Clean Notch                  | Clear genre and rating text with a notch at the top sampled from the posters colour. |
+| clean_sash         | Clean Sash                   | Clean genre and rating text with a sash at the top, the colour is based on sash type. |
+| mini_sash_oa       | Original Art - Mini & Sash   | Uses the original art mode with a minimal rating and sash that attempt to stay out of the way. |
+| bar_notch_oa       | Original Art - Bar & Notch   | Uses the original art mode with a bar rating and notch that attempt to stay out of the way. |
 
 ## Rating sources
 
@@ -49,4 +53,4 @@ Posters+ aggregates from MDBList (IMDB, Rotten Tomatoes, Letterboxd, Metacritic,
 
 ## License
 
-MIT (upstream). ElfHosted fork inherits the same.
+GNU Affero General Public License v3.0 (upstream). The ElfHosted fork inherits the same.

@@ -1,0 +1,57 @@
+name: PR Base Guard
+
+# main is release-only: it moves by a dev -> main merge at release time, never
+# by a contributor PR.  GitHub cannot restrict which base branch a PR may be
+# opened against, so this closes the mistargeted ones with an explanation
+# instead.  Contributors keep their commits — reopening against dev is a
+# two-click edit of the base branch, which the comment spells out.
+#
+# pull_request_target (not pull_request) for two reasons: fork PRs get a
+# read-only token on pull_request, and this needs to comment and close; and
+# pull_request_target evaluates the workflow from the BASE branch, so this file
+# must exist on main to have any effect.  Nothing here checks out or executes
+# PR code, so running in the base-repo context carries no untrusted-code risk.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, edited]
+    branches:
+      - main
+
+permissions:
+  pull-requests: write
+
+jobs:
+  guard:
+    # Allowed into main: dev, and hotfix/* for the occasional urgent patch —
+    # both from this repo, never from a fork.  "edited" also fires when someone
+    # retargets an existing PR onto main, which is caught here too; the state
+    # check keeps a title edit on an already-closed PR from re-commenting.
+    if: >-
+      github.event.pull_request.state == 'open' &&
+      (github.event.pull_request.head.repo.full_name != github.repository ||
+       (github.event.pull_request.head.ref != 'dev' &&
+        !startsWith(github.event.pull_request.head.ref, 'hotfix/')))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write explanation
+        run: |
+          cat > /tmp/body.md <<'EOF'
+          Thanks for the contribution! This PR targets `main`, which this repo keeps for releases only — it moves by a `dev` -> `main` merge when a version ships, so a PR into it can never be merged as-is. All contributions go into `dev`.
+
+          Nothing is lost and you don't need to redo any work. To fix it:
+
+          1. Reopen this PR (button below), then click **Edit** next to the title.
+          2. Change the base branch from `main` to `dev`.
+
+          That's it — same commits, right target. Sorry for the automated close; this fires before a human sees it.
+          EOF
+
+      - name: Comment and close
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr comment "$PR" --repo "$REPO" --body-file /tmp/body.md
+          gh pr close "$PR" --repo "$REPO"

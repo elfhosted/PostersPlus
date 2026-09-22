@@ -8,7 +8,7 @@ services:
         # BAKE_PPOCR_MODEL=false in your .env for a lean image that downloads the
         # model once at runtime instead.
         BAKE_PPOCR_MODEL: "${BAKE_PPOCR_MODEL:-true}"
-    image: PostersPlus
+    image: postersplus
     ports:
       - "8000:8000"
     restart: unless-stopped
@@ -26,6 +26,12 @@ services:
     environment: 
       - TMDB_API_KEY=${TMDB_API_KEY:-}
       - MDBLIST_API_KEY=${MDBLIST_API_KEY:-}
+      - TVDB_API_KEY=${TVDB_API_KEY:-}
+      - TVDB_SUBSCRIBER_PIN=${TVDB_SUBSCRIBER_PIN:-}
+      - TVDB_USE_LOGOS=${TVDB_USE_LOGOS:-true}
+      - TVDB_USE_BACKDROPS=${TVDB_USE_BACKDROPS:-true}
+      - TVDB_USE_POSTERS=${TVDB_USE_POSTERS:-false}
+      - TVDB_LOGO_PRIORITY=${TVDB_LOGO_PRIORITY:-3}
       - ACCESS_KEY=${ACCESS_KEY:-}
       - WORKERS=${WORKERS:-1}
       - TEXTLESS_DETECTION_CONCURRENCY=${TEXTLESS_DETECTION_CONCURRENCY:-2}
@@ -58,9 +64,12 @@ services:
     # The image runs as the non-root uid 568; the named volume below is seeded
     # writable for it automatically (see the volumes: note).
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/live')"]
+      # Exec form (no shell) so a probe that overruns is killed outright rather
+      # than leaving an orphaned python3 behind; see the HEALTHCHECK note in
+      # the dockerfile.
+      test: ["CMD", "python3", "-c", "import http.client; c = http.client.HTTPConnection('localhost', 8000, timeout=8); c.request('GET', '/health'); r = c.getresponse(); raise SystemExit(0 if r.status == 200 else 1)"]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
       start_period: 15s
 

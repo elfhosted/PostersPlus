@@ -22,7 +22,10 @@ data:
   OBJECT_STORE_PUBLIC_URL: "https://cdn.example.com/postersplus"
 
   # Phase 4 — cap renders, return 503 after 30s queue wait
-  RENDER_CONCURRENCY: "4"
+  # Upstream's render-admission cap (v1.2.0+). Gates the whole render
+  # pipeline, not just the Pillow encode, so it supersedes the fork's older
+  # RENDER_CONCURRENCY — which is still honoured as an alias if set.
+  POSTER_RENDER_CONCURRENCY: "4"
   RENDER_QUEUE_TIMEOUT: "30"
 
   # Phase 6

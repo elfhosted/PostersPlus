@@ -21,11 +21,13 @@ logger = logging.getLogger(__name__)
 _PUBLIC_API = (
     "init_db",
     "prune_caches",
+    "prune_local_caches",
     "ping",
     "close",
     "get_cached_final_poster",
     "get_cached_final_poster_url",
     "is_cached_final_poster_fresh",
+    "get_cached_final_poster_redirect",
     "set_cached_final_poster",
     "get_cached_rating",
     "set_cached_rating",
@@ -51,6 +53,23 @@ _PUBLIC_API = (
     "get_cached_text_detection",
     "set_cached_text_detection",
     "get_cache_stats",
+    # Upstream v1.2.0 additions:
+    "get_cached_final_poster_entry",
+    "delete_cached_final_poster",
+    "invalidate_final_posters",
+    "composite_l1_stats",
+    "release_status_ttl_seconds",
+    "release_status_expiry",
+    "get_cached_movie_release_info",
+    "set_cached_movie_release_info",
+    "get_cached_tvdb_json",
+    "set_cached_tvdb_json",
+    "get_app_state",
+    "set_app_state",
+    "claim_app_state_slot",
+    # Fork addition: upstream reaches for cache.get_db() to run this one query
+    # from the trending refresh, which only works against SQLite.
+    "list_composite_request_params",
 )
 
 

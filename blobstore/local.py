@@ -9,7 +9,9 @@ by disk reads on a slow volume.
 """
 import asyncio
 import logging
+import contextlib
 import os
+import tempfile
 import time
 
 logger = logging.getLogger(__name__)
@@ -80,11 +82,25 @@ def _put_sync(bucket: str, key: str, data: bytes) -> None:
     path = _safe_path(base, key)
     try:
         os.makedirs(os.path.dirname(path) or base, exist_ok=True)
-        # Atomic write: temp file in same dir, then rename.
-        tmp_path = f"{path}.tmp"
-        with open(tmp_path, "wb") as f:
-            f.write(data)
-        os.replace(tmp_path, path)
+        # Atomic write: temp file in the same dir, then rename.
+        #
+        # The temp name must be unique per writer, not derived from the key.
+        # Render coalescing is process-local, so with WORKERS>1 two processes
+        # can composite the same key at once; sharing one "<key>.tmp" meant one
+        # writer truncating the other's file mid-write, or still appending to
+        # an inode the other had already renamed into place — publishing a
+        # torn image under a key the cache now reports as valid.
+        fd, tmp_path = tempfile.mkstemp(
+            dir=os.path.dirname(path) or base, prefix=".tmp-", suffix=".blob"
+        )
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp_path, path)
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+            raise
     except Exception as exc:
         # Propagate so set_cached_final_poster can skip writing the
         # metadata row. Same contract as the S3 backend — a metadata

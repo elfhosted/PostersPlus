@@ -31,6 +31,9 @@ Thumbs.db
 # Claude Code local state (machine-specific permissions)
 .claude/
 
+# Cached Wikipedia/Wikidata responses for tools/audit_festival_winners.py
+tools/.audit-cache/
+
 # ElfHosted fork: local runtime artifacts (caches, prometheus multiproc, sqlite)
 .local-cache/
 postersplus-prom/
