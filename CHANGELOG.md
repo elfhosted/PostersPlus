@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.2.0-elf.3](https://github.com/elfhosted/PostersPlus/compare/v1.2.0-elf.2...v1.2.0-elf.3) (2026-09-22)
+
+
+### Bug Fixes
+
+* burned-in-text detection off by default ([b376fff](https://github.com/elfhosted/PostersPlus/commit/b376fffaaeb0dd6807db17bd3f03290ba6c43503))
+* burned-in-text detection off by default ([df1febc](https://github.com/elfhosted/PostersPlus/commit/df1febcf4ed71ac0e9eaaa6d6fa817f3c938029c))
+
+
+### Miscellaneous Chores
+
+* release 1.2.0-elf.3 ([dacdb7d](https://github.com/elfhosted/PostersPlus/commit/dacdb7dcc9ec740fe5de4ba64a192d8e34ccfede))
+
 ## [1.2.0-elf.2](https://github.com/elfhosted/PostersPlus/compare/v1.2.0-elf.1...v1.2.0-elf.2) (2026-09-22)
 
 
