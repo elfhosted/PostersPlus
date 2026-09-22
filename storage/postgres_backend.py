@@ -13,6 +13,7 @@ Phase 10 split (matches the SQLite backend):
     backups / replication stream as BYTEA. This module keeps only the
     cache metadata row.
 """
+import asyncio
 import logging
 import os
 import time
@@ -37,6 +38,7 @@ from config import (
     TMDB_POSTER_CACHE_DURATION,
     TMDB_LOGO_CACHE_DIR,
     TMDB_LOGO_CACHE_DURATION,
+    TMDB_IMAGE_CACHE_JITTER_DAYS,
     TMDB_METADATA_CACHE_DURATION,
     COMPOSITE_CACHE_TTL,
     COMPOSITE_CACHE_TTL_JITTER,
@@ -45,6 +47,7 @@ from config import (
     QUALITY_OLD_CACHE_DURATION,
     DIGITAL_RELEASE_MAX_AGE_DAYS,
     RATING_MIN_VOTES,
+    IMAGE_FORMAT as _IMAGE_FORMAT,
 )
 from festivals import LEGACY_LABEL_KEYWORDS
 
@@ -69,6 +72,7 @@ from storage.sqlite_backend import (
     release_status_expiry,
     _safe_cache_path,
     _remove_if_dir,
+    _prune_file_cache,
     get_cached_tmdb_poster,
     set_cached_tmdb_poster,
     get_cached_tmdb_logo,
@@ -499,10 +503,22 @@ async def set_cached_final_poster(
     try:
         # Write bytes first so the metadata row is never present without
         # a backing blob.
-        await blobstore.put(
-            blobstore.BUCKET_COMPOSITES, cache_key, jpeg_bytes,
-            content_type="image/jpeg",
-        )
+        # The composite is encoded in config.IMAGE_FORMAT (webp by default),
+        # not necessarily JPEG. Hardcoding image/jpeg here put the wrong
+        # Content-Type on every object, which the app never noticed because it
+        # re-serves the bytes itself — but a CDN redirect hands the object
+        # straight to the browser with whatever type S3 stored.
+        # The key lock is held across the put and the note_write so a drain
+        # cannot delete this blob between the two. note_write cancels any
+        # delete an earlier invalidation queued for this key — the trending
+        # refresh invalidates and immediately re-renders, and without it the
+        # next drain would remove the replacement.
+        async with blobstore.key_lock(blobstore.BUCKET_COMPOSITES, cache_key):
+            await blobstore.put(
+                blobstore.BUCKET_COMPOSITES, cache_key, jpeg_bytes,
+                content_type=f"image/{_IMAGE_FORMAT}",
+            )
+            blobstore.note_write(blobstore.BUCKET_COMPOSITES, cache_key)
 
         # L1 only after the durable write succeeds: an L1 entry whose blob
         # never landed would serve this replica a poster the rest of the fleet
@@ -656,6 +672,29 @@ def list_composite_request_params() -> list[tuple[str, str]]:
 
 
 async def prune_caches() -> None:
+    """Prune every cache, without stalling the event loop.
+
+    Same split as the SQLite backend: the relational deletes and the local
+    filesystem sweep are synchronous and can be slow on a large cache, so they
+    run on an executor thread. The pool is thread-safe, so unlike SQLite there
+    is no per-thread connection to tidy up afterwards. Only the blob-store work
+    stays on the loop.
+    """
+    expired_composite_keys = await asyncio.to_thread(_prune_sync)
+
+    # Best-effort blob deletion for the expired composite rows, plus anything
+    # the synchronous delete/invalidate paths queued since the last sweep.
+    for k in expired_composite_keys:
+        try:
+            await blobstore.delete(blobstore.BUCKET_COMPOSITES, k)
+        except Exception as exc:
+            logger.warning(f"Composite blob delete error for {k}: {exc}")
+    await blobstore.drain_deferred_deletes()
+    blobstore._forget_generations_if_idle()
+
+
+def _prune_sync() -> list[str]:
+    """Relational + filesystem pruning. Runs on an executor thread."""
     now = int(time.time())
     expired_composite_keys: list[str] = []
     try:
@@ -753,20 +792,24 @@ async def prune_caches() -> None:
             conn.commit()
         # Postgres autovacuum handles space reclamation — no explicit VACUUM here.
 
-        # Phase 10: best-effort blob deletion for evicted composite rows,
-        # outside the connection-pool ctx so a slow S3 doesn't hold the
-        # connection.
-        for k in expired_composite_keys:
-            try:
-                await blobstore.delete(blobstore.BUCKET_COMPOSITES, k)
-            except Exception as exc:
-                logger.warning(f"Composite blob delete error for {k}: {exc}")
-
-        # Anything the synchronous delete/invalidate paths queued since the
-        # last sweep.
-        await blobstore.drain_deferred_deletes()
+        # TMDB poster/logo bytes are a per-POD filesystem cache on this backend
+        # too (see the module docstring) — only the relational data is shared.
+        # Without this they were never swept on Postgres deployments, so a
+        # long-running pod grew artwork for every title it ever rendered,
+        # ignoring the configured TTLs entirely. Same jitter allowance as the
+        # SQLite backend, so prune never deletes a file the read path would
+        # still consider fresh.
+        _prune_file_cache(
+            TMDB_POSTER_CACHE_DIR,
+            TMDB_POSTER_CACHE_DURATION + TMDB_IMAGE_CACHE_JITTER_DAYS / 2,
+        )
+        _prune_file_cache(
+            TMDB_LOGO_CACHE_DIR,
+            TMDB_LOGO_CACHE_DURATION + TMDB_IMAGE_CACHE_JITTER_DAYS / 2,
+        )
     except Exception as exc:
         logger.error(f"Cache prune error: {exc}")
+    return expired_composite_keys
 
 
 # ---------------------------------------------------------------------------

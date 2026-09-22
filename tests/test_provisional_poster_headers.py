@@ -189,13 +189,22 @@ class CoalescedRenderTests(unittest.TestCase):
         """
         seen = []
         with TestClient(main.app) as client:
-            main.get_cached_final_poster_entry = lambda key: (
-                seen.append(key), (b"jpeg", int(time.time()) + 3600)
-            )[1]
+            # ElfHosted fork: composite bytes live in the blobstore, so this
+            # is a coroutine here and the call site awaits it. A sync lambda
+            # raises "'tuple' object can't be awaited" before the coalescing
+            # this test is about ever runs.
+            async def _hit(key):
+                seen.append(key)
+                return (b"jpeg", int(time.time()) + 3600)
+
+            main.get_cached_final_poster_entry = _hit
             self.assertEqual(client.get("/poster", params=self.PARAMS).status_code, 200)
             key = seen[0]
 
-            main.get_cached_final_poster_entry = lambda _key: None
+            async def _miss(_key):
+                return None
+
+            main.get_cached_final_poster_entry = _miss
 
             async def _seed():
                 fut = asyncio.get_running_loop().create_future()

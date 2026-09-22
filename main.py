@@ -575,8 +575,24 @@ def _mark_mdblist_rate_limit(
     return backoff_secs, _next_mdblist_server_key(key, now)
 
 
-async def _publish_fleet_mdblist_cooldown(backoff_secs: float) -> None:
-    """ElfHosted fork: raise a fleet-wide MDBList cooldown.
+def _fleet_cooldown_id(mdblist_key: str) -> str | None:
+    """Coordination key for a credential's shared cooldown, or None if it has
+    no fleet-wide meaning.
+
+    Only the OPERATOR's configured keys are shared across replicas, so only
+    they get one. A request-supplied key belongs to one tenant: its quota
+    running out says nothing about anyone else's, and cooling the fleet on it
+    would let any user with an exhausted key stop rating lookups for everyone.
+
+    The identity is hashed so the credential never reaches Redis in clear.
+    """
+    if not mdblist_key or mdblist_key not in _cfg.SERVER_MDBLIST_KEYS:
+        return None
+    return hashlib.sha256(mdblist_key.encode("utf-8")).hexdigest()[:16]
+
+
+async def _publish_fleet_mdblist_cooldown(mdblist_key: str, backoff_secs: float) -> None:
+    """ElfHosted fork: raise a fleet-wide cooldown for ONE MDBList credential.
 
     _mark_mdblist_rate_limit records the 429 in this process's dicts, which is
     all a single-instance deploy needs. Across replicas sharing the same keys,
@@ -585,15 +601,37 @@ async def _publish_fleet_mdblist_cooldown(backoff_secs: float) -> None:
     stop. Publishing it means the first replica to be refused backs the rest
     off too.
 
+    Per credential, not fleet-wide-for-everything: MDBList quota is per key and
+    v1.2.0 rotates between several. A single shared flag would let one
+    exhausted key disable the healthy siblings rotation had just selected —
+    turning a working failover into a fleet-wide outage for up to the 24h a
+    quota cooldown can last.
+
     A no-op beyond the per-process cooldown on the in-process coordinator, and
     never fatal: failing to publish a cooldown must not fail the request that
     was merely unlucky enough to hit the 429.
     """
+    cooldown_id = _fleet_cooldown_id(mdblist_key)
+    if cooldown_id is None:
+        return
     with suppress(Exception):
         await coord.set_backoff(
-            coord.NS_MDBLIST_GLOBAL_COOLDOWN, coord.MDBLIST_GLOBAL_KEY,
+            coord.NS_MDBLIST_GLOBAL_COOLDOWN, cooldown_id,
             ttl_seconds=backoff_secs,
         )
+
+
+async def _fleet_mdblist_cooling(mdblist_key: str) -> bool:
+    """True when a sibling replica has already been 429'd on this credential."""
+    cooldown_id = _fleet_cooldown_id(mdblist_key)
+    if cooldown_id is None:
+        return False
+    try:
+        return await coord.is_backoff_active(
+            coord.NS_MDBLIST_GLOBAL_COOLDOWN, cooldown_id
+        )
+    except Exception:
+        return False
 
 
 def _warm_mdblist_key_with_quota(current_key: str, now: float, reserve: int) -> str | None:
@@ -679,6 +717,7 @@ from cache import (
     get_cached_tmdb_metadata,
     get_cached_text_detection,
     set_cached_text_detection,
+    get_cached_release_status,
     init_db,
     is_digital_release,
     set_cached_rating,
@@ -3649,6 +3688,15 @@ async def _cache_prune_loop() -> None:
             else:
                 logger.debug("Cache prune skipped — another replica holds the lease")
 
+            # The deferred blob-delete queue is process-local, but ANY worker
+            # can fill it — every invalidation this process performs lands
+            # here. Draining it only inside the leader's prune would let a
+            # follower's queue grow until it hit its cap and started discarding
+            # keys, orphaning those objects for good. Leadership decides who
+            # prunes the shared database, not who cleans up after itself.
+            await blobstore.drain_deferred_deletes()
+            blobstore._forget_generations_if_idle()
+
             # Per-worker in-memory state, so this runs regardless of leadership.
             expired, orphans = prune_rating_state(asyncio.get_running_loop().time())
             if expired or orphans:
@@ -3978,7 +4026,7 @@ async def _run_cache_warm_cycle(client: httpx.AsyncClient) -> None:
             # shares, so its 429 has to reach them too — otherwise the other
             # replicas keep issuing live requests against a key that is done
             # for the day.
-            await _publish_fleet_mdblist_cooldown(backoff_secs)
+            await _publish_fleet_mdblist_cooldown(effective_mdblist_key, backoff_secs)
             if replacement:
                 effective_mdblist_key = replacement
             else:
@@ -5375,11 +5423,18 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
                 resp.headers[k] = v
             return resp
     else:
-        cached_jpeg = await get_cached_final_poster(final_cache_key)
+        # get_cached_final_poster_entry, not ..._poster: without the deadline
+        # this path advertised the full preset TTL on every hit, so a shared
+        # composite with seconds left could be held downstream for another day
+        # with an expired trending rank or release status baked in.
+        _inline_entry = await get_cached_final_poster_entry(final_cache_key)
+        cached_jpeg, _cdn_expires_at_inline = (
+            _inline_entry if _inline_entry is not None else (None, None)
+        )
         if cached_jpeg is not None:
             logger.info(f"Preset {preset} cache hit (inline) for {final_cache_key}")
-            return Response(content=cached_jpeg, media_type="image/jpeg",
-                            headers=_preset_header(True))
+            return Response(content=cached_jpeg, media_type=f"image/{_cfg.IMAGE_FORMAT}",
+                            headers=_preset_header(True, _cdn_expires_at_inline))
 
     # Rating + quality: cached-only. None means "never queried" (suppress
     # persistence); [] means "queried, nothing available" (safe to persist).
@@ -5395,6 +5450,38 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
     # Bound before the try: the finally clears this slot, and a failure in the
     # metadata fetch below happens before the coalescing future is created.
     _render_fut: "asyncio.Future[bytes] | None" = None
+
+    # Render admission, before the cold fetch pipeline rather than just before
+    # the Pillow encode.
+    #
+    # Everything above this line was cache reads. Everything below talks to
+    # TMDB — metadata, art, logo, trending — and that is the part the cap
+    # exists to bound: those calls share one httpx pool with /poster, and a
+    # burst past the pool's budget fails with PoolTimeout instead of queueing.
+    # Gating only the encode would let an anonymous burst — the exact traffic
+    # this route is built to absorb — walk straight past the limit protecting
+    # /poster, and hold decoded images in memory while it waited.
+    _render_sem = _get_render_semaphore()
+    if _render_sem.locked():
+        logger.debug(
+            f"Preset render for {imdb_id} queued: "
+            f"{_cfg.POSTER_RENDER_CONCURRENCY} renders already in flight"
+        )
+    try:
+        if _cfg.RENDER_QUEUE_TIMEOUT > 0:
+            await asyncio.wait_for(
+                _render_sem.acquire(), timeout=_cfg.RENDER_QUEUE_TIMEOUT
+            )
+        else:
+            await _render_sem.acquire()
+    except asyncio.TimeoutError:
+        _metrics.render_saturated_total.inc()
+        logger.warning(
+            f"Render queue saturated (cap={_cfg.POSTER_RENDER_CONCURRENCY}); "
+            f"503 for preset={preset} imdb={imdb_id}"
+        )
+        raise HTTPException(status_code=503, detail="Server saturated — try again shortly",
+                            headers={"Retry-After": "5"})
 
     try:
         genre_ids, is_textless, logos, release_year, title, poster_path, backdrop_path, tmdb_data = (
@@ -5442,6 +5529,34 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
                     genre = _cfg.GENRE_MAP[_gid]
                     break
 
+        # Original-art mode. Pure selection over metadata already in hand — no
+        # extra request — so the moat allows it, and four of the ten gallery
+        # presets set use_original_art. Without this they silently rendered the
+        # textless art instead, and then persisted it under the key /poster
+        # shares, handing the wrong artwork to configured instances too.
+        _plangs    = tmdb_data.get("poster_langs") or {}
+        _p_default = tmdb_data.get("original_poster_path")
+        _original_lang = tmdb_data.get("original_language") or ""
+        _poster_language_order = image_language_order(
+            rcfg.logo_language, _original_lang, rcfg.logo_priority, ""
+        )
+        _priority_lang = _poster_language_order[0] if _poster_language_order else ""
+        _ranked_posters = [
+            _plangs[language]
+            for language in _poster_language_order
+            if _plangs.get(language)
+        ]
+        _use_primary = (
+            _priority_lang == "en" and rcfg.original_art_source == "primary"
+        )
+        if _use_primary:
+            _orig_art = _p_default or next(iter(_ranked_posters), None)
+        else:
+            _orig_art = next(iter(_ranked_posters), None) or _p_default
+        if rcfg.use_original_art and _orig_art:
+            poster_path = _orig_art
+            is_textless = False
+
         # No-poster ladder: poster → backdrop → gradient canvas.
         is_no_poster = poster_path is None
         use_backdrop = is_no_poster and backdrop_path is not None
@@ -5484,8 +5599,54 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             else:
                 _suppress_overlay = bool(_det_cached)
 
+        # Release status, cached-only.
+        #
+        # Every gallery preset asks for a release slot, so without this every
+        # /p render lost its status sash and cinema greyscale — and then
+        # persisted that under /poster's shared key, taking the sash away from
+        # configured instances too.
+        #
+        # For series it is a pure mapping of the tmdb_status already fetched,
+        # so it costs nothing. For films it needs TMDB's /release_dates, which
+        # the moat forbids: read the cached row instead and, when there isn't
+        # one, treat the render as undetermined rather than quietly shipping a
+        # poster missing a sash that /poster would have drawn.
+        _release_status: str | None = None
+        _release_undetermined = False
+        _RS_SLOTS = {
+            "release_status", "cinema", "streaming", "physical",
+            "production", "ended", "cancelled", "airing",
+        }
+        if any(s in rcfg.sash_priority for s in _RS_SLOTS):
+            if type in ("tv", "series"):
+                _release_status = await fetch_release_status(
+                    client, tmdb_id, effective_tmdb_key, type,
+                    tmdb_data.get("tmdb_status"),
+                )
+            else:
+                _release_status = get_cached_release_status(f"{type}_{tmdb_id}")
+                if _release_status is None:
+                    _release_undetermined = True
+            # Both overrides below are local lookups, so they stay honest here.
+            if (_release_status in ("Cinema", "Production")
+                    and is_digital_release(imdb_id)):
+                _release_status = "Streaming"
+            if (rcfg.release_status_cinema_only
+                    and _release_status not in ("Cinema", "Production")):
+                _release_status = None
+            # A dated "Oct 16 Cinema" sash needs the upcoming-release lookup,
+            # which is a request we may not make. The status alone renders
+            # differently from what /poster produces, so don't share it.
+            if (rcfg.release_status_dates
+                    and _release_status in ("Cinema", "Production")
+                    and type not in ("tv", "series")):
+                _release_undetermined = True
+
         will_persist = (
-            cached_rating is not None and not quality_missing and not _ocr_undetermined
+            cached_rating is not None
+            and not quality_missing
+            and not _ocr_undetermined
+            and not _release_undetermined
         )
 
         # Coalesce concurrent uncached renders — only on the will-persist path
@@ -5501,15 +5662,22 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
                     # two share _render_inflight keyed by the same composite key
                     # and either endpoint can be the one that got there first.
                     if isinstance(_coalesced, tuple):
-                        _coalesced_bytes, _coalesced_provisional = _coalesced[0], _coalesced[1]
+                        _coalesced_bytes = _coalesced[0]
+                        _coalesced_provisional = _coalesced[1]
+                        _coalesced_expires_at = (
+                            _coalesced[2] if len(_coalesced) > 2 else None
+                        )
                     else:
                         _coalesced_bytes, _coalesced_provisional = _coalesced, False
+                        _coalesced_expires_at = None
                     # A provisional /poster render is one rendered without all
                     # its inputs, which is exactly what must not go out under
                     # the long preset TTL.
                     return Response(
-                        content=_coalesced_bytes, media_type="image/jpeg",
-                        headers=_preset_header(not _coalesced_provisional),
+                        content=_coalesced_bytes, media_type=f"image/{_cfg.IMAGE_FORMAT}",
+                        headers=_preset_header(
+                            not _coalesced_provisional, _coalesced_expires_at
+                        ),
                     )
                 except Exception:
                     pass   # in-flight render failed; fall through and try ourselves
@@ -5541,6 +5709,7 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             is_cult_override=is_cult, is_true_story_override=is_true_story,
             is_metacritic_override=is_metacritic,
             is_digital_release_override=is_digital_release(imdb_id),
+            release_status_override=_release_status,
         )
 
         _bp_args = dict(
@@ -5560,26 +5729,15 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
         def _composite_and_encode() -> bytes:
             result = build_poster(image, score, genre, rcfg, **_bp_args)
             buf = io.BytesIO()
-            result.convert("RGB").save(buf, format="JPEG", quality=_cfg.JPEG_QUALITY)
+            # Must match /poster's encoding: the two share a composite key, so
+            # a JPEG written here is later served as image/<IMAGE_FORMAT> by
+            # /poster (webp by default), and vice versa.
+            _quality = _cfg.WEBP_QUALITY if _cfg.IMAGE_FORMAT == "webp" else _cfg.JPEG_QUALITY
+            result.convert("RGB").save(buf, format=_cfg.IMAGE_FORMAT.upper(), quality=_quality)
             return buf.getvalue()
 
-        # Same admission control as /poster, so preset traffic and /poster
-        # traffic queue against one cap rather than two independent ones.
-        _render_sem = _get_render_semaphore()
-        try:
-            if _cfg.RENDER_QUEUE_TIMEOUT > 0:
-                await asyncio.wait_for(_render_sem.acquire(),
-                                       timeout=_cfg.RENDER_QUEUE_TIMEOUT)
-            else:
-                await _render_sem.acquire()
-        except asyncio.TimeoutError:
-            _metrics.render_saturated_total.inc()
-            logger.warning(
-                f"Render queue saturated (cap={_cfg.POSTER_RENDER_CONCURRENCY}); "
-                f"503 for preset={preset} imdb={imdb_id}"
-            )
-            raise HTTPException(status_code=503, detail="Server saturated — try again shortly",
-                                headers={"Retry-After": "5"})
+        # The admission slot was taken before the fetch pipeline above and is
+        # released in this function's finally; only the CPU metering is here.
         try:
             _metrics.render_inflight.inc()
             with _metrics.render_duration_seconds.time():
@@ -5587,27 +5745,39 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
                     None, _composite_and_encode)
         finally:
             _metrics.render_inflight.dec()
-            _render_sem.release()
 
+        _persisted_expires_at: int | None = None
         if will_persist:
             # No request_params: replaying a /p URL through the trending
             # refresh would need the /poster query string, which this route
             # never had. The composite is still invalidated by tmdb_id like any
             # other, so a rank change drops it and the next hit re-renders.
-            await set_cached_final_poster(final_cache_key, img_bytes)
+            _persisted_expires_at = await set_cached_final_poster(
+                final_cache_key, img_bytes
+            )
             logger.info(f"Preset {preset} rendered + cached {final_cache_key}")
             if _render_fut is not None and not _render_fut.done():
-                _render_fut.set_result(img_bytes)
+                # Publish /poster's (bytes, provisional, expires_at) shape.
+                # _render_inflight is shared between the two routes, so a
+                # /poster request coalescing onto THIS render unpacks three
+                # values — bare bytes there would raise inside its own
+                # exception handler, be read as a failed render, and send it
+                # through the whole pipeline again.
+                _render_fut.set_result(
+                    (img_bytes, False, _persisted_expires_at)
+                )
         else:
             logger.info(
                 f"Preset {preset} rendered (not persisted: "
                 f"rating_cached={cached_rating is not None}, "
-                f"quality_missing={quality_missing}, ocr_undetermined={_ocr_undetermined}) "
+                f"quality_missing={quality_missing}, ocr_undetermined={_ocr_undetermined}, "
+                f"release_undetermined={_release_undetermined}) "
                 f"{final_cache_key}"
             )
-        return Response(content=img_bytes, media_type="image/jpeg",
-                        headers=_preset_header(will_persist))
+        return Response(content=img_bytes, media_type=f"image/{_cfg.IMAGE_FORMAT}",
+                        headers=_preset_header(will_persist, _persisted_expires_at))
     finally:
+        _render_sem.release()
         # Clear our coalescing slot. Waiters already hold the future object, so
         # popping after a successful set_result is safe; on an error path we
         # fail the future first so waiters don't hang. Only touch the future
@@ -6143,20 +6313,41 @@ async def get_poster(
     if not rating_already_cached and effective_mdblist_key:
         _loop_now = asyncio.get_running_loop().time()
 
-        # ElfHosted fork: fleet-wide MDBList cooldown. When any replica has been
-        # 429'd recently, every replica backs off — cross-worker via the
-        # coordination layer (Redis), or per-process on the in-process default
-        # (where it overlaps the per-key cooldown below). Suppresses the fetch
-        # and the composite persist so an N/A score isn't locked in.
-        if await coord.is_backoff_active(
-            coord.NS_MDBLIST_GLOBAL_COOLDOWN, coord.MDBLIST_GLOBAL_KEY
-        ):
-            logger.debug(
-                f"Rating fetch for {canonical_id} skipped (fleet-wide MDBList cooldown)"
-            )
-            effective_mdblist_key = None
-            _rating_backoff_active = True
-            _mdblist_unavailable_reason = "fleet-wide MDBList cooldown active"
+        # ElfHosted fork: fleet-wide MDBList cooldown, per credential. When a
+        # sibling replica has been 429'd on this key, back off here too rather
+        # than spending one more call to learn the same thing — cross-replica
+        # via the coordination layer, or per-process on the in-process default
+        # (where it overlaps the per-key cooldown below).
+        #
+        # Rotation first: a cooling key is a reason to try its siblings, not to
+        # stop. Only when every configured key is cooling does the request give
+        # up, which also suppresses the composite persist so an N/A score is
+        # not locked in for the composite TTL.
+        if await _fleet_mdblist_cooling(effective_mdblist_key):
+            _fleet_cooling_key = effective_mdblist_key
+            _fleet_replacement = None
+            for _candidate in _cfg.SERVER_MDBLIST_KEYS:
+                if _candidate == _fleet_cooling_key:
+                    continue
+                if _loop_now < _mdblist_key_cooldown.get(_candidate, 0.0):
+                    continue
+                if not await _fleet_mdblist_cooling(_candidate):
+                    _fleet_replacement = _candidate
+                    break
+            if _fleet_replacement is not None:
+                logger.info(
+                    f"MDBList {_mdblist_server_key_label(_fleet_cooling_key)} cooling "
+                    f"fleet-wide; using {_mdblist_server_key_label(_fleet_replacement)}"
+                )
+                effective_mdblist_key = _fleet_replacement
+            else:
+                logger.debug(
+                    f"Rating fetch for {canonical_id} skipped "
+                    f"(every MDBList key cooling fleet-wide)"
+                )
+                effective_mdblist_key = None
+                _rating_backoff_active = True
+                _mdblist_unavailable_reason = "fleet-wide MDBList cooldown active"
 
         # Per-key cooldown: configured server keys may rotate; request-supplied
         # keys remain isolated and simply wait for their own cooldown to expire.
@@ -7001,7 +7192,7 @@ async def get_poster(
                 f"MDBList {_mdblist_server_key_label(_failed_key)} rate-limited "
                 f"for {canonical_id}; cooling down for {_backoff_secs:.0f}s"
             )
-            await _publish_fleet_mdblist_cooldown(_backoff_secs)
+            await _publish_fleet_mdblist_cooldown(_failed_key, _backoff_secs)
             if _rescue_key is not None:
                 effective_mdblist_key = _rescue_key
                 logger.warning(
@@ -7076,7 +7267,9 @@ async def get_poster(
                         f"MDBList rate-limited {canonical_id}; key cooling down for "
                         f"{backoff_secs:.0f}s"
                     )
-                    await _publish_fleet_mdblist_cooldown(backoff_secs)
+                    await _publish_fleet_mdblist_cooldown(
+                        effective_mdblist_key, backoff_secs
+                    )
             else:
                 # Network / timeout failure — escalating back-off so a transient
                 # hiccup retries quickly while a sustained outage backs off further.

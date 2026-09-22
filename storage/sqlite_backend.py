@@ -22,6 +22,7 @@ upstream cache.py changes still map almost 1-to-1:
 
 The Postgres backend (storage/postgres_backend.py) mirrors this surface.
 """
+import asyncio
 import hashlib
 import logging
 import os
@@ -58,6 +59,7 @@ from config import (
     QUALITY_OLD_CACHE_DURATION,
     DIGITAL_RELEASE_MAX_AGE_DAYS,
     RATING_MIN_VOTES,
+    IMAGE_FORMAT as _IMAGE_FORMAT,
 )
 
 
@@ -649,10 +651,22 @@ async def set_cached_final_poster(
         # Write the bytes first so the metadata row is never present without
         # a corresponding blob (which would race a reader into a broken state
         # on the very first hit).
-        await blobstore.put(
-            blobstore.BUCKET_COMPOSITES, cache_key, jpeg_bytes,
-            content_type="image/jpeg",
-        )
+        # The composite is encoded in config.IMAGE_FORMAT (webp by default),
+        # not necessarily JPEG. Hardcoding image/jpeg here put the wrong
+        # Content-Type on every object, which the app never noticed because it
+        # re-serves the bytes itself — but a CDN redirect hands the object
+        # straight to the browser with whatever type S3 stored.
+        # The key lock is held across the put and the note_write so a drain
+        # cannot delete this blob between the two. note_write cancels any
+        # delete an earlier invalidation queued for this key — the trending
+        # refresh invalidates and immediately re-renders, and without it the
+        # next drain would remove the replacement.
+        async with blobstore.key_lock(blobstore.BUCKET_COMPOSITES, cache_key):
+            await blobstore.put(
+                blobstore.BUCKET_COMPOSITES, cache_key, jpeg_bytes,
+                content_type=f"image/{_IMAGE_FORMAT}",
+            )
+            blobstore.note_write(blobstore.BUCKET_COMPOSITES, cache_key)
 
         # L1 only after the durable write succeeds: an L1 entry whose blob
         # never landed would serve this replica a poster the rest of the
@@ -829,8 +843,52 @@ def get_cache_stats() -> dict:
 
 
 async def prune_caches() -> None:
+    """Prune every cache, without stalling the event loop.
+
+    The relational deletes, the filesystem sweep and — on a legacy database —
+    a full VACUUM under an exclusive lock are all synchronous, and they run on
+    a cache that can be very large. Awaiting them directly would freeze every
+    request and health probe in this worker for the duration; upstream ran the
+    equivalent work in an executor for exactly that reason, and this restores
+    it. Only the blob-store work, which is genuinely async, stays on the loop.
     """
-    Delete expired rows from every SQLite cache table.
+    expired_composites = await asyncio.to_thread(_prune_sync)
+
+    # Drop the blobs behind the expired composite rows, plus anything the
+    # synchronous delete/invalidate paths queued since the last sweep.
+    for k in expired_composites:
+        try:
+            await blobstore.delete(blobstore.BUCKET_COMPOSITES, k)
+        except Exception:
+            pass
+    await blobstore.drain_deferred_deletes()
+    blobstore._forget_generations_if_idle()
+
+
+def _close_thread_connection() -> None:
+    """Close only THIS thread's connection.
+
+    Connections are thread-local, and prune now runs on a pooled executor
+    thread, so without this each prune could strand a connection on whichever
+    thread it landed on. Deliberately not close(): that also flips the module's
+    _initialised flag, which would tell every other thread the database had
+    been shut down.
+    """
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _local.conn = None
+
+
+def _prune_sync() -> list[str]:
+    """
+    Delete expired rows from every SQLite cache table. Returns the cache_keys
+    of the composites it removed, so the caller can drop their blobs.
+
+    Runs on an executor thread — see prune_caches.
 
     Called periodically by a leader-elected background task in main.py.  All
     tables use a simple age cutoff; pruning everything keeps the DB tidy.
@@ -845,6 +903,7 @@ async def prune_caches() -> None:
     metadata rows.
     """
     now = int(time.time())
+    expired_composites: list[str] = []
     try:
         # Collect expired composite keys before deleting the rows so we can
         # also drop their blobs from the blobstore.
@@ -860,7 +919,6 @@ async def prune_caches() -> None:
             now,
             now - COMPOSITE_CACHE_TTL - COMPOSITE_CACHE_TTL_JITTER // 2,
         )
-        expired_composites: list[str] = []
         try:
             expired_composites = [
                 r[0] for r in get_db().execute(
@@ -955,15 +1013,6 @@ async def prune_caches() -> None:
 
             db.commit()
 
-        # Drop the blobs behind the expired composite rows, plus anything the
-        # synchronous delete/invalidate paths queued since the last sweep.
-        for k in expired_composites:
-            try:
-                await blobstore.delete(blobstore.BUCKET_COMPOSITES, k)
-            except Exception:
-                pass
-        await blobstore.drain_deferred_deletes()
-
         # Use the high end of the per-key jitter range so prune never deletes
         # a file before get_cached_tmdb_poster/_logo would (which apply the
         # same jitter per cache_key).
@@ -1017,6 +1066,9 @@ async def prune_caches() -> None:
 
     except Exception as exc:
         logger.error(f"Cache prune error: {exc}")
+    finally:
+        _close_thread_connection()
+    return expired_composites
 
 
 # ---------------------------------------------------------------------------

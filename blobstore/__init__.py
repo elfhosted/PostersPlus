@@ -92,14 +92,74 @@ BUCKET_COMPOSITES: str = "composites"
 # only ever reaches a blob via a live metadata row, and a row whose blob has
 # gone is dropped on the read that finds it. So when the queue is full we log
 # and discard rather than block a cache write on object-store latency.
+import asyncio as _asyncio
 import threading as _threading
-from collections import deque as _deque
+import itertools as _itertools
+from contextlib import asynccontextmanager as _asynccontextmanager
 
 DEFERRED_DELETE_MAX = 50_000
 
-_deferred_deletes: "_deque[tuple[str, str]]" = _deque()
+# key -> the write generation current when the delete was queued.
+_deferred_deletes: "dict[tuple[str, str], int]" = {}
+# key -> the generation of its most recent successful put().
+_blob_generation: "dict[tuple[str, str], int]" = {}
+_generation_counter = _itertools.count(1)
 _deferred_lock = _threading.Lock()
 _deferred_dropped = 0
+
+
+# Per-key mutexes shared by the write path and the drain.
+#
+# The generation check alone is not enough: the drain decides under the lock,
+# then releases it to await the delete, and a write landing in that window is
+# a live blob deleted after the check said it was safe. Serialising the two
+# operations per key is what makes the check decisive.
+_key_locks: "dict[tuple[str, str], _asyncio.Lock]" = {}
+_key_lock_waiters: "dict[tuple[str, str], int]" = {}
+
+
+@_asynccontextmanager
+async def key_lock(bucket: str, key: str):
+    """Serialise writes and deferred deletes of one blob key."""
+    k = (bucket, key)
+    with _deferred_lock:
+        lock = _key_locks.get(k)
+        if lock is None:
+            lock = _key_locks[k] = _asyncio.Lock()
+        _key_lock_waiters[k] = _key_lock_waiters.get(k, 0) + 1
+    try:
+        async with lock:
+            yield
+    finally:
+        # Drop the lock object once nobody is queued on it, so this registry
+        # does not grow by one entry per composite ever written.
+        with _deferred_lock:
+            remaining = _key_lock_waiters.get(k, 1) - 1
+            if remaining <= 0:
+                _key_lock_waiters.pop(k, None)
+                _key_locks.pop(k, None)
+            else:
+                _key_lock_waiters[k] = remaining
+
+
+def note_write(bucket: str, key: str) -> None:
+    """Record that *key* has just been (re)written.
+
+    This is what stops the queue deleting a live blob. Invalidation and
+    regeneration are not hypothetical here — _run_trending_fetch_cycle does
+    exactly that, in that order: it invalidates a composite (queueing the blob
+    for deletion) and immediately replays the request, which writes a fresh
+    blob under the SAME key. A later drain would then delete the replacement
+    and leave a metadata row pointing at nothing.
+
+    The inline read path recovers from that by dropping the row, but the CDN
+    redirect path does not: it 302s on the strength of the row alone, so
+    clients would be sent to a missing object until the row expired.
+    """
+    with _deferred_lock:
+        _blob_generation[(bucket, key)] = next(_generation_counter)
+        # A write supersedes any pending delete for the same key outright.
+        _deferred_deletes.pop((bucket, key), None)
 
 
 def delete_later(bucket: str, key: str) -> None:
@@ -107,7 +167,10 @@ def delete_later(bucket: str, key: str) -> None:
     from code that is not on the event loop."""
     global _deferred_dropped
     with _deferred_lock:
-        if len(_deferred_deletes) >= DEFERRED_DELETE_MAX:
+        if (
+            len(_deferred_deletes) >= DEFERRED_DELETE_MAX
+            and (bucket, key) not in _deferred_deletes
+        ):
             _deferred_dropped += 1
             if _deferred_dropped % 1000 == 1:
                 logger.warning(
@@ -117,7 +180,7 @@ def delete_later(bucket: str, key: str) -> None:
                     DEFERRED_DELETE_MAX, _deferred_dropped,
                 )
             return
-        _deferred_deletes.append((bucket, key))
+        _deferred_deletes[(bucket, key)] = next(_generation_counter)
 
 
 def deferred_delete_stats() -> dict:
@@ -134,12 +197,36 @@ async def drain_deferred_deletes(limit: int | None = None) -> int:
         with _deferred_lock:
             if not _deferred_deletes:
                 break
-            bucket, key = _deferred_deletes.popleft()
-        try:
-            await delete(bucket, key)
-        except Exception as exc:
-            logger.debug("Deferred blob delete failed for %s:%s — %s", bucket, key, exc)
+            (bucket, key), queued_at = _deferred_deletes.popitem()
+
+        # Hold the key's lock across the generation check AND the delete, so a
+        # write cannot slip between the two.
+        async with key_lock(bucket, key):
+            with _deferred_lock:
+                superseded = _blob_generation.get((bucket, key), 0) > queued_at
+                if not superseded:
+                    _blob_generation.pop((bucket, key), None)
+            if superseded:
+                continue
+            try:
+                await delete(bucket, key)
+            except Exception as exc:
+                logger.debug(
+                    "Deferred blob delete failed for %s:%s — %s", bucket, key, exc
+                )
         removed += 1
     if removed:
         logger.info("Drained %d deferred blob deletes", removed)
     return removed
+
+
+def _forget_generations_if_idle() -> None:
+    """Drop write-generation bookkeeping once nothing is queued.
+
+    _blob_generation would otherwise grow with every composite ever written.
+    It only has to outlive pending deletes, so an empty queue means none of it
+    is still needed.
+    """
+    with _deferred_lock:
+        if not _deferred_deletes:
+            _blob_generation.clear()

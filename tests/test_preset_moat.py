@@ -12,6 +12,7 @@ helpers in main's namespace:
     under the SAME composite key /poster would use, with the long preset TTL
 """
 import asyncio
+import io
 import os
 import tempfile
 import unittest
@@ -30,6 +31,10 @@ config.SERVER_TMDB_KEY = "test-server-key"
 config.PRESET_ENABLED = True
 config.PRESET_CDN_CACHE_TTL = 86400
 config.TEXTLESS_TEXT_DETECTION = True
+# /p and /poster share composite keys, so they must agree on the encoding.
+# Pinned to the non-default here so a regression back to hardcoded JPEG shows
+# up as a failure rather than passing by coincidence.
+config.IMAGE_FORMAT = "webp"
 
 import storage.sqlite_backend as sb
 sb.DB_PATH = config.DB_PATH
@@ -119,8 +124,15 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_uncached_not_persisted_short_ttl(self):
         resp = await self._call(imdb="tt1111111")
-        # Rendered (200 inline JPEG), short Cache-Control, NOT persisted.
-        self.assertEqual(resp.media_type, "image/jpeg")
+        # Rendered inline in the CONFIGURED format, short Cache-Control, NOT
+        # persisted. The format matters beyond the header: /p writes into the
+        # same composite key /poster reads, so a JPEG written here would later
+        # be served as image/webp by /poster.
+        self.assertEqual(resp.media_type, f"image/{config.IMAGE_FORMAT}")
+        self.assertEqual(
+            Image.open(io.BytesIO(resp.body)).format,
+            config.IMAGE_FORMAT.upper(),
+        )
         self.assertIn("max-age=60", resp.headers.get("Cache-Control", ""))
         key = main._composite_cache_key(
             "tt1111111", "278", "movie",
@@ -137,8 +149,39 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
             c.start()
         try:
             resp = await main.get_preset_poster("clean_notch", "movie", "tt2222222")
-            self.assertEqual(resp.media_type, "image/jpeg")
+            self.assertEqual(resp.media_type, f"image/{config.IMAGE_FORMAT}")
             self.assertIn("max-age=60", resp.headers.get("Cache-Control", ""))
+        finally:
+            for c in ctxs:
+                c.stop()
+
+    async def test_unwarmed_release_status_is_not_persisted(self):
+        """A film with a cached rating but no cached release status is still
+        incomplete.
+
+        /poster would draw a status sash here (and grey a Cinema title); /p
+        cannot resolve the status without a TMDB request the moat forbids. The
+        render is therefore not the one /poster would produce, so it must not
+        go into the composite both routes read, nor be advertised for a day.
+        """
+        imdb = "tt4444444"
+        cache.set_cached_rating(
+            imdb, {"letterboxd": 80}, "Action", "1994-01-01",
+            [], [], 1, None, None, False, False, False,
+        )
+        ctxs = self._patches(_META_NON_TEXTLESS)
+        for c in ctxs:
+            c.start()
+        try:
+            resp = await main.get_preset_poster("clean_notch", "movie", imdb)
+            self.assertIn("max-age=60", resp.headers.get("Cache-Control", ""))
+            key = main._composite_cache_key(
+                imdb, "278", "movie",
+                dict(main.get_preset("clean_notch")),
+                main.build_request_config(dict(main.get_preset("clean_notch"))).fallback_to_imdb,
+                imdb_id=imdb,
+            )
+            self.assertIsNone(await cache.get_cached_final_poster(key))
         finally:
             for c in ctxs:
                 c.stop()
@@ -151,6 +194,11 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
             imdb, {"letterboxd": 80}, "Action", "1994-01-01",
             [], [], 1, None, None, False, False, False,
         )
+        # ...and the release status. Every gallery preset asks for a release
+        # slot, and /p may not call TMDB's /release_dates itself, so a film
+        # whose status has never been resolved is not fully warmed — see
+        # test_unwarmed_release_status_is_not_persisted.
+        cache.set_cached_release_status("movie_278", "Streaming")
         ctxs = self._patches(_META_NON_TEXTLESS)
         for c in ctxs:
             c.start()
