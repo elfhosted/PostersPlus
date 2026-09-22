@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.2.0-elf.5](https://github.com/elfhosted/PostersPlus/compare/v1.2.0-elf.4...v1.2.0-elf.5) (2026-09-22)
+
+
+### Bug Fixes
+
+* self-heal IMDb ids whose TMDB entry was retired ([725036e](https://github.com/elfhosted/PostersPlus/commit/725036e5187608f3ee8354c0764d85a251b046f1))
+* self-heal IMDb ids whose TMDB entry was retired ([9186bfc](https://github.com/elfhosted/PostersPlus/commit/9186bfc83c304c9750506f52ce28c5c7685de850))
+
+
+### Miscellaneous Chores
+
+* release 1.2.0-elf.5 ([61494c0](https://github.com/elfhosted/PostersPlus/commit/61494c0774fa7fb30c143ada8b060180d23e36e3))
+
 ## [1.2.0-elf.4](https://github.com/elfhosted/PostersPlus/compare/v1.2.0-elf.3...v1.2.0-elf.4) (2026-09-22)
 
 
