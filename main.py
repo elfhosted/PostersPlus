@@ -4742,6 +4742,9 @@ async def server_caps(access_key: str = ""):
         "presets":               preset_catalog() if _cfg.PRESET_ENABLED else [],
         "access_key_valid":      access_key_valid,
         "version":               _APP_VERSION,
+        # Lets the configurator offer an id-agnostic stremio_id={id} pattern
+        # (e.g. for Nuvio) only on instances that can resolve it.
+        "poster_resolve_imdb":   _cfg.POSTER_RESOLVE_IMDB,
     }
 
 
@@ -6433,6 +6436,15 @@ async def get_poster(
         _stremio_hint = stremio_id.strip()
         if _IMDB_ID_RE.match(_stremio_hint):
             imdb_id = _stremio_hint
+        # ElfHosted fork (POSTER_RESOLVE_IMDB): "tmdb:<id>" — the third form
+        # this param's docstring lists — names the TMDB id directly. Upstream
+        # only reads tt… here, so a TMDB-keyed title sent as {id} fell through
+        # to "missing tmdb_id". With both forms understood, a client whose {id}
+        # placeholder is always populated (Nuvio's is) can use stremio_id={id}
+        # alone and never have the URL dropped for want of a per-service id.
+        elif (_cfg.POSTER_RESOLVE_IMDB and not tmdb_id
+              and _stremio_hint.lower().startswith("tmdb:")):
+            tmdb_id = _stremio_hint.split(":", 2)[1]
 
     # -----------------------------------------------------------------------
     # Anime-native ids (AniList / Kitsu).

@@ -59,5 +59,46 @@ class PosterImdbResolutionTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 404)
 
 
+class NuvioIdPatternTests(PosterImdbResolutionTests):
+    """The configurator's Nuvio pattern sends only stremio_id={id}, which Nuvio
+    always fills with the namespaced meta id. Each form must reach a tmdb_id."""
+
+    def _get_id(self, stremio_id, resolver):
+        seen = {}
+
+        def _capture(tmdb_id):
+            seen["tmdb_id"] = tmdb_id
+            raise main.HTTPException(418, "resolved")
+
+        with mock.patch.object(main, "resolve_imdb_to_tmdb", resolver), \
+             mock.patch.object(main, "_check_tmdb_id", side_effect=_capture):
+            resp = self.client.get(
+                "/poster",
+                params={"stremio_id": stremio_id, "type": "series", "shape": "landscape"},
+            )
+        return resp, seen.get("tmdb_id")
+
+    def test_imdb_form_is_resolved(self):
+        config.POSTER_RESOLVE_IMDB = True
+        resolver = mock.AsyncMock(return_value="1396")
+        resp, tmdb_id = self._get_id("tt0903747", resolver)
+        self.assertEqual((resp.status_code, tmdb_id), (418, "1396"))
+        resolver.assert_awaited_once()
+
+    def test_tmdb_form_needs_no_lookup(self):
+        config.POSTER_RESOLVE_IMDB = True
+        resolver = mock.AsyncMock()
+        for sid in ("tmdb:1396", "tmdb:1396:1:2"):
+            with self.subTest(stremio_id=sid):
+                resp, tmdb_id = self._get_id(sid, resolver)
+                self.assertEqual((resp.status_code, tmdb_id), (418, "1396"))
+        resolver.assert_not_awaited()
+
+    def test_tmdb_form_is_upstreams_400_when_off(self):
+        config.POSTER_RESOLVE_IMDB = False
+        resp, _ = self._get_id("tmdb:1396", mock.AsyncMock())
+        self.assertEqual(resp.status_code, 400)
+
+
 if __name__ == "__main__":
     unittest.main()

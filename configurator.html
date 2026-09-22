@@ -2356,6 +2356,10 @@
      element any more, so the button it used to hide would have come back
      visible in lock mode. Target #import-url-btn, which is what upstream
      calls it now. */
+  .url-format-row { display: flex; align-items: center; gap: 8px; margin: 0 0 8px;
+                    flex-wrap: wrap; font-size: 12px; color: var(--text-muted); }
+  .url-format-row select { width: auto; }
+  .url-format-hint { flex-basis: 100%; }
   body.preset-only-mode .import-modal,
   body.preset-only-mode #import-modal,
   body.preset-only-mode #import-url-btn,
@@ -3674,6 +3678,18 @@ try{if(localStorage.getItem('postersplus_theme')==='light')document.documentElem
         </div>
         <!-- Errors surface here, directly under where the poster renders. -->
         <div class="preview-error" id="preview-error" hidden></div>
+        <!-- ElfHosted fork: which client the copied URL is for. Nuvio fills
+             per-service ids ({tmdb_id}) only when a title has one and drops the
+             URL when it's empty, so it gets an id-agnostic pattern, plus
+             {shape} so its landscape slots get the landscape layout. -->
+        <div class="url-format-row">
+          <label for="cfg-url-format" class="url-format-label">URL for</label>
+          <select id="cfg-url-format" onchange="onUrlFormatChange()">
+            <option value="aiometadata">AIOMetadata</option>
+            <option value="nuvio">Nuvio</option>
+          </select>
+          <span class="url-format-hint" id="url-format-hint"></span>
+        </div>
         <div class="preview-actions">
           <button class="btn btn-preview" onclick="copyUrl()"
             data-tip="Copies the poster URL. Paste it into AIOMetadata → Art Providers → Custom Art URLs → Poster URL Pattern.">Copy config</button>
@@ -4170,6 +4186,7 @@ async function fetchServerCaps() {
   // footer. Guarded independently so a throw in either can't strand the
   // other (or the upstream badge update above).
   try { applyLockMode(); } catch(e) { console.warn('applyLockMode failed', e); }
+  try { restoreUrlFormat(); } catch(e) { console.warn('restoreUrlFormat failed', e); }
   const versionEl = document.getElementById('build-version');
   if (versionEl && serverCaps.version) {
     versionEl.textContent = '· v' + serverCaps.version;
@@ -5402,6 +5419,11 @@ function buildLockedPreviewUrl(domain) {
 }
 function buildLockedTemplateUrl(domain) {
   if (!lockedPresetId) return null;
+  if (urlFormat() === 'nuvio') {
+    // Pipe syntax: Nuvio only requests titles that carry one of these ids and
+    // substitutes that id; /p accepts tt…, bare TMDB numbers and tmdb:….
+    return `${domain}/p/${lockedPresetId}/{type}/{imdb_id|tmdb_id}.jpg?shape={shape}`;
+  }
   return `${domain}/p/${lockedPresetId}/{type}/{imdb_id}.jpg`;
 }
 
@@ -5468,7 +5490,70 @@ function buildTemplateUrl() {
     const locked = buildLockedTemplateUrl(domain);
     if (locked) return locked;
   }
-  return buildBaseParams({ usePlaceholders: true });
+  const url = buildBaseParams({ usePlaceholders: true });
+  return urlFormat() === 'nuvio' ? toNuvioPattern(url) : url;
+}
+
+// ── ELFHOSTED FORK: client URL formats ──────────────────────────────────────
+// Nuvio's custom poster pattern (NuvioTV #3624 / NuvioMobile #2025) differs
+// from AIOMetadata's in two ways that matter here:
+//   * a per-service placeholder like {tmdb_id} is filled only when the title
+//     carries that id, and an empty required placeholder DROPS the URL — so on
+//     IMDb-only (Cinemeta) catalogues a tmdb_id pattern silently keeps the
+//     original posters. {id} is always filled: the namespaced meta id
+//     ("tt…", "tmdb:…", "kitsu:…"), which /poster reads via stremio_id.
+//   * {shape} ("poster" / "landscape" / "square") gets separate URLs for its
+//     portrait and landscape slots.
+const URL_FORMAT_KEY = 'postersplus_url_format';
+
+function urlFormat() {
+  return vEl('cfg-url-format') === 'nuvio' ? 'nuvio' : 'aiometadata';
+}
+
+function onUrlFormatChange() {
+  try { localStorage.setItem(URL_FORMAT_KEY, urlFormat()); } catch (e) {}
+  updateUrlFormatHint();
+  build();
+}
+
+function restoreUrlFormat() {
+  let saved = null;
+  try { saved = localStorage.getItem(URL_FORMAT_KEY); } catch (e) {}
+  const sel = document.getElementById('cfg-url-format');
+  if (sel && (saved === 'nuvio' || saved === 'aiometadata')) sel.value = saved;
+  updateUrlFormatHint();
+}
+
+function updateUrlFormatHint() {
+  const hint = document.getElementById('url-format-hint');
+  if (!hint) return;
+  if (urlFormat() !== 'nuvio') {
+    hint.textContent = "Paste into AIOMetadata → Art Providers → Custom Art URLs → Poster URL Pattern.";
+  } else if (lockModeActive || serverCaps.poster_resolve_imdb) {
+    hint.textContent = "Paste into Nuvio's custom poster URL pattern. Works for IMDb- and TMDB-keyed titles, in poster and landscape rows.";
+  } else {
+    hint.textContent = "Paste into Nuvio's custom poster URL pattern. This instance can't resolve IMDb-only titles, so Nuvio keeps their original posters.";
+  }
+}
+
+// Rewrite a generated /poster template into a Nuvio pattern. String-level on
+// purpose: URL/URLSearchParams would percent-encode the braces, and a pattern
+// with %7Bid%7D never matches Nuvio's literal placeholder.
+function toNuvioPattern(url) {
+  const q = url.indexOf('?');
+  if (q < 0) return url;
+  const base = url.slice(0, q);
+  const ID_KEYS = new Set(['tmdb_id', 'imdb_id', 'stremio_id', 'anilist_id', 'kitsu_id', 'type', 'shape']);
+  const kept = url.slice(q + 1).split('&').filter(kv => kv && !ID_KEYS.has(kv.split('=')[0]));
+  const ids = serverCaps.poster_resolve_imdb
+    // {id} is always populated; the server resolves tt… and reads tmdb:… itself.
+    ? ['stremio_id={id}']
+    // No server-side resolution: keep the required tmdb_id (Nuvio drops the URL
+    // for titles without one). {id} still carries the IMDb id for tt… titles
+    // — /poster reads it from stremio_id — and anime ids for anime-native art,
+    // so the optional-placeholder form is not needed (some clients reject it).
+    : ['tmdb_id={tmdb_id}', 'stremio_id={id}'];
+  return `${base}?${ids.concat(['type={type}', 'shape={shape}'], kept).join('&')}`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
