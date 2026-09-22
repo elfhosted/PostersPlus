@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.2.0-elf.4](https://github.com/elfhosted/PostersPlus/compare/v1.2.0-elf.3...v1.2.0-elf.4) (2026-09-22)
+
+
+### Bug Fixes
+
+* **configurator:** locked preview must not fall back to /poster ([1241e13](https://github.com/elfhosted/PostersPlus/commit/1241e1302ca67395deb07574437330f6588fabfe))
+* **configurator:** locked preview must not fall back to /poster (403 on public site) ([9db3391](https://github.com/elfhosted/PostersPlus/commit/9db339132a83a31a7b5bc978fc644cca81ef9f0d))
+
+
+### Miscellaneous Chores
+
+* release 1.2.0-elf.4 ([d9343d2](https://github.com/elfhosted/PostersPlus/commit/d9343d2f76fbe8de0e48f57c433aa96eb0a6b6be))
+
 ## [1.2.0-elf.3](https://github.com/elfhosted/PostersPlus/compare/v1.2.0-elf.2...v1.2.0-elf.3) (2026-09-22)
 
 
