@@ -220,6 +220,15 @@ RATE_LIMIT_RPS          = int(os.environ.get("RATE_LIMIT_RPS", "0"))
 # longer TTL than CDN_CACHE_TTL is safe).
 PRESET_ENABLED        = os.environ.get("PRESET_ENABLED", "").strip().lower() in ("1", "true", "yes")
 PRESET_CDN_CACHE_TTL  = int(os.environ.get("PRESET_CDN_CACHE_TTL", "86400"))
+# Let /p warm its own rating cache. /p never calls MDBList in the foreground,
+# and on a preset-only instance /poster is closed, so without this nothing ever
+# fetches a rating and every preset renders "N/A". When true, a /p miss queues a
+# BACKGROUND MDBList fetch (bounded, de-duplicated, honouring per-key and
+# fleet-wide cooldowns and the daily quota); the first hit still renders
+# without a rating under the short Cache-Control and the next one persists.
+# Off by default so instances where /poster traffic warms the cache keep
+# /p from spending quota. Public-tier instances should set it true.
+PRESET_MDBLIST_FETCH  = os.environ.get("PRESET_MDBLIST_FETCH", "").strip().lower() in ("1", "true", "yes")
 # Floor on anonymous /search and /resolve-imdb (the public preset flow needs
 # the title picker). RATE_LIMIT_RPS only gates /poster + /p; without this
 # independent floor an operator who left RATE_LIMIT_RPS=0 would leave the TMDB

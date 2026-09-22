@@ -29,7 +29,6 @@ config.TMDB_POSTER_CACHE_DIR = os.path.join(_TMP, "p")
 config.TMDB_LOGO_CACHE_DIR = os.path.join(_TMP, "l")
 config.COMPOSITE_BLOB_DIR = os.path.join(_TMP, "comp")
 config.SERVER_TMDB_KEY = "test-server-key"
-config.PRESET_ENABLED = True
 config.PRESET_CDN_CACHE_TTL = 86400
 config.TEXTLESS_TEXT_DETECTION = True
 # /p and /poster share composite keys, so they must agree on the encoding.
@@ -71,6 +70,11 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
         # happened — with the real /app path — before this module set config.)
         from blobstore import local as _bl
         _bl._BUCKETS["composites"] = config.COMPOSITE_BLOB_DIR
+        # Scoped to this class, not set at import: PRESET_ENABLED closes
+        # /poster, and leaking it would 403 every upstream test that runs after
+        # this module.
+        self._prev_preset_enabled = config.PRESET_ENABLED
+        config.PRESET_ENABLED = True
         cache.init_db()
         await blobstore.init()
         main._HTTP_CLIENT = object()  # sentinel; network helpers are stubbed
@@ -85,6 +89,7 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
             sb._composite_l1.clear()
 
     async def asyncTearDown(self):
+        config.PRESET_ENABLED = self._prev_preset_enabled
         await blobstore.close()
         cache.close()
 
@@ -324,6 +329,43 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
             second = await self._call(imdb=imdb)
         config.SERVER_TMDB_KEY = prev_key
         self.assertIn("max-age=86400", second.headers.get("Cache-Control", ""))
+
+    async def test_preset_mdblist_fetch_warms_the_rating_in_the_background(self):
+        """On a preset-only instance /poster is closed, so /p has to warm its
+        own ratings or every preset renders N/A forever. With
+        PRESET_MDBLIST_FETCH, a miss queues a background MDBList fetch (never
+        a foreground one) and the next hit carries the rating."""
+        imdb = "tt1212121"
+        cache.set_cached_release_status("movie_278", "Streaming")
+        cache.set_cached_movie_release_info("movie_278", {"status": "Streaming"})
+        fetch = mock.AsyncMock(return_value=(
+            {"letterboxd": 81}, "Action", "1994-01-01", [], None,
+        ))
+        saved = (config.PRESET_MDBLIST_FETCH, config.SERVER_MDBLIST_KEYS)
+        config.PRESET_MDBLIST_FETCH, config.SERVER_MDBLIST_KEYS = True, ["mdb-key"]
+        try:
+            with mock.patch.object(main, "fetch_rating", fetch):
+                first = await self._call(imdb=imdb)
+                self.assertIn("max-age=60", first.headers.get("Cache-Control", ""))
+                await asyncio.gather(*list(main._rating_warm_tasks))
+                self.assertIsNotNone(cache.get_cached_rating(imdb))
+                second = await self._call(imdb=imdb)
+        finally:
+            config.PRESET_MDBLIST_FETCH, config.SERVER_MDBLIST_KEYS = saved
+        fetch.assert_awaited_once()
+        self.assertIn("max-age=86400", second.headers.get("Cache-Control", ""))
+
+    async def test_preset_mdblist_fetch_off_spends_no_quota(self):
+        fetch = mock.AsyncMock()
+        saved = (config.PRESET_MDBLIST_FETCH, config.SERVER_MDBLIST_KEYS)
+        config.PRESET_MDBLIST_FETCH, config.SERVER_MDBLIST_KEYS = False, ["mdb-key"]
+        try:
+            with mock.patch.object(main, "fetch_rating", fetch):
+                await self._call(imdb="tt1313131")
+                await asyncio.gather(*list(main._rating_warm_tasks))
+        finally:
+            config.PRESET_MDBLIST_FETCH, config.SERVER_MDBLIST_KEYS = saved
+        fetch.assert_not_awaited()
 
     async def test_unwarmed_release_status_is_not_persisted(self):
         """A film with a cached rating but no cached release status is still

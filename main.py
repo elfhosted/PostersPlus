@@ -4987,8 +4987,7 @@ async def stats(access_key: str = ""):
     (in-flight renders, background quality fetches, MDBList key cooldowns).
     Gated behind the access key when one is configured.
     """
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    _require_operator(access_key)
 
     now = asyncio.get_running_loop().time()
     keys = _cfg.SERVER_MDBLIST_KEYS
@@ -5060,8 +5059,7 @@ async def debug_canvas(genre: str = "Action", title: str = "Sample Title",
     the usual rating label composited on top.  Lets you eyeball any genre/style
     without hunting for a title that happens to lack poster art.
     """
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    _require_operator(access_key)
     if len(title) > 200:
         raise HTTPException(status_code=400, detail="Title too long")
     cache_key = (genre, title, style, year, score)
@@ -5101,8 +5099,7 @@ async def fallback_gallery(style: str = "minimal", access_key: str = ""):
     genre fonts at a glance and compare the minimal vs photoreal sets.  Gated
     behind the access key when configured.
     """
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized. Provide ?access_key=<key>")
+    _require_operator(access_key)
     if style not in _GENRE_BG_STYLES:
         style = "minimal"
     _ak = f"&access_key={access_key}" if access_key else ""
@@ -5193,6 +5190,38 @@ async def get_configurator(request: Request, access_key: str = "", reload: str =
 # ---------------------------------------------------------------------------
 # Search endpoint
 # ---------------------------------------------------------------------------
+
+def _require_operator(
+    access_key: str,
+    *,
+    detail: str = "Unauthorized",
+    public_detail: str | None = None,
+) -> None:
+    """ElfHosted fork: fail-closed gate for endpoints that spend operator keys
+    or expose operator data (/poster, /logo, /stats, /debug/*).
+
+    Upstream's gate is `if ACCESS_KEY and <key doesn't match>`, which fires
+    only when ACCESS_KEY is set. A public-tier instance runs PRESET_ENABLED
+    with NO ACCESS_KEY, so under upstream's gate all of these were anonymous:
+    custom renders with live MDBList fetches and foreground OCR on the
+    operator's keys, unbounded debug canvas renders, cache counts on /stats.
+    Here, PRESET_ENABLED alone is enough to require a valid key — and with no
+    key configured, nothing can pass: /p is the only way in. That is the
+    posture the public instance's configmap relies on; v1.0.3-elf.4 had it,
+    and the v1.1.0 rebuild dropped it.
+    """
+    if not (_cfg.PRESET_ENABLED or _cfg.ACCESS_KEY):
+        return
+    if (_cfg.ACCESS_KEY and access_key
+            and hmac.compare_digest(access_key.encode("utf-8"),
+                                    _cfg.ACCESS_KEY.encode("utf-8"))):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=(public_detail or detail)
+        if _cfg.PRESET_ENABLED and not _cfg.ACCESS_KEY else detail,
+    )
+
 
 def _gate_anonymous_tmdb_proxy(access_key: str) -> None:
     """ElfHosted fork: when ACCESS_KEY is configured, /search and /resolve-imdb
@@ -5320,8 +5349,7 @@ async def get_logo(
     then falls through to TMDB and Metahub as needed.  No rendering is applied —
     callers receive the original PNG exactly as stored.
     """
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    _require_operator(access_key)
 
     if _HTTP_CLIENT is None:
         raise HTTPException(status_code=503, detail="Service unavailable")
@@ -5401,6 +5429,94 @@ def _queue_release_warm(tmdb_id: str, tmdb_status: str | None) -> None:
     task = asyncio.get_running_loop().create_task(_warm())
     _release_warm_tasks.add(task)          # keep a strong reference
     task.add_done_callback(_release_warm_tasks.discard)
+
+
+# Background rating warm for /p (ElfHosted fork, PRESET_MDBLIST_FETCH).
+#
+# Same shape as the release-fact warm above: /p may never call MDBList in the
+# foreground, but with /poster closed on a preset-only instance nothing else
+# would ever fetch a rating. Bounded by MDBLIST_CONCURRENCY (shared with every
+# other MDBList caller), de-duplicated, capped in how much can be pending, and
+# it only spends a key that is off cooldown here AND fleet-wide and has quota
+# left. A 429 is recorded exactly as /poster records one, so the whole fleet
+# backs off. The row it writes is the same one the cache warmer and /poster
+# write, so it serves them too.
+_rating_warm_pending: set[str] = set()
+_rating_warm_tasks: set["asyncio.Task[None]"] = set()
+_rating_warm_failed_until: dict[str, float] = {}
+_RATING_WARM_MAX_PENDING = 256
+_RATING_WARM_FAILURE_BACKOFF = 600.0
+
+
+def _queue_rating_warm(
+    canonical_id: str, imdb_id: str, tmdb_id: str, media_type: str,
+    genre_ids: list[int],
+) -> None:
+    global _mdblist_semaphore
+    if (not _cfg.PRESET_MDBLIST_FETCH or not _cfg.SERVER_MDBLIST_KEYS
+            or _HTTP_CLIENT is None
+            or canonical_id in _rating_warm_pending
+            or len(_rating_warm_pending) >= _RATING_WARM_MAX_PENDING):
+        return
+    loop = asyncio.get_running_loop()
+    if loop.time() < _rating_warm_failed_until.get(canonical_id, 0.0):
+        return
+    if _mdblist_semaphore is None:
+        _mdblist_semaphore = asyncio.Semaphore(_cfg.MDBLIST_CONCURRENCY)
+    _rating_warm_pending.add(canonical_id)
+
+    async def _warm() -> None:
+        try:
+            now = loop.time()
+            key = _warm_mdblist_key_with_quota(_resolve_mdblist_key(""), now, 0)
+            if key is None or await _fleet_mdblist_cooling(key):
+                return
+            async with _mdblist_semaphore:
+                result = await fetch_rating(
+                    _HTTP_CLIENT, key, genre_ids, media_type,
+                    media_id=imdb_id or tmdb_id,
+                    provider="imdb" if imdb_id else "tmdb",
+                )
+            if isinstance(result, _RateLimited):
+                backoff, _ = _mark_mdblist_rate_limit(canonical_id, key, result)
+                await _publish_fleet_mdblist_cooldown(key, backoff)
+                return
+            if result is FETCH_FAILED:
+                _rating_warm_failed_until[canonical_id] = (
+                    loop.time() + _RATING_WARM_FAILURE_BACKOFF
+                )
+                return
+            ratings_dict, genre, rel, keywords, age_rating = result
+            award_wins, award_noms = parse_mdblist_awards(
+                keywords, tmdb_id=tmdb_id, media_type=media_type,
+            )
+            kw_names = {(kw.get("name") or "").lower().strip() for kw in keywords}
+            set_cached_rating(
+                canonical_id,
+                ratings_dict if isinstance(ratings_dict, dict) else {},
+                genre or "Unknown",
+                rel,
+                award_wins,
+                award_noms,
+                awards_fetched=True,
+                festival_keyword=match_festival_keyword(kw_names),
+                age_rating=age_rating,
+                is_cult=bool({"cult-classic", "cult-film"} & kw_names),
+                is_true_story="based-on-true-story" in kw_names,
+                is_metacritic="metacritic-must-see" in kw_names,
+            )
+        except Exception as exc:
+            logger.debug(f"Preset rating warm failed for {canonical_id}: {exc}")
+        finally:
+            _rating_warm_pending.discard(canonical_id)
+            if len(_rating_warm_failed_until) > 4 * _RATING_WARM_MAX_PENDING:
+                _now = loop.time()
+                for _k in [k for k, v in _rating_warm_failed_until.items() if v <= _now]:
+                    _rating_warm_failed_until.pop(_k, None)
+
+    task = loop.create_task(_warm())
+    _rating_warm_tasks.add(task)          # keep a strong reference
+    task.add_done_callback(_rating_warm_tasks.discard)
 
 
 # ---------------------------------------------------------------------------
@@ -5684,8 +5800,11 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             genre = cached_genre or "Unknown"
             rel = cached_release_date
         else:
-            # No MDBList row. The IMDb dataset is still a local table, so a
-            # dataset-sourced score is allowed here exactly as /poster uses it.
+            # No MDBList row: ask for one in the background (PRESET_MDBLIST_FETCH)
+            # so the next hit can persist. Nothing is fetched on this request.
+            _queue_rating_warm(canonical_id, imdb_id, tmdb_id, type, genre_ids)
+            # The IMDb dataset is still a local table, so a dataset-sourced
+            # score is allowed here exactly as /poster uses it.
             ratings_dict = _merge_imdb_dataset_rating({}, imdb_id, rcfg)
             if ratings_dict:
                 weights = (
@@ -6193,8 +6312,15 @@ async def get_poster(
     debug: str | None = None,
     nocache: str | None = None,
 ):
-    if _cfg.ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized, your access key is not valid for this instance.")
+    # ElfHosted fork: fail-closed operator gate — see _require_operator.
+    _require_operator(
+        access_key,
+        public_detail=(
+            "Custom posters are not available on this instance; use a "
+            "/p/{preset}/{type}/{imdb_id}.jpg preset URL."
+        ),
+        detail="Unauthorized, your access key is not valid for this instance.",
+    )
 
     # ElfHosted fork: per-tenant rate limit. Tenant identity is derived from
     # the user-supplied key when the user brings their own (so a noisy tenant
