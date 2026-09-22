@@ -461,11 +461,17 @@ IMDB_DATASET_MIN_VOTES       = max(0, int(os.environ.get("IMDB_DATASET_MIN_VOTES
 # Cache warming — proactively populate the TMDB metadata cache (logos, posters,
 # credits) and the MDBList rating/award cache for currently-trending titles, so
 # the first real requests for them are fast and don't all hit upstream APIs at
-# once. Off by default — enable explicitly once the server keys' quotas are
-# understood. Each budget is a ceiling on actual API calls (cache hits don't
-# count), so steady-state runs after the first one are typically far cheaper
-# than the configured budgets.
-CACHE_WARM_ENABLED           = os.environ.get("CACHE_WARM_ENABLED", "false").strip().lower() == "true"
+# once. Each budget is a ceiling on actual API calls (cache hits don't count),
+# so steady-state runs after the first one are typically far cheaper than the
+# configured budgets.
+#
+# ElfHosted fork: ON by default (upstream: off). Every instance we run routes
+# its lookups through emdb, where trending titles are almost always already
+# cached, so a cycle costs little upstream quota and turns hot titles'
+# first requests into persistable renders. Set CACHE_WARM_ENABLED=false to opt
+# out — e.g. to keep a disk-constrained instance from caching artwork for up to
+# CACHE_WARM_TMDB_BUDGET titles.
+CACHE_WARM_ENABLED           = os.environ.get("CACHE_WARM_ENABLED", "true").strip().lower() == "true"
 CACHE_WARM_TMDB_BUDGET       = int(os.environ.get("CACHE_WARM_TMDB_BUDGET", "2000"))
 CACHE_WARM_MDBLIST_BUDGET    = int(os.environ.get("CACHE_WARM_MDBLIST_BUDGET", "500"))
 # MDBList's limit is a per-key daily quota (1000/day free) shared with live
