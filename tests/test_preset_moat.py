@@ -15,6 +15,7 @@ import asyncio
 import io
 import os
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -44,6 +45,7 @@ sb.TMDB_LOGO_CACHE_DIR = config.TMDB_LOGO_CACHE_DIR
 import blobstore
 import cache
 import main
+from discovery import DiscoveryMeta
 from fastapi import HTTPException
 
 # A non-textless poster so the OCR branch is skipped on the happy path; a
@@ -90,7 +92,15 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(main, "fetch_trending_rank",
                               mock.AsyncMock(return_value=None)),
             mock.patch.object(main, "build_poster", lambda *a, **k: _img()),
-            mock.patch.object(main, "extract_discovery_meta", lambda **k: {}),
+            # A real (empty) DiscoveryMeta, not {}: the persist path runs
+            # pick_sash on it to cap the composite's lifetime.
+            mock.patch.object(
+                main, "extract_discovery_meta",
+                lambda **k: DiscoveryMeta(
+                    award_wins=[], award_noms=[], trending_rank=None,
+                    original_language="en",
+                ),
+            ),
             mock.patch.object(main, "is_digital_release", lambda _i: False),
             # If the foreground OCR scanner is ever invoked from /p, fail loudly.
             mock.patch.object(main, "_start_text_detection",
@@ -154,6 +164,80 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
         finally:
             for c in ctxs:
                 c.stop()
+
+    async def test_coalescing_does_not_hold_a_render_slot(self):
+        """Joining an in-flight render must not occupy an admission slot.
+
+        With the cap at one, a /poster request can publish its future and then
+        queue for a slot. If /p waits for that future while holding the only
+        slot, neither can proceed: RENDER_QUEUE_TIMEOUT turns it into a 503 and
+        with the timeout disabled it hangs forever. So the join has to happen
+        before admission — with the cap at one and a slot already taken, this
+        request must still return the coalesced bytes promptly.
+        """
+        imdb = "tt5555555"
+        preset = "clean_notch"
+        key = main._composite_cache_key(
+            imdb, "278", "movie",
+            dict(main.get_preset(preset)),
+            main.build_request_config(dict(main.get_preset(preset))).fallback_to_imdb,
+            imdb_id=imdb,
+        )
+
+        prev_cap = config.POSTER_RENDER_CONCURRENCY
+        prev_sem = main._render_semaphore
+        config.POSTER_RENDER_CONCURRENCY = 1
+        main._render_semaphore = None
+        sem = main._get_render_semaphore()
+        await sem.acquire()          # the only slot, held by someone else
+        try:
+            fut = asyncio.get_running_loop().create_future()
+            fut.set_result((b"COALESCED", False, int(time.time()) + 3600))
+            main._render_inflight[key] = fut
+            try:
+                ctxs = self._patches(_META_NON_TEXTLESS)
+                for c in ctxs:
+                    c.start()
+                try:
+                    resp = await asyncio.wait_for(
+                        main.get_preset_poster(preset, "movie", imdb), timeout=5
+                    )
+                finally:
+                    for c in ctxs:
+                        c.stop()
+            finally:
+                main._render_inflight.pop(key, None)
+        finally:
+            sem.release()
+            config.POSTER_RENDER_CONCURRENCY = prev_cap
+            main._render_semaphore = prev_sem
+
+        self.assertEqual(resp.body, b"COALESCED")
+
+    async def test_a_titled_poster_is_swapped_for_the_backdrop_like_poster(self):
+        """/poster replaces a poster with its title burned in by a backdrop
+        crop. /p must pick the same art: the two share a composite key, and a
+        preset that rendered the titled poster would store a different image
+        under the key /poster reads."""
+        meta = (
+            [28], False, [], "1994", "Test Title", "/titled.jpg", "/backdrop.jpg",
+            {"vote_count": 1234, "original_language": "en"},
+        )
+        backdrop = mock.AsyncMock(return_value=_img())
+        poster = mock.AsyncMock(return_value=_img())
+        ctxs = self._patches(meta) + [
+            mock.patch.object(main, "fetch_backdrop_image", backdrop),
+            mock.patch.object(main, "fetch_poster_image", poster),
+        ]
+        for c in ctxs:
+            c.start()
+        try:
+            await main.get_preset_poster("clean_notch", "movie", "tt6666666")
+        finally:
+            for c in ctxs:
+                c.stop()
+        backdrop.assert_awaited()
+        poster.assert_not_awaited()
 
     async def test_unwarmed_release_status_is_not_persisted(self):
         """A film with a cached rating but no cached release status is still

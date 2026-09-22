@@ -412,6 +412,19 @@ def _peek_final_poster(cache_key: str) -> int | None:
             return int(expires_at)
 
 
+def _composite_row_is_live(bucket: str, cache_key: str) -> bool:
+    """True when a fresh metadata row still names this blob.
+
+    The drain's authority: the row lives in the shared database, so this answer
+    holds across workers and replicas, where the process-local generation map
+    cannot. Expired rows are swept by the peek, so they correctly read as not
+    live and their blobs are collected.
+    """
+    if bucket != blobstore.BUCKET_COMPOSITES:
+        return False
+    return _peek_final_poster(cache_key) is not None
+
+
 async def is_cached_final_poster_fresh(cache_key: str) -> int | None:
     """Lightweight freshness probe — checks L1, then the metadata row + TTL,
     never touches the blobstore. Lets /poster emit a 302 to the CDN without
@@ -429,7 +442,7 @@ async def is_cached_final_poster_fresh(cache_key: str) -> int | None:
         expires_at = _peek_final_poster(cache_key)
         if expires_at is not None:
             return expires_at
-        await blobstore.delete(blobstore.BUCKET_COMPOSITES, cache_key)
+        blobstore.delete_later(blobstore.BUCKET_COMPOSITES, cache_key)
         return None
     except Exception as exc:
         logger.error(f"Final poster freshness probe error: {exc}")
@@ -457,7 +470,11 @@ async def get_cached_final_poster_entry(cache_key: str) -> "tuple[bytes, int] | 
 
         expires_at = _peek_final_poster(cache_key)
         if expires_at is None:
-            await blobstore.delete(blobstore.BUCKET_COMPOSITES, cache_key)
+            # Queue rather than delete inline: this read can interleave with
+            # another request mid-write for the same key, and an inline delete
+            # would remove the blob it had just published. The drain re-checks
+            # the row first, which is the check that makes it safe.
+            blobstore.delete_later(blobstore.BUCKET_COMPOSITES, cache_key)
             return None
 
         data = await blobstore.get(
@@ -565,10 +582,10 @@ async def set_cached_final_poster(
             if COMPOSITE_MEM_ENTRIES > 0:
                 with _composite_l1_lock:
                     _composite_l1.pop(k, None)
-            try:
-                await blobstore.delete(blobstore.BUCKET_COMPOSITES, k)
-            except Exception:
-                pass
+            # Queued, not deleted inline: the eviction and a competing
+            # re-render of the same key can interleave, and the drain's row
+            # check is what tells the two apart.
+            blobstore.delete_later(blobstore.BUCKET_COMPOSITES, k)
     except Exception as exc:
         logger.error(f"Final poster cache write error: {exc}")
 
@@ -684,13 +701,40 @@ async def prune_caches() -> None:
 
     # Best-effort blob deletion for the expired composite rows, plus anything
     # the synchronous delete/invalidate paths queued since the last sweep.
+    # Through the same queue rather than deleted here, so they get the same
+    # row check: a title re-rendered between the prune's DELETE and this line
+    # has a live row again, and its blob must survive.
     for k in expired_composite_keys:
-        try:
-            await blobstore.delete(blobstore.BUCKET_COMPOSITES, k)
-        except Exception as exc:
-            logger.warning(f"Composite blob delete error for {k}: {exc}")
-    await blobstore.drain_deferred_deletes()
+        blobstore.delete_later(blobstore.BUCKET_COMPOSITES, k)
+    await blobstore.drain_deferred_deletes(is_live=_composite_row_is_live)
     blobstore._forget_generations_if_idle()
+
+
+async def prune_local_caches() -> None:
+    """Pod-local cleanup: the deferred blob queue and the TMDB artwork files.
+
+    TMDB poster/logo bytes are a per-POD filesystem cache on this backend too
+    (see the module docstring) — only the relational data is shared. They were
+    never swept on Postgres deployments at all, so a long-running pod grew
+    artwork for every title it ever rendered, ignoring the configured TTLs.
+    Being pod-local, this has to run on followers as well as the prune leader.
+    """
+    await blobstore.drain_deferred_deletes(is_live=_composite_row_is_live)
+    blobstore._forget_generations_if_idle()
+    await asyncio.to_thread(_prune_local_files)
+
+
+def _prune_local_files() -> None:
+    # Same jitter allowance as the SQLite backend, so this never deletes a file
+    # the read path would still consider fresh.
+    _prune_file_cache(
+        TMDB_POSTER_CACHE_DIR,
+        TMDB_POSTER_CACHE_DURATION + TMDB_IMAGE_CACHE_JITTER_DAYS / 2,
+    )
+    _prune_file_cache(
+        TMDB_LOGO_CACHE_DIR,
+        TMDB_LOGO_CACHE_DURATION + TMDB_IMAGE_CACHE_JITTER_DAYS / 2,
+    )
 
 
 def _prune_sync() -> list[str]:
@@ -792,21 +836,6 @@ def _prune_sync() -> list[str]:
             conn.commit()
         # Postgres autovacuum handles space reclamation — no explicit VACUUM here.
 
-        # TMDB poster/logo bytes are a per-POD filesystem cache on this backend
-        # too (see the module docstring) — only the relational data is shared.
-        # Without this they were never swept on Postgres deployments, so a
-        # long-running pod grew artwork for every title it ever rendered,
-        # ignoring the configured TTLs entirely. Same jitter allowance as the
-        # SQLite backend, so prune never deletes a file the read path would
-        # still consider fresh.
-        _prune_file_cache(
-            TMDB_POSTER_CACHE_DIR,
-            TMDB_POSTER_CACHE_DURATION + TMDB_IMAGE_CACHE_JITTER_DAYS / 2,
-        )
-        _prune_file_cache(
-            TMDB_LOGO_CACHE_DIR,
-            TMDB_LOGO_CACHE_DURATION + TMDB_IMAGE_CACHE_JITTER_DAYS / 2,
-        )
     except Exception as exc:
         logger.error(f"Cache prune error: {exc}")
     return expired_composite_keys

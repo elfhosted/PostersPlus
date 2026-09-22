@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 _PUBLIC_API = (
     "init_db",
     "prune_caches",
+    "prune_local_caches",
     "ping",
     "close",
     "get_cached_final_poster",

@@ -47,6 +47,23 @@ _DATASET_URL = "https://datasets.imdbws.com/title.ratings.tsv.gz"
 # Shared across worker processes via cache.db's app_state table, so only one
 # worker per interval performs the download. See imdb_dataset_refresh_loop.
 _REFRESH_CLAIM_KEY = "imdb_dataset_refresh_claimed_at"
+
+
+def _refresh_claim_key() -> str:
+    """ElfHosted fork: scope the refresh claim to the dataset's storage.
+
+    The claim dedupes workers that share ONE dataset file. On SQLite the claim
+    table and the dataset sit on the same volume, so that holds. On the
+    Postgres backend the claim is shared by every pod while the dataset is
+    still a pod-local SQLite file, so one pod would win and every other pod
+    would re-read its own empty table forever. Keying by hostname keeps the
+    dedupe within a pod (its workers share the file) without starving the rest.
+    """
+    import cache as _cache
+    if getattr(_cache, "BACKEND_KIND", "sqlite") == "sqlite":
+        return _REFRESH_CLAIM_KEY
+    import socket
+    return f"{_REFRESH_CLAIM_KEY}:{socket.gethostname()}"
 # How long a worker with an empty table waits before looking again.
 _NOT_READY_RETRY_SECS = 60
 
@@ -316,13 +333,14 @@ async def imdb_dataset_refresh_loop(client: httpx.AsyncClient) -> None:
     await asyncio.sleep(30)  # let the service finish warming up first
     while True:
         try:
-            if claim_app_state_slot(_REFRESH_CLAIM_KEY, time.time(), interval * 0.9):
+            _claim_key = _refresh_claim_key()
+            if claim_app_state_slot(_claim_key, time.time(), interval * 0.9):
                 if await refresh_dataset(client) == 0:
                     # Download or parse failed. Release the claim rather than
                     # holding it for most of a day — otherwise one transient
                     # startup failure leaves every worker locked out until
                     # tomorrow, which is exactly when it matters least.
-                    set_app_state(_REFRESH_CLAIM_KEY, "0")
+                    set_app_state(_claim_key, "0")
             else:
                 logger.info(
                     "IMDb dataset refresh claimed by another worker "

@@ -148,6 +148,49 @@ class DeferredBlobDeleteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(entry, "write during drain lost its blob")
         self.assertEqual(entry[0], b"SECOND")
 
+    async def test_a_delete_queued_by_another_worker_spares_a_live_row(self):
+        """The cross-process case the generation map cannot see.
+
+        Worker A invalidates a composite and queues its blob. Worker B — a
+        different process, so a different generation map and a different key
+        lock — regenerates it under the same key. A's drain must still not
+        delete B's blob.
+
+        Simulated by clearing this process's generation bookkeeping between the
+        queue and the write, which is exactly what A would observe: a queued
+        delete and no local record of the write. What saves the blob is the
+        metadata row, which both workers share.
+        """
+        await cache.set_cached_final_poster(KEY, b"FIRST")
+        cache.invalidate_final_posters("99", "movie")
+        with blobstore._deferred_lock:
+            queued_at = blobstore._deferred_deletes[
+                (blobstore.BUCKET_COMPOSITES, KEY)
+            ]
+
+        # Worker B's write. In one process this cancels the queued delete; in
+        # another process it cannot, so put the entry back exactly as worker A
+        # still holds it — queued, with no local record of B's write.
+        await cache.set_cached_final_poster(KEY, b"SECOND")
+        with blobstore._deferred_lock:
+            blobstore._blob_generation.clear()
+            blobstore._deferred_deletes[
+                (blobstore.BUCKET_COMPOSITES, KEY)
+            ] = queued_at
+
+        await blobstore.drain_deferred_deletes(is_live=sb._composite_row_is_live)
+
+        self.assertEqual(
+            await self._blob(), b"SECOND",
+            "a delete queued in another process deleted a live composite",
+        )
+        self._drop_l1()
+        self.assertIsNotNone(
+            await cache.is_cached_final_poster_fresh(KEY),
+            "row survived but its blob did not — a CDN redirect would 302 to "
+            "a missing object",
+        )
+
     async def test_the_queue_is_bounded_and_says_so(self):
         original = blobstore.DEFERRED_DELETE_MAX
         blobstore.DEFERRED_DELETE_MAX = 3

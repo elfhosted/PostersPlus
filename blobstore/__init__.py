@@ -188,10 +188,20 @@ def deferred_delete_stats() -> dict:
         return {"queued": len(_deferred_deletes), "dropped": _deferred_dropped}
 
 
-async def drain_deferred_deletes(limit: int | None = None) -> int:
+async def drain_deferred_deletes(limit: int | None = None, is_live=None) -> int:
     """Delete queued blobs. Returns how many were removed. Best effort: a key
     whose delete raises is dropped rather than retried forever, because the
-    row that named it is already gone."""
+    row that named it is already gone.
+
+    *is_live* is the authoritative guard: a callable taking (bucket, key) and
+    returning True when a live metadata row still names that blob. The
+    generation map and key lock below only see THIS process, so on their own
+    they cannot stop worker A's queued delete from removing the composite
+    worker B has just regenerated under the same key — a fresh row pointing at
+    nothing, which the inline read recovers from but a CDN redirect does not.
+    The metadata row is shared by every worker and replica, so asking it is
+    what actually settles the question.
+    """
     removed = 0
     while limit is None or removed < limit:
         with _deferred_lock:
@@ -208,6 +218,21 @@ async def drain_deferred_deletes(limit: int | None = None) -> int:
                     _blob_generation.pop((bucket, key), None)
             if superseded:
                 continue
+            if is_live is not None:
+                try:
+                    if await _asyncio.to_thread(is_live, bucket, key):
+                        # Someone regenerated this composite. Its row names the
+                        # blob, so the blob stays.
+                        continue
+                except Exception as exc:
+                    # Cannot confirm the blob is unreferenced, so leave it. An
+                    # orphan costs storage; deleting a live one costs a broken
+                    # redirect.
+                    logger.debug(
+                        "Deferred blob delete skipped for %s:%s — liveness "
+                        "check failed: %s", bucket, key, exc,
+                    )
+                    continue
             try:
                 await delete(bucket, key)
             except Exception as exc:

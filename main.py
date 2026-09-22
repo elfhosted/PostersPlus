@@ -723,6 +723,7 @@ from cache import (
     set_cached_rating,
     delete_cached_tmdb_metadata,
     prune_caches,
+    prune_local_caches,
     release_status_ttl_seconds,
     get_cache_stats,
     get_app_state,
@@ -3688,14 +3689,18 @@ async def _cache_prune_loop() -> None:
             else:
                 logger.debug("Cache prune skipped — another replica holds the lease")
 
-            # The deferred blob-delete queue is process-local, but ANY worker
+            # Everything below is per-POD, so it runs whether or not this pod
+            # won the lease. Leadership decides who prunes the SHARED database,
+            # not who cleans up after itself.
+            #
+            # The deferred blob-delete queue is process-local and any worker
             # can fill it — every invalidation this process performs lands
-            # here. Draining it only inside the leader's prune would let a
-            # follower's queue grow until it hit its cap and started discarding
-            # keys, orphaning those objects for good. Leadership decides who
-            # prunes the shared database, not who cleans up after itself.
-            await blobstore.drain_deferred_deletes()
-            blobstore._forget_generations_if_idle()
+            # there — so a follower that never drained would grow to the cap
+            # and start discarding keys, orphaning those objects for good.
+            # The TMDB poster/logo caches are pod-local files, so a follower
+            # that never swept them would keep artwork for every title it ever
+            # rendered, ignoring the configured TTLs until the volume filled.
+            await prune_local_caches()
 
             # Per-worker in-memory state, so this runs regardless of leadership.
             expired, orphans = prune_rating_state(asyncio.get_running_loop().time())
@@ -4234,16 +4239,26 @@ async def _trending_fetch_loop() -> None:
             wait = (target_dt - now_dt).total_seconds()
             
         logger.info(f"Trending fetch: next cycle scheduled in {wait / 3600:.1f} hours")
-        await asyncio.sleep(wait)
         try:
-            if _HTTP_CLIENT is None:
-                pass
-            elif await _lead():
-                await _run_trending_fetch_cycle(_HTTP_CLIENT)
-            else:
-                logger.debug("Trending fetch skipped — another replica holds the lease")
-        except Exception as exc:
-            logger.error(f"Trending fetch: cycle failed: {exc}")
+            await asyncio.sleep(wait)
+            try:
+                if _HTTP_CLIENT is None:
+                    pass
+                elif await _lead():
+                    await _run_trending_fetch_cycle(_HTTP_CLIENT)
+                else:
+                    logger.debug("Trending fetch skipped — another replica holds the lease")
+            except Exception as exc:
+                logger.error(f"Trending fetch: cycle failed: {exc}")
+        except asyncio.CancelledError:
+            # Shutdown. Hand the lease back rather than making the next pod
+            # wait out a 26-hour TTL before anything refreshes trending again —
+            # a rolling deploy would otherwise skip a daily cycle every time.
+            if lease_token is not None:
+                with suppress(Exception):
+                    await coord.release_lease(coord.LEASE_TRENDING_FETCH, lease_token)
+                lease_token = None
+            raise
 
 
 async def _cache_warm_loop(digital_release_ready: asyncio.Event | None = None) -> None:
@@ -5447,6 +5462,43 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
     wants_badges = rcfg.badge_display_mode != 0
     quality_missing = wants_badges and cached_quality is None
 
+    # Coalesce onto an in-flight render for the same composite, BEFORE taking
+    # an admission slot.
+    #
+    # Waiting while holding a slot is a circular wait: with the cap at one, a
+    # /poster request can publish its future and then queue for the slot this
+    # request is sitting on while this request waits for that future. Neither
+    # proceeds — RENDER_QUEUE_TIMEOUT turns it into a 503, and with the timeout
+    # disabled it never resolves at all. Nothing is needed from the fetch
+    # pipeline to join: the composite key is already known.
+    _existing_fut = _render_inflight.get(final_cache_key)
+    if _existing_fut is not None:
+        logger.info(f"Preset {preset} coalescing on {final_cache_key}")
+        try:
+            _coalesced = await _existing_fut
+            # /poster's futures carry (bytes, provisional, expires_at); this
+            # route publishes the same shape, but accept bare bytes too so an
+            # older in-flight render is never mis-read.
+            if isinstance(_coalesced, tuple):
+                _coalesced_bytes = _coalesced[0]
+                _coalesced_provisional = _coalesced[1]
+                _coalesced_expires_at = (
+                    _coalesced[2] if len(_coalesced) > 2 else None
+                )
+            else:
+                _coalesced_bytes, _coalesced_provisional = _coalesced, False
+                _coalesced_expires_at = None
+            # A provisional /poster render is one made without all its inputs,
+            # which is exactly what must not go out under the long preset TTL.
+            return Response(
+                content=_coalesced_bytes, media_type=f"image/{_cfg.IMAGE_FORMAT}",
+                headers=_preset_header(
+                    not _coalesced_provisional, _coalesced_expires_at
+                ),
+            )
+        except Exception:
+            pass   # in-flight render failed; fall through and try ourselves
+
     # Bound before the try: the finally clears this slot, and a failure in the
     # metadata fetch below happens before the coalescing future is created.
     _render_fut: "asyncio.Future[bytes] | None" = None
@@ -5553,26 +5605,52 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             _orig_art = _p_default or next(iter(_ranked_posters), None)
         else:
             _orig_art = next(iter(_ranked_posters), None) or _p_default
+        # Art selection, mirroring /poster step for step: the two routes share
+        # composite keys, so a preset that picked different art would store a
+        # different poster under the key /poster reads.
+        #
+        #   no poster, or a poster with its title burned in → backdrop crop,
+        #   which is textless, so our logo goes on top;
+        #   original-art mode overrides both and serves the poster as-is.
+        _art_undetermined = False
+        use_backdrop = bool(backdrop_path) and (poster_path is None or not is_textless)
+        if use_backdrop:
+            is_textless = True
         if rcfg.use_original_art and _orig_art:
             poster_path = _orig_art
             is_textless = False
+            use_backdrop = False
+        is_no_poster = poster_path is None and not use_backdrop
 
-        # No-poster ladder: poster → backdrop → gradient canvas.
-        is_no_poster = poster_path is None
-        use_backdrop = is_no_poster and backdrop_path is not None
+        _vc = tmdb_data.get("vote_count")
+        _vote_detection_ok = _detection_vote_ok(_vc)
         if use_backdrop:
-            image_coro = fetch_backdrop_image(client, tmdb_id, backdrop_path)
+            # /poster crops a backdrop text-aware when detection is on and the
+            # title is under the vote gate — and that crop runs OCR, which this
+            # route may not. Crop plainly, and if /poster would have cropped
+            # differently, don't share the result.
+            _poster_would_avoid_text = (
+                _cfg.TEXTLESS_TEXT_DETECTION and _vote_detection_ok
+            )
+            if _poster_would_avoid_text:
+                _art_undetermined = True
+            image_coro = fetch_backdrop_image(
+                client, tmdb_id, backdrop_path, avoid_text=False
+            )
         elif is_no_poster:
+            # /poster tries TVDB art and the atmospheric genre backgrounds
+            # before the flat canvas — more requests than the moat allows. The
+            # canvas is a fine anonymous answer but not the same poster.
+            _art_undetermined = True
             image_coro = _resolved(_make_fallback_canvas(genre_ids))
         else:
             image_coro = fetch_poster_image(client, tmdb_id, type, poster_path)
 
         # Burned-in-text detection: CACHED ONLY. Never scan in the foreground on
-        # an anonymous hit. If a textless poster's detection isn't cached, the
-        # render is "undetermined" (it might differ from what /poster produces
-        # once OCR runs), so we don't persist it and we queue a background scan
-        # to warm it — matching /poster's det cache key exactly so the result
-        # is shared.
+        # an anonymous hit. The detection key follows the art actually chosen —
+        # a backdrop is scanned under its own "bd:" key, exactly as /poster
+        # does, so a result either route computes is shared. Uncached means the
+        # render is undetermined: queue the background scan and don't persist.
         _suppress_overlay = False
         _ocr_undetermined = False
         _scan_selected = (
@@ -5580,20 +5658,29 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
         )
         if _scan_selected:
             from text_detect import DETECT_RES_SIG
-            _det_src = f"ps:{poster_path}"
+            if use_backdrop:
+                _det_src = f"bd:{backdrop_path}:{_CROP_VERSION}:plain"
+                _image_cache_key = (
+                    f"backdrop_{tmdb_id}_{backdrop_path.strip('/')}_{_CROP_VERSION}"
+                )
+                _det_source = "backdrop"
+            else:
+                _det_src = f"ps:{poster_path}"
+                _image_cache_key = f"{type}_{tmdb_id}_{poster_path.strip('/')}"
+                _det_source = "poster"
             _det_key = f"{_det_src}|conf={_cfg.PPOCR_BOX_THRESHOLD}:{DETECT_RES_SIG}"
             _det_cached = get_cached_text_detection(_det_key)
             if _det_cached is None:
                 _ocr_undetermined = True
                 _queue_background_text_detection(_DeferredTextDetection(
                     cache_key=_det_key,
-                    image_cache_key=f"{type}_{tmdb_id}_{poster_path.strip('/')}",
+                    image_cache_key=_image_cache_key,
                     title=tuple(v for v in (title, tmdb_data.get("original_title")) if v),
-                    source="poster",
+                    source=_det_source,
                     tmdb_id=tmdb_id,
                     media_type=type,
                     image_path=poster_path,
-                    vote_count=tmdb_data.get("vote_count"),
+                    vote_count=_vc,
                     source_key=_det_src,
                 ))
             else:
@@ -5647,40 +5734,14 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             and not quality_missing
             and not _ocr_undetermined
             and not _release_undetermined
+            and not _art_undetermined
         )
 
-        # Coalesce concurrent uncached renders — only on the will-persist path
-        # (an incomplete render must not be shared under the long preset TTL).
-        if will_persist:
-            _existing_fut = _render_inflight.get(final_cache_key)
-            if _existing_fut is not None:
-                logger.info(f"Preset {preset} coalescing on {final_cache_key}")
-                try:
-                    _coalesced = await _existing_fut
-                    # /poster's futures carry (bytes, provisional, expires_at);
-                    # this route's carry bare bytes. Accept either, because the
-                    # two share _render_inflight keyed by the same composite key
-                    # and either endpoint can be the one that got there first.
-                    if isinstance(_coalesced, tuple):
-                        _coalesced_bytes = _coalesced[0]
-                        _coalesced_provisional = _coalesced[1]
-                        _coalesced_expires_at = (
-                            _coalesced[2] if len(_coalesced) > 2 else None
-                        )
-                    else:
-                        _coalesced_bytes, _coalesced_provisional = _coalesced, False
-                        _coalesced_expires_at = None
-                    # A provisional /poster render is one rendered without all
-                    # its inputs, which is exactly what must not go out under
-                    # the long preset TTL.
-                    return Response(
-                        content=_coalesced_bytes, media_type=f"image/{_cfg.IMAGE_FORMAT}",
-                        headers=_preset_header(
-                            not _coalesced_provisional, _coalesced_expires_at
-                        ),
-                    )
-                except Exception:
-                    pass   # in-flight render failed; fall through and try ourselves
+        # Publish this render for others to coalesce onto — only on the
+        # will-persist path (an incomplete render must not be shared under the
+        # long preset TTL). Joining an existing render happened before
+        # admission, above.
+        if will_persist and _render_inflight.get(final_cache_key) is None:
             _render_fut = asyncio.get_running_loop().create_future()
             _render_fut.add_done_callback(
                 lambda f: f.exception() if not f.cancelled() and f.exception() else None
@@ -5724,6 +5785,10 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             release_year=release_year,
             age_rating=age_rating,
             no_poster=is_no_poster,
+            # A confirmed burned-in title must also switch off the tinted
+            # frosting, as /poster does; suppressing only the logo left the
+            # tint painted over the existing title.
+            has_burned_in_text=(_suppress_overlay is True),
         )
 
         def _composite_and_encode() -> bytes:
@@ -5752,8 +5817,23 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             # refresh would need the /poster query string, which this route
             # never had. The composite is still invalidated by tmdb_id like any
             # other, so a rank change drops it and the next hit re-renders.
+            # Same dependency cap /poster applies: a composite must not outlive
+            # the facts baked into it. Without it a preset with a trending sash
+            # or a Cinema/Production status sat for the full ~7-day composite
+            # TTL — and, sharing /poster's key, served that stale sash to
+            # configured instances too, since cache hits skip resolution.
+            _ttl_override = None
+            _sash_result = pick_sash(discovery_meta, rcfg.sash_priority)
+            if _sash_result and _sash_result[1] in ("trending", "trending_broad"):
+                _ttl_override = 86400
+            if _release_status:
+                _status_ttl = release_status_ttl_seconds(_release_status)
+                _ttl_override = (
+                    _status_ttl if _ttl_override is None
+                    else min(_ttl_override, _status_ttl)
+                )
             _persisted_expires_at = await set_cached_final_poster(
-                final_cache_key, img_bytes
+                final_cache_key, img_bytes, ttl_override=_ttl_override,
             )
             logger.info(f"Preset {preset} rendered + cached {final_cache_key}")
             if _render_fut is not None and not _render_fut.done():
@@ -5771,7 +5851,8 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
                 f"Preset {preset} rendered (not persisted: "
                 f"rating_cached={cached_rating is not None}, "
                 f"quality_missing={quality_missing}, ocr_undetermined={_ocr_undetermined}, "
-                f"release_undetermined={_release_undetermined}) "
+                f"release_undetermined={_release_undetermined}, "
+                f"art_undetermined={_art_undetermined}) "
                 f"{final_cache_key}"
             )
         return Response(content=img_bytes, media_type=f"image/{_cfg.IMAGE_FORMAT}",
