@@ -95,7 +95,7 @@ services:
     environment:
       - TMDB_API_KEY=your_tmdb_key
       - MDBLIST_API_KEY=your_mdblist_key
-      - TEXTLESS_TEXT_DETECTION=true # set off for faster renders at the cost of potentially printing double logos
+      - TEXTLESS_TEXT_DETECTION=false # off by default in this fork (~170MiB RAM); set true to avoid double logos on mislabelled 'textless' posters
       - ACCESS_KEY=youraccesskey # Highly suggested if exposing to the internet.*
       # See .env.example for all available options
 ```
@@ -178,7 +178,7 @@ All configuration is done via environment variables. Copy `.env.example` to `.en
 | `TMDB_POSTER_MIN_VOTES` | `3` | Prefer textless posters with at least this many votes when they remain competitively rated |
 | `TMDB_POSTER_MAX_SCORE_DROP` | `1.0` | Maximum rating downgrade allowed when preferring a textless poster that meets the vote minimum |
 | `RATING_MIN_VOTES` | `10` | Ignore provider ratings below this vote count. Roger Ebert is exempt |
-| `TEXTLESS_TEXT_DETECTION` | `true` | Detect burned-in title text on posters TMDB mislabelled as "textless" and skip our own logo so the title isn't doubled. Set `false` to opt out |
+| `TEXTLESS_TEXT_DETECTION` | `false` | Detect burned-in title text on posters TMDB mislabelled as "textless" and skip our own logo so the title isn't doubled. Off by default in the ElfHosted fork: the detector holds ~170MiB of RAM per process from startup. Set `true` to opt in |
 | `TEXTLESS_DETECTION_MAX_VOTES` | `3000` | Foreground OCR vote limit. Higher-vote assets render without waiting, skip composite caching, and enter the idle background scan queue. Raise for foreground accuracy; lower for faster stale-cache bursts |
 | `TEXTLESS_FAKE_REPORT` | `true` | Record OCR-rejected TMDB posters in a deduplicated human-review report |
 | `TEXTLESS_FAKE_REPORT_PATH` | `/app/cache/fake_textless_posters.txt` | Report location. The default persists in the existing cache volume |

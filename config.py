@@ -596,12 +596,20 @@ LOGO_STRETCH_FACTOR        = max(1.0, float(os.environ.get("LOGO_STRETCH_FACTOR"
 # download). Foreground scans are vote-gated to protect burst latency; skipped
 # assets are scanned later by the idle background queue.
 #
-# On by default; set TEXTLESS_TEXT_DETECTION=false to opt out.
+# ElfHosted fork: OFF by default (upstream: on); set TEXTLESS_TEXT_DETECTION=true
+# to opt in. The detector is loaded at startup and held for the life of the
+# process — measured on the 1.2.0 image at idle, one worker: 266MiB with it on
+# versus 92MiB off, ~174MiB per pod whether or not a poster is ever scanned. The
+# base install should be as light as possible, and what it buys is cosmetic
+# (no doubled title on the minority of "textless" posters that aren't).
+#
+# Toggling it changes every composite's cache key (the detection settings are
+# folded into it while enabled), so either direction costs a one-time re-render.
 #
 # 3000 covers most titles while excluding the high-vote bulk of large libraries.
 # Raise it for maximum foreground accuracy or lower it for faster stale-cache bursts.
 # Changing it invalidates cached composites.
-TEXTLESS_TEXT_DETECTION    = _parse_bool_env("TEXTLESS_TEXT_DETECTION", True)
+TEXTLESS_TEXT_DETECTION    = _parse_bool_env("TEXTLESS_TEXT_DETECTION", False)
 TEXTLESS_DETECTION_MAX_VOTES = max(0, int(os.environ.get("TEXTLESS_DETECTION_MAX_VOTES", "3000")))
 # Keep a small, deduplicated list of TMDB posters rejected by OCR so operators
 # can review and correct upstream metadata manually.

@@ -301,9 +301,9 @@ Default: `10`
 
 ### `TEXTLESS_TEXT_DETECTION`
 
-Detect burned-in title text on posters TMDB mislabelled as "textless" and skip compositing our own logo so the title isn't doubled. Uses PP-OCRv5 Mobile; its ~4.6MB model is downloaded once into the cache volume. On by default; set to false to opt out. Default: true.
+Detect burned-in title text on posters TMDB mislabelled as "textless" and skip compositing our own logo so the title isn't doubled. Uses PP-OCRv5 Mobile (baked into the image). Off by default in the ElfHosted fork — the detector is loaded at startup and holds ~170MiB of RAM per process whether or not it is used; set to true to opt in. Toggling it re-keys every cached composite, so either direction costs a one-time re-render.
 
-Default: `true`
+Default: `false`
 
 ### `TEXTLESS_FAKE_REPORT`
 
