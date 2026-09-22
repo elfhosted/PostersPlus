@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.2.0-elf.2](https://github.com/elfhosted/PostersPlus/compare/v1.2.0-elf.1...v1.2.0-elf.2) (2026-09-22)
+
+
+### Features
+
+* cache warmer on by default ([1b2eb56](https://github.com/elfhosted/PostersPlus/commit/1b2eb56f0b0c1546ef0da7fc8e061654a0517507))
+
+
+### Bug Fixes
+
+* **p:** don't wait for quality badges when no quality source exists ([689ea67](https://github.com/elfhosted/PostersPlus/commit/689ea67fb910b9699e3aa291799f2f3d22569849))
+* **p:** persist renders when no quality source exists; cache warmer on by default ([7075608](https://github.com/elfhosted/PostersPlus/commit/7075608bf39cfe4744e1b54edf64cb8faf5d8009))
+
+
+### Miscellaneous Chores
+
+* release 1.2.0-elf.2 ([640e0f8](https://github.com/elfhosted/PostersPlus/commit/640e0f8d2c92c30a293b65b7191826c90e3a235e))
+
 ## [1.2.0-elf.1](https://github.com/elfhosted/PostersPlus/compare/v1.1.0-elf.7...v1.2.0-elf.1) (2026-09-22)
 
 
