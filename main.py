@@ -722,6 +722,7 @@ from cache import (
     set_cached_text_detection,
     get_cached_release_status,
     get_cached_imdb_to_tmdb,
+    delete_cached_imdb_to_tmdb,
     init_db,
     is_digital_release,
     set_cached_rating,
@@ -5603,6 +5604,19 @@ _PRESET_ROUTE_VALID_TYPES = frozenset({"movie", "tv"})
 _PRESET_INCOMPLETE_TTL = 60   # short Cache-Control (s) for not-yet-warm renders
 
 
+def _fail_render_future(
+    fut: "asyncio.Future | None", exc: HTTPException
+) -> HTTPException:
+    """Hand a coalescing future the status the originator is about to raise.
+
+    Without this the finally block below fails every waiter with a blanket
+    500, so a request that joined a render which 404s upstream is told the
+    server broke. Returns the exception so callers can ``raise`` it inline."""
+    if fut is not None and not fut.done():
+        fut.set_exception(exc)
+    return exc
+
+
 @app.get("/p/{preset}/{type}/{imdb_id}.jpg")
 async def get_preset_poster(preset: str, type: str, imdb_id: str, shape: str = ""):
     """Anonymous preset render.
@@ -5856,11 +5870,24 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str, shape: str = "
                             headers={"Retry-After": "5"})
 
     try:
-        genre_ids, is_textless, logos, release_year, title, poster_path, backdrop_path, tmdb_data = (
-            await fetch_poster_metadata(
-                client, tmdb_id, effective_tmdb_key, type, rcfg.logo_language,
+        try:
+            genre_ids, is_textless, logos, release_year, title, poster_path, backdrop_path, tmdb_data = (
+                await fetch_poster_metadata(
+                    client, tmdb_id, effective_tmdb_key, type, rcfg.logo_language,
+                )
             )
-        )
+        except httpx.HTTPStatusError as exc:
+            # Only the TITLE lookup 404ing proves the id itself is gone. The
+            # artwork fetches below raise the same exception for a stale image
+            # path, and the title is fine in that case — evicting the mapping
+            # there would churn good rows and buy a /find call per bad image.
+            if exc.response.status_code == 404 and imdb_id:
+                delete_cached_imdb_to_tmdb(imdb_id, type, tmdb_id)
+                logger.warning(
+                    f"TMDB has no {type}/{tmdb_id} — dropped the {imdb_id} mapping, "
+                    f"will re-resolve on the next request"
+                )
+            raise
 
         # IMDb id for enrichment lookups — the request's, else the one TMDB
         # returned — exactly as /poster derives effective_imdb_id. For a
@@ -6292,6 +6319,44 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str, shape: str = "
             )
         return Response(content=img_bytes, media_type=f"image/{_cfg.IMAGE_FORMAT}",
                         headers=_preset_header(will_persist, _persisted_expires_at))
+    except HTTPException as exc:
+        # Already a deliberate status (a coalesced waiter re-raising, say) —
+        # pass it through rather than let the ladder below relabel it 500.
+        _fail_render_future(_render_fut, exc)
+        raise
+    except httpx.TimeoutException as exc:
+        logger.warning(f"Upstream timeout for tmdb_id={tmdb_id}: {exc.__class__.__name__}")
+        raise _fail_render_future(
+            _render_fut, HTTPException(status_code=504, detail="Upstream request timed out")
+        )
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status == 404:
+            # Whatever 404'd — the title itself or a stale image path — the
+            # cached metadata is what named it, so drop it and let the next
+            # request re-fetch. The imdb->tmdb mapping is handled at the
+            # metadata call above, where a 404 actually means the id is gone.
+            _endpoint = "tv" if type in ("tv", "series") else "movie"
+            delete_cached_tmdb_metadata(tmdb_metadata_cache_key(
+                _endpoint, tmdb_id, rcfg.logo_language
+            ))
+            logger.warning(
+                f"TMDB 404 for tmdb_id={tmdb_id} — metadata cache invalidated, "
+                f"will self-heal on next request"
+            )
+            raise _fail_render_future(
+                _render_fut,
+                HTTPException(status_code=404, detail="Title not found on TMDB"),
+            )
+        logger.error(f"Upstream HTTP {status} for tmdb_id={tmdb_id}: {exc}")
+        raise _fail_render_future(
+            _render_fut, HTTPException(status_code=502, detail=f"Upstream error {status}")
+        )
+    except Exception:
+        logger.exception(f"Error building preset poster for tmdb_id={tmdb_id}")
+        raise _fail_render_future(
+            _render_fut, HTTPException(status_code=500, detail="Failed to build poster")
+        )
     finally:
         _render_sem.release()
         # Clear our coalescing slot. Waiters already hold the future object, so
@@ -6575,6 +6640,10 @@ async def get_poster(
         # its tmdb_id server-side. The resolved request is keyed exactly like
         # one that sent both ids — canonical_id is the IMDb id either way — so
         # the two share composites rather than rendering the title twice.
+        # Names the media_type this request's tmdb_id was resolved under, and
+        # stays empty when the caller supplied the id — only a resolved id has
+        # a cached mapping that a later 404 should invalidate.
+        _resolved_media_type = ""
         if not tmdb_id and imdb_id and _cfg.POSTER_RESOLVE_IMDB:
             _check_imdb_id(imdb_id)
             _resolve_key = _resolve_tmdb_key(tmdb_key)
@@ -6613,6 +6682,7 @@ async def get_poster(
                         status_code=404,
                         detail=f"No TMDB {type} found for imdb_id {imdb_id}",
                     )
+                _resolved_media_type = _resolve_type
         if not tmdb_id:
             raise HTTPException(
                 status_code=400,
@@ -7157,12 +7227,25 @@ async def get_poster(
             if using_anime_art and _logo_meta is not None:
                 logos = _logo_meta[2]
         else:
-            genre_ids, is_textless, logos, release_year, title, poster_path, backdrop_path, tmdb_data = (
-                await _coalesced_fetch_poster_metadata(
-                    client, tmdb_id, effective_tmdb_key, type, rcfg.logo_language,
-                    _effective_secondary,
+            try:
+                genre_ids, is_textless, logos, release_year, title, poster_path, backdrop_path, tmdb_data = (
+                    await _coalesced_fetch_poster_metadata(
+                        client, tmdb_id, effective_tmdb_key, type, rcfg.logo_language,
+                        _effective_secondary,
+                    )
                 )
-            )
+            except httpx.HTTPStatusError as exc:
+                # Same retirement case /p handles: a resolved tmdb_id is cached
+                # with no TTL, and TMDB merges duplicate entries. Without this
+                # the ladder below returns a tidy 404 and the poisoned mapping
+                # survives to 404 again on every future request for the title.
+                if exc.response.status_code == 404 and _resolved_media_type:
+                    delete_cached_imdb_to_tmdb(imdb_id, _resolved_media_type, tmdb_id)
+                    logger.warning(
+                        f"TMDB has no {type}/{tmdb_id} — dropped the {imdb_id} "
+                        f"mapping, will re-resolve on the next request"
+                    )
+                raise
         # Canonical IMDb id for downstream lookups (e.g. TVDB remoteid resolution):
         # the request param if supplied, else the one TMDB returned in external_ids.
         # Optional: TMDB returns imdb_id: null for titles it has no IMDb link for.
