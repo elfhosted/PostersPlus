@@ -5119,8 +5119,9 @@ async def fallback_gallery(style: str = "minimal", access_key: str = ""):
     behind the access key when configured.
     """
     _require_operator(access_key)
-    if style not in _GENRE_BG_STYLES:
-        style = "minimal"
+    # Take the value from our own constants rather than keeping the request's
+    # string: it ends up in HTML, and this way nothing user-supplied can.
+    style = next((s for s in _GENRE_BG_STYLES if s == style), "minimal")
     # ElfHosted fork: the key is echoed into HTML links, so it is URL-encoded
     # and HTML-escaped. Upstream interpolated it raw — a reflected XSS on any
     # instance where the gate lets an arbitrary access_key through.
