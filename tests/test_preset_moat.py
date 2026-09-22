@@ -455,7 +455,9 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
         def _spy(imdb, rel=None):
             seen.append(imdb)
             return real(imdb, rel)
-        ctxs = self._patches(meta) + [mock.patch.object(main, "get_cached_quality", _spy)]
+        ctxs = self._patches(meta) + [
+            mock.patch.object(main, "get_cached_quality", _spy),
+        ]
         for c in ctxs:
             c.start()
         try:
@@ -464,6 +466,46 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
             for c in ctxs:
                 c.stop()
         self.assertIn("tt0111161", seen)
+
+    async def _badge_preset(self, imdb, source_configured):
+        cache.set_cached_rating(
+            imdb, {"letterboxd": 80}, "Action", "1994-01-01",
+            [], [], 1, None, None, False, False, False,
+        )
+        cache.set_cached_release_status("movie_278", "Streaming")
+        cache.set_cached_movie_release_info("movie_278", {"status": "Streaming"})
+        ctxs = self._patches(_META_NON_TEXTLESS) + [mock.patch.object(
+            main, "quality_source_configured", lambda: source_configured)]
+        for c in ctxs:
+            c.start()
+        try:
+            # A retired badge preset — what the public instance's traffic is.
+            return await main.get_preset_poster("prestige_rating_bar", "movie", imdb)
+        finally:
+            for c in ctxs:
+                c.stop()
+
+    async def test_badge_preset_persists_when_no_quality_source_exists(self):
+        """With no quality source quality can never be cached, so waiting for
+        it kept every badge preset unpersistable forever — 99% of the public
+        instance's renders. /poster doesn't wait in that case; neither may /p."""
+        self.assertNotEqual(main.get_preset("prestige_rating_bar").get("badge_display_mode"), "0")
+        resp = await self._badge_preset("tt3434343", source_configured=False)
+        self.assertIn("max-age=86400", resp.headers.get("Cache-Control", ""))
+
+    def test_adding_a_quality_source_changes_the_composite_key(self):
+        """Badge-less composites rendered with no source must not be served
+        once a source is configured."""
+        params = dict(main.get_preset("prestige_rating_bar"))
+        keys = {}
+        for configured in (False, True):
+            with mock.patch.object(main, "quality_source_configured", lambda c=configured: c):
+                keys[configured] = main._composite_cache_key("tt1", "278", "movie", params, False)
+        self.assertNotEqual(keys[False], keys[True])
+
+    async def test_badge_preset_still_waits_when_a_source_exists(self):
+        resp = await self._badge_preset("tt3535353", source_configured=True)
+        self.assertIn("max-age=60", resp.headers.get("Cache-Control", ""))
 
     async def test_unwarmed_release_status_is_not_persisted(self):
         """A film with a cached rating but no cached release status is still
