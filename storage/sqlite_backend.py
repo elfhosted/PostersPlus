@@ -2271,6 +2271,29 @@ def set_cached_imdb_to_tmdb(imdb_id: str, media_type: str, tmdb_id: str) -> None
         logger.error(f"imdb_to_tmdb cache write error: {exc}")
 
 
+def delete_cached_imdb_to_tmdb(imdb_id: str, media_type: str, tmdb_id: str) -> None:
+    """Drop a stale imdb_id -> tmdb_id mapping (ElfHosted fork).
+
+    The mapping has no TTL because a TMDB id, once assigned, stays put — but
+    TMDB does delete and merge duplicate entries, and the id it retires is
+    then a 404 forever. The metadata fetch is what discovers that, so it
+    invalidates the mapping and the next request re-resolves via /find.
+
+    The delete names the tmdb_id that 404'd: concurrent requests all hold the
+    retired id, and the first one through re-resolves and caches the
+    replacement. A later straggler must not then delete that repair."""
+    try:
+        with _db_lock:
+            get_db().execute(
+                "DELETE FROM imdb_to_tmdb_cache "
+                "WHERE imdb_id = ? AND media_type = ? AND tmdb_id = ?",
+                (imdb_id, media_type, tmdb_id),
+            )
+            get_db().commit()
+    except Exception as exc:
+        logger.error(f"imdb_to_tmdb cache delete error: {exc}")
+
+
 def ping() -> bool:
     """Cheap connectivity check for /ready probes."""
     try:
