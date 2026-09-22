@@ -366,6 +366,14 @@ This release is compared with `v1.1.0`.
   `Palme d'Or` through `Tribeca AA`. Previously these rendered in English on an
   otherwise translated poster.
 
+## [1.1.0-elf.7](https://github.com/elfhosted/PostersPlus/compare/v1.1.0-elf.6...v1.1.0-elf.7) (2026-06-11)
+
+
+### Bug Fixes
+
+* stop release-please aborting auto-tag (empty component) ([8e17cd0](https://github.com/elfhosted/PostersPlus/commit/8e17cd0858ea7ed626ff4257f72a10831d50a625))
+* stop release-please aborting auto-tag (empty component) ([310a2ea](https://github.com/elfhosted/PostersPlus/commit/310a2eac012874634394d2491d1a23aac341c6b5))
+
 ## [1.1.0-elf.6](https://github.com/elfhosted/PostersPlus/compare/v1.1.0-elf.5...v1.1.0-elf.6) (2026-06-11)
 
 

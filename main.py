@@ -4941,14 +4941,34 @@ async def readiness_probe():
     return {"status": "ok", **body}
 
 
+def _metrics_key_supplied(request: Request, access_key: str) -> str:
+    """The key a /metrics caller supplied: an `Authorization: Bearer <key>`
+    header, else the `access_key` query parameter.
+
+    The header form exists so scrapers can read the key from a Secret
+    (prometheus-operator's `authorization.credentials`) instead of carrying it
+    in a URL, which would put it in the ServiceMonitor, git and access logs.
+    """
+    auth = request.headers.get("authorization", "")
+    scheme, _, token = auth.partition(" ")
+    if scheme.lower() == "bearer" and token.strip():
+        return token.strip()
+    return access_key
+
+
 @app.get("/metrics")
-async def metrics_endpoint(access_key: str = ""):
+async def metrics_endpoint(request: Request, access_key: str = ""):
     """Prometheus exposition (ElfHosted fork). Optional shared-secret guard via
     METRICS_ACCESS_KEY (defence-in-depth when /metrics is publicly reachable —
-    operators should still gate it at the ingress). Aggregates across uvicorn
-    workers when PROMETHEUS_MULTIPROC_DIR is set."""
-    if _cfg.METRICS_ACCESS_KEY and not hmac.compare_digest(access_key, _cfg.METRICS_ACCESS_KEY):
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    operators should still gate it at the ingress), supplied as a Bearer token
+    or `?access_key=`. Aggregates across uvicorn workers when
+    PROMETHEUS_MULTIPROC_DIR is set."""
+    if _cfg.METRICS_ACCESS_KEY:
+        supplied = _metrics_key_supplied(request, access_key)
+        # Compare bytes: compare_digest raises TypeError on non-ASCII str,
+        # which would turn a junk header into a 500 instead of a 403.
+        if not hmac.compare_digest(supplied.encode("utf-8"), _cfg.METRICS_ACCESS_KEY.encode("utf-8")):
+            raise HTTPException(status_code=403, detail="Unauthorized")
     from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, CollectorRegistry
     if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
         from prometheus_client import multiprocess

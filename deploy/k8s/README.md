@@ -50,7 +50,7 @@ kubectl -n postersplus get pods
 
 When `WORKERS > 1`, multiprocess aggregation is enabled automatically by `entrypoint.sh` (sets `PROMETHEUS_MULTIPROC_DIR=/tmp/postersplus-prom`). The Deployment mounts an `emptyDir` at that path.
 
-If you want `/metrics` access-controlled, set `METRICS_ACCESS_KEY` in `secret.yaml` and pass `?access_key=…` from your scraper.
+If you want `/metrics` access-controlled, set `METRICS_ACCESS_KEY` in `secret.yaml` and have your scraper send it as `Authorization: Bearer …` (with prometheus-operator, `authorization.credentials` pointing at that Secret key) or as `?access_key=…`.
 
 ## Tuning
 
