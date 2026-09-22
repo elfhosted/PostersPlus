@@ -40,8 +40,9 @@ RUN pip install --no-cache-dir --no-deps /wheels/*.whl \
     && rm -rf /wheels
 
 # Bake the PP-OCRv5 Mobile detector into the image.  TEXTLESS_TEXT_DETECTION is
-# on by default, so baking avoids the one-time ~4.6MB runtime download that would
-# otherwise stall the first low-vote textless request, and it survives cache-
+# off by default in the ElfHosted fork, but baking costs only ~4.6MB of image
+# and means opting in needs no runtime download: no stalled first low-vote
+# textless request once enabled, and it survives cache-
 # volume wipes / works on air-gapped hosts.  Adds ~4.6MB to the image, and makes
 # the build depend on PPOCR_MODEL_URL being reachable.  Opt out for a lean image
 # (e.g. if you disable detection) — the model then downloads once at runtime:
