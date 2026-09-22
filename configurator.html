@@ -4217,6 +4217,15 @@ function applyLockMode() {
     // tab bar and the other sections + per-user knobs. Calling showTab keeps
     // the inline display state consistent with the !important CSS overrides.
     try { showTab('core'); } catch(e) {}
+    // Start on a preset, so the showcase's controls, preview and copyable URL
+    // all describe the same thing from the first paint — and so the preview
+    // never has to fall back to the closed /poster route.
+    if (!lockedPresetId) {
+      const id = defaultLockedPresetId();
+      if (id) {
+        try { loadPreset(id); } catch (e) { console.warn('default preset failed', e); }
+      }
+    }
   }
 }
 
@@ -5413,9 +5422,19 @@ function buildBaseParams({ usePlaceholders = false, domainOverride = null } = {}
 // The live-preview variant uses the resolved ids of the currently-selected
 // title; the copyable/template variant keeps {imdb_id}/{type} placeholders so
 // the same string works as an AIOMetadata poster URL pattern across titles.
-function buildLockedPreviewUrl(domain) {
-  if (!lockedPresetId || !resolvedImdbId) return null;
-  return `${domain}/p/${lockedPresetId}/${mediaType}/${resolvedImdbId}.jpg`;
+// The preset the locked showcase starts on: whatever the server lists first,
+// else the first gallery card. Without one the preview had nothing to render
+// and fell back to /poster, which a preset-only instance refuses.
+function defaultLockedPresetId() {
+  const fromCaps = (serverCaps.presets || [])[0];
+  if (fromCaps && fromCaps.id) return fromCaps.id;
+  return (typeof PRESETS !== 'undefined' && PRESETS.length) ? PRESETS[0].id : '';
+}
+
+function buildLockedPreviewUrl(domain, presetId) {
+  const preset = presetId || lockedPresetId;
+  if (!preset || !resolvedImdbId) return null;
+  return `${domain}/p/${preset}/${mediaType}/${resolvedImdbId}.jpg`;
 }
 function buildLockedTemplateUrl(domain) {
   if (!lockedPresetId) return null;
@@ -5474,13 +5493,17 @@ function buildPreviewUrl() {
   // When the domain has been rewritten to postersplus:port, the preview image
   // must still load from the actual origin so it resolves in the browser.
   const override = _REWRITE_DOMAIN ? window.location.origin : null;
-  // Locked public-tier path: preview the chosen static preset for the
-  // selected title via /p/… (falls through to the normal /poster URL when no
-  // preset has been picked yet, so the empty-state behaviour is unchanged).
+  // Locked public-tier path: preview the chosen static preset for the selected
+  // title via /p/…. It must NOT fall through to /poster: that route is closed
+  // on a preset-only instance, so the fallback rendered the preview as a 403
+  // (reported by a user on the public site). lockedPresetId is defaulted by
+  // applyLockMode, and defaultLockedPresetId() is the belt-and-braces path if
+  // the catalogue arrived after this ran.
   if (lockModeActive) {
     const domain = (override || vEl('cfg-domain') || window.location.origin).replace(/\/$/, '');
-    const locked = buildLockedPreviewUrl(domain);
-    if (locked) return locked;
+    return buildLockedPreviewUrl(domain)
+        || buildLockedPreviewUrl(domain, defaultLockedPresetId())
+        || null;
   }
   return buildBaseParams({ usePlaceholders: false, domainOverride: override });
 }
@@ -5801,6 +5824,13 @@ async function loadPreview() {
   // /poster URL already carries a query string ('&'), but the locked-mode
   // /p/…jpg path has none, so it needs '?' or the route stops matching.
   const _previewBase = buildPreviewUrl();
+  if (!_previewBase) {
+    // Locked mode with no preset to render (empty catalogue).
+    previewLoading = false;
+    document.getElementById('preview-status').textContent = 'IDLE';
+    setStatus('Pick a preset style to preview.', 'info');
+    return;
+  }
   const previewUrl = _previewBase + (_previewBase.includes('?') ? '&' : '?') + '_ts=' + Date.now();
   const existingImg = frame.querySelector('.preview-poster');
   if (existingImg) {
