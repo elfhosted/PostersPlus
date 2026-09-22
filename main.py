@@ -4508,6 +4508,13 @@ async def lifespan(app: FastAPI):
     logger.info("HTTP client closed")
     with suppress(Exception):
         await coord.close()
+    # The deferred blob-delete queue is process memory. Drain what is past its
+    # grace period before exit, or a rolling deploy strands those objects for
+    # good — their rows are already gone, so no later prune can find them.
+    # Entries still inside the grace are left: a client may be replaying a
+    # cached redirect to them, and an orphan costs less than a 404.
+    with suppress(Exception):
+        await blobstore.drain_deferred_deletes()
     with suppress(Exception):
         await blobstore.close()
     with suppress(Exception):
@@ -5333,6 +5340,49 @@ async def get_logo(
     )
 
 
+# Background warming of film release facts for /p (ElfHosted fork).
+#
+# /p may read TMDB-derived caches but never fetch in the foreground, and it
+# will not persist a film render whose release status is unknown. On an
+# instance serving mostly /p nothing else ever fetches those facts, so without
+# this a film would never become persistable and every hit would re-render —
+# quietly defeating the caching the preset route exists for. Mirroring the
+# background text-detection queue: bounded concurrency, de-duplicated, and a
+# cap on how much can be pending so an anonymous burst cannot grow it without
+# limit. One fetch_release_status call fills both release caches.
+_release_warm_pending: set[str] = set()
+_release_warm_tasks: set["asyncio.Task[None]"] = set()
+_release_warm_semaphore: "asyncio.Semaphore | None" = None
+_RELEASE_WARM_MAX_PENDING = 256
+_RELEASE_WARM_CONCURRENCY = 2
+
+
+def _queue_release_warm(tmdb_id: str, tmdb_status: str | None) -> None:
+    global _release_warm_semaphore
+    if (tmdb_id in _release_warm_pending
+            or len(_release_warm_pending) >= _RELEASE_WARM_MAX_PENDING
+            or _HTTP_CLIENT is None or not _cfg.SERVER_TMDB_KEY):
+        return
+    if _release_warm_semaphore is None:
+        _release_warm_semaphore = asyncio.Semaphore(_RELEASE_WARM_CONCURRENCY)
+    _release_warm_pending.add(tmdb_id)
+
+    async def _warm() -> None:
+        try:
+            async with _release_warm_semaphore:
+                await fetch_release_status(
+                    _HTTP_CLIENT, tmdb_id, _cfg.SERVER_TMDB_KEY, "movie", tmdb_status,
+                )
+        except Exception as exc:
+            logger.debug(f"Release warm failed for movie {tmdb_id}: {exc}")
+        finally:
+            _release_warm_pending.discard(tmdb_id)
+
+    task = asyncio.get_running_loop().create_task(_warm())
+    _release_warm_tasks.add(task)          # keep a strong reference
+    task.add_done_callback(_release_warm_tasks.discard)
+
+
 # ---------------------------------------------------------------------------
 # Static-preset route (ElfHosted fork)
 # ---------------------------------------------------------------------------
@@ -5469,7 +5519,11 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             logger.info(f"Preset {preset} cache hit (CDN redirect) for {final_cache_key}")
             resp = Response(status_code=302)
             resp.headers["Location"] = cdn_url
-            for k, v in _preset_header(True, _cdn_expires_at).items():
+            # Capped below the blob grace period — see the /poster redirect.
+            for k, v in _preset_header(True, min(
+                _cdn_expires_at,
+                int(time.time()) + blobstore.REDIRECT_MAX_AGE_SECONDS,
+            )).items():
                 resp.headers[k] = v
             return resp
     else:
@@ -5585,6 +5639,12 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
                 ratings_dict, cached_genre, _crd, award_wins, award_noms, _af,
                 festival_keyword, age_rating, is_cult, is_true_story, is_metacritic,
             ) = cached_rating
+            # Same correction /poster applies to stored award labels (legacy or
+            # since-fixed Emmy/Globe entries). Local, so allowed here — and
+            # required, since both routes write the same composite key.
+            award_wins, award_noms = reconcile_cached_awards(
+                award_wins, award_noms, tmdb_id, type,
+            )
             # The IMDb weight can come from the local dataset instead of
             # MDBList, and that is a local table read, not a network call — so
             # it is allowed here and keeps the preset score matching /poster's.
@@ -5777,6 +5837,7 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
                 _release_status = get_cached_release_status(f"{type}_{tmdb_id}")
                 if _release_status is None:
                     _release_undetermined = True
+                    _queue_release_warm(tmdb_id, tmdb_data.get("tmdb_status"))
             # Both overrides below are local lookups, so they stay honest here.
             if (_release_status in ("Cinema", "Production")
                     and is_digital_release(imdb_id)):
@@ -5799,6 +5860,7 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             _known, _recent_digital_release_date = recent_digital_release_from_cache(tmdb_id)
             if not _known:
                 _release_undetermined = True
+                _queue_release_warm(tmdb_id, tmdb_data.get("tmdb_status"))
 
         will_persist = (
             not _cfg.DISABLE_COMPOSITE_CACHE
@@ -5832,6 +5894,15 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
             ) if _overlay_logo else _resolved(None),
             fetch_trending_rank(client, tmdb_id, effective_tmdb_key, type),
         )
+
+        # /poster may take the logo from TVDB — first, second, or as the last
+        # resort after TMDB and Metahub, per TVDB_LOGO_PRIORITY. That is a TVDB
+        # request /p does not make, so whenever it could change the answer the
+        # render is not shared.
+        if (_overlay_logo and tvdb.tvdb_enabled() and _cfg.TVDB_USE_LOGOS
+                and (_cfg.TVDB_LOGO_PRIORITY < 3 or not logo)):
+            _art_undetermined = True
+            will_persist = False
 
         discovery_meta = extract_discovery_meta(
             tmdb_data=tmdb_data, media_type=type,
@@ -5920,6 +5991,12 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str):
                     (img_bytes, False, _persisted_expires_at)
                 )
         else:
+            # A render can turn non-persistable after its coalescing future was
+            # published (the TVDB-logo check needs the logo result). Hand the
+            # waiters the bytes anyway, marked provisional so none of them
+            # stores or long-caches it.
+            if _render_fut is not None and not _render_fut.done():
+                _render_fut.set_result((img_bytes, True, None))
             logger.info(
                 f"Preset {preset} rendered (not persisted: "
                 f"rating_cached={cached_rating is not None}, "
@@ -6353,8 +6430,17 @@ async def get_poster(
                 # per-composite mode) there is no flat TTL, and hardcoding
                 # one here would let a redirect outlive the composite it
                 # points at — the case that mode exists to prevent.
+                # ...but never longer than REDIRECT_MAX_AGE_SECONDS. The 302
+                # names one blob VERSION, and a superseded version is deleted
+                # after blobstore.DELETE_GRACE_SECONDS; a redirect cached past
+                # that would send clients to a 404. The object itself is
+                # immutable, so the CDN can hold it for as long as it likes.
                 _apply_poster_cache_headers(
-                    _redir, provisional=False, expires_at=_cdn_expires_at
+                    _redir, provisional=False,
+                    expires_at=min(
+                        _cdn_expires_at,
+                        int(time.time()) + blobstore.REDIRECT_MAX_AGE_SECONDS,
+                    ),
                 )
                 return _redir
         # ElfHosted fork: composite bytes live in the blobstore, so the read

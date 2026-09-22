@@ -92,7 +92,7 @@ class CompositeBlobLifecycleTests(unittest.IsolatedAsyncioTestCase):
         cache.invalidate_final_posters("99", "movie")
         await cache.set_cached_final_poster(KEY, b"SECOND")
 
-        await blobstore.drain_deferred_deletes()
+        await blobstore.drain_deferred_deletes(min_age=0)
 
         self.assertEqual(await self._blob(self._blob_key()), b"SECOND")
         self.assertEqual(await self._read(), b"SECOND")
@@ -113,7 +113,7 @@ class CompositeBlobLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with blobstore._deferred_lock:                       # A drains later
             blobstore._deferred_deletes.clear()
             blobstore._deferred_deletes.update(queued)
-        await blobstore.drain_deferred_deletes()
+        await blobstore.drain_deferred_deletes(min_age=0)
 
         self.assertIsNone(await self._blob(old_version), "old version not collected")
         self.assertEqual(await self._blob(self._blob_key()), b"SECOND")
@@ -123,7 +123,7 @@ class CompositeBlobLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await cache.set_cached_final_poster(KEY, b"FIRST")
         version = self._blob_key()
         cache.invalidate_final_posters("99", "movie")
-        await blobstore.drain_deferred_deletes()
+        await blobstore.drain_deferred_deletes(min_age=0)
         self.assertIsNone(await self._blob(version))
         self.assertIsNone(await self._read())
 
@@ -133,7 +133,7 @@ class CompositeBlobLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await cache.set_cached_final_poster(KEY, b"FIRST")
         first = self._blob_key()
         await cache.set_cached_final_poster(KEY, b"SECOND")
-        await blobstore.drain_deferred_deletes()
+        await blobstore.drain_deferred_deletes(min_age=0)
         self.assertIsNone(await self._blob(first))
         self.assertEqual(await self._read(), b"SECOND")
 
@@ -159,6 +159,22 @@ class CompositeBlobLifecycleTests(unittest.IsolatedAsyncioTestCase):
         finally:
             _bl.url_for = prev
             blobstore.url_for = prev
+
+    async def test_a_superseded_version_outlives_the_redirect_grace(self):
+        """A 302 names one blob version and may be replayed from a cache for up
+        to REDIRECT_MAX_AGE_SECONDS, so a superseded version must not be
+        deleted before DELETE_GRACE_SECONDS — or a cached redirect 404s."""
+        self.assertGreater(
+            blobstore.DELETE_GRACE_SECONDS, blobstore.REDIRECT_MAX_AGE_SECONDS
+        )
+        await cache.set_cached_final_poster(KEY, b"FIRST")
+        first = self._blob_key()
+        await cache.set_cached_final_poster(KEY, b"SECOND")
+        await blobstore.drain_deferred_deletes()            # default grace
+        self.assertEqual(await self._blob(first), b"FIRST",
+                         "superseded version deleted inside the grace period")
+        await blobstore.drain_deferred_deletes(min_age=0)
+        self.assertIsNone(await self._blob(first))
 
     async def test_the_queue_is_bounded_and_says_so(self):
         original = blobstore.DEFERRED_DELETE_MAX

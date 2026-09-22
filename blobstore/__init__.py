@@ -100,10 +100,20 @@ BUCKET_COMPOSITES: str = "composites"
 # queue is full we log and discard rather than block a cache write on
 # object-store latency.
 import threading as _threading
+import time as _time
 
 DEFERRED_DELETE_MAX = 50_000
 
-_deferred_deletes: "dict[tuple[str, str], None]" = {}
+# How long a superseded blob version is kept before it may be deleted. A CDN
+# redirect names a specific version, and a client or edge cache can replay
+# that 302 for as long as its max-age allows — so the version it names has to
+# outlive the redirect. Redirects are capped at REDIRECT_MAX_AGE_SECONDS; the
+# grace is comfortably longer.
+REDIRECT_MAX_AGE_SECONDS = 300
+DELETE_GRACE_SECONDS = 900
+
+# key -> the monotonic time it was queued.
+_deferred_deletes: "dict[tuple[str, str], float]" = {}
 _deferred_lock = _threading.Lock()
 _deferred_dropped = 0
 
@@ -125,7 +135,7 @@ def delete_later(bucket: str, key: str) -> None:
                     DEFERRED_DELETE_MAX, _deferred_dropped,
                 )
             return
-        _deferred_deletes[(bucket, key)] = None
+        _deferred_deletes[(bucket, key)] = _time.monotonic()
 
 
 def deferred_delete_stats() -> dict:
@@ -133,16 +143,25 @@ def deferred_delete_stats() -> dict:
         return {"queued": len(_deferred_deletes), "dropped": _deferred_dropped}
 
 
-async def drain_deferred_deletes(limit: int | None = None) -> int:
-    """Delete queued blobs. Returns how many were removed. Best effort: a key
-    whose delete raises is dropped rather than retried forever, because the
-    row that named it is already gone."""
+async def drain_deferred_deletes(
+    limit: int | None = None, min_age: float | None = None
+) -> int:
+    """Delete queued blobs that have been queued for at least *min_age*
+    seconds (default DELETE_GRACE_SECONDS). Returns how many were removed.
+
+    Best effort: a key whose delete raises is dropped rather than retried
+    forever, because the row that named it is already gone.
+    """
+    grace = DELETE_GRACE_SECONDS if min_age is None else min_age
+    cutoff = _time.monotonic() - grace
+    with _deferred_lock:
+        due = [k for k, t in _deferred_deletes.items() if t <= cutoff]
+        if limit is not None:
+            due = due[:limit]
+        for k in due:
+            _deferred_deletes.pop(k, None)
     removed = 0
-    while limit is None or removed < limit:
-        with _deferred_lock:
-            if not _deferred_deletes:
-                break
-            (bucket, key), _ = _deferred_deletes.popitem()
+    for bucket, key in due:
         try:
             await delete(bucket, key)
         except Exception as exc:

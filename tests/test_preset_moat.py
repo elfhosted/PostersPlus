@@ -299,6 +299,32 @@ class PresetMoatTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.exception.status_code, 503)
         resolver.assert_not_awaited()
 
+    async def test_an_unwarmed_film_warms_itself_in_the_background(self):
+        """Nothing else fetches film release facts on a /p-only instance, so
+        without background warming a film would never become persistable and
+        would re-render on every hit. The first hit queues the fetch; once it
+        lands, the next hit is persisted under the long preset TTL."""
+        imdb = "tt9999999"
+        cache.set_cached_rating(
+            imdb, {"letterboxd": 80}, "Action", "1994-01-01",
+            [], [], 1, None, None, False, False, False,
+        )
+
+        async def _fake_status(client, tmdb_id, key, media_type, status):
+            cache.set_cached_release_status(f"movie_{tmdb_id}", "Streaming")
+            cache.set_cached_movie_release_info(f"movie_{tmdb_id}", {"status": "Streaming"})
+            return "Streaming"
+
+        prev_key = config.SERVER_TMDB_KEY
+        with mock.patch.object(main, "fetch_release_status", _fake_status):
+            first = await self._call(imdb=imdb)
+            self.assertIn("max-age=60", first.headers.get("Cache-Control", ""))
+            # Let the queued background warm run.
+            await asyncio.gather(*list(main._release_warm_tasks))
+            second = await self._call(imdb=imdb)
+        config.SERVER_TMDB_KEY = prev_key
+        self.assertIn("max-age=86400", second.headers.get("Cache-Control", ""))
+
     async def test_unwarmed_release_status_is_not_persisted(self):
         """A film with a cached rating but no cached release status is still
         incomplete.
