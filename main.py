@@ -2,6 +2,8 @@
 import asyncio
 import dataclasses
 import hashlib
+from html import escape as _html_escape
+import urllib.parse
 import hmac
 import io
 import logging
@@ -4573,9 +4575,23 @@ _GENRE_BG_CACHE_MAX = 8
 _genre_bg_cache: "OrderedDict[str, Image.Image | None]" = OrderedDict()
 
 
+_GENRE_BG_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _&'.-]{0,63}$")
+
+
 def _genre_bg_path(style: str, name: str) -> "str | None":
-    """Filesystem path to a genre-background PNG, or None if it doesn't exist."""
-    p = os.path.join(_GENRE_BG_DIR, style, f"{name}.png")
+    """Filesystem path to a genre-background PNG, or None if it doesn't exist.
+
+    ElfHosted fork: *name* can come straight from a query string
+    (/debug/canvas?genre=…), so it is validated and the result confined to
+    _GENRE_BG_DIR. Without that, genre=../../<anything> read any .png on disk.
+    """
+    if (style not in _GENRE_BG_STYLES or not _GENRE_BG_NAME_RE.match(name or "")
+            or ".." in name):
+        return None
+    base = os.path.realpath(_GENRE_BG_DIR)
+    p = os.path.realpath(os.path.join(base, style, f"{name}.png"))
+    if not p.startswith(base + os.sep):
+        return None
     return p if os.path.exists(p) else None
 
 
@@ -5105,7 +5121,13 @@ async def fallback_gallery(style: str = "minimal", access_key: str = ""):
     _require_operator(access_key)
     if style not in _GENRE_BG_STYLES:
         style = "minimal"
-    _ak = f"&access_key={access_key}" if access_key else ""
+    # ElfHosted fork: the key is echoed into HTML links, so it is URL-encoded
+    # and HTML-escaped. Upstream interpolated it raw — a reflected XSS on any
+    # instance where the gate lets an arbitrary access_key through.
+    _ak = (
+        "&access_key=" + _html_escape(urllib.parse.quote(access_key, safe=""))
+        if access_key else ""
+    )
 
     # Every genre that has a background (covers the full genre map + any future
     # additions), derived from the minimal set so the gallery is never stale.
