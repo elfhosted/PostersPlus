@@ -1638,6 +1638,8 @@ async def fetch_trending_candidates(
     # a title warmed this cycle could be rendered against yesterday's ranks.
     # An empty list means the fetch failed; leave the existing snapshot alone.
     for _media_type, _ids in sources.items():
+        if _ids is not None and not _ids and failures is not None:
+            failures.append(f"{_media_type}/custom-source")
         if _ids:
             set_cached_trending_snapshot(
                 _media_type,

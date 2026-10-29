@@ -4244,16 +4244,21 @@ async def _run_trending_fetch_cycle(client: httpx.AsyncClient) -> bool | None:
                 resp = await local_client.get(f"/poster?{req_params_str}")
                 if resp.status_code >= 400:
                     logger.warning(f"Trending fetch: regenerate for {cache_key} returned HTTP {resp.status_code}")
+                    _fetch_failures.append(f"replay {cache_key}")
                 else:
                     regenerated_count += 1
             except Exception as exc:
                 logger.error(f"Trending fetch: failed to regenerate poster {cache_key}: {exc}")
+                _fetch_failures.append(f"replay {cache_key}")
                     
     logger.info(f"Trending fetch cycle completed. Regenerated {regenerated_count} posters.")
     if _fetch_failures:
-        # What was fetched has been refreshed, but the lists in _fetch_failures
+        # What succeeded has been refreshed, but the failed lists or replays
         # were not, so this cycle must not suppress the next one.
-        logger.warning(f"Trending fetch: incomplete, failed lists: {', '.join(_fetch_failures)}")
+        logger.warning(
+            f"Trending fetch: incomplete, {len(_fetch_failures)} failed: "
+            f"{', '.join(_fetch_failures[:10])}"
+        )
         return False
     return True
 

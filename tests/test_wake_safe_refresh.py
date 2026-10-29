@@ -252,6 +252,44 @@ class TrendingStartupTests(unittest.TestCase):
         finally:
             self.main._cfg.SERVER_TMDB_KEY, self.main._digital_release_current = saved
 
+    def test_a_failed_custom_source_counts_as_a_failure(self):
+        import tmdb
+
+        async def source_ids(client, media_type):
+            return ["1", "2"] if media_type == "movie" else []   # tv source failed
+
+        failures = []
+        with mock.patch.object(tmdb, "fetch_trending_source_ids", source_ids), \
+             mock.patch.object(tmdb, "set_cached_trending_snapshot", lambda *a, **k: None):
+            asyncio.run(tmdb.fetch_trending_candidates(None, "key", max_items=20, failures=failures))
+        self.assertEqual(failures, ["tv/custom-source"])
+
+    def test_failed_poster_replays_are_not_a_completed_cycle(self):
+        async def candidates(*a, failures=None, **k):
+            return [{"tmdb_id": "1", "media_type": "movie"}]
+
+        class _Resp:
+            status_code = 502
+
+        class _Client:
+            def __init__(self, *a, **k): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def get(self, *a, **k): return _Resp()
+
+        saved = (self.main._cfg.SERVER_TMDB_KEY, self.main._digital_release_current)
+        self.main._cfg.SERVER_TMDB_KEY = "key"
+        self.main._digital_release_current = None
+        try:
+            with mock.patch.object(self.main, "fetch_trending_candidates", candidates), \
+                 mock.patch.object(self.main, "list_composite_request_params",
+                                   return_value=[("tt0000001:1:movie:abc", "tmdb_id=1&type=movie")]), \
+                 mock.patch.object(self.main, "delete_cached_final_poster", lambda *a, **k: None), \
+                 mock.patch.object(self.main.httpx, "AsyncClient", _Client):
+                self.assertIs(asyncio.run(self.main._run_trending_fetch_cycle(None)), False)
+        finally:
+            self.main._cfg.SERVER_TMDB_KEY, self.main._digital_release_current = saved
+
     def test_an_empty_trending_fetch_is_a_failed_cycle(self):
         async def no_candidates(*a, **k):
             return []
