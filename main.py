@@ -4088,6 +4088,12 @@ async def _run_cache_warm_cycle(client: httpx.AsyncClient) -> None:
 
 
 _CACHE_WARM_LAST_RUN_KEY = "cache_warm_last_run"
+_TRENDING_LAST_RUN_KEY = "trending_fetch_last_run"
+# ElfHosted fork: set once the digital-release set is current (see
+# digital_release_poll_loop). Until then a render may carry a "new release"
+# sash decided from an old set, so it is served but not cached. None outside
+# the app lifespan (tests), which never treats a render as pending.
+_digital_release_ready: asyncio.Event | None = None
 # Wait this long after startup before the very first-ever cycle, so it
 # doesn't compete with other startup warm-up work (text detection model,
 # genre backgrounds, etc.).
@@ -4131,7 +4137,9 @@ def _sanitize_request_params(query: str) -> str:
     return urlencode(kept)
 
 
-async def _run_trending_fetch_cycle(client: httpx.AsyncClient) -> None:
+async def _run_trending_fetch_cycle(client: httpx.AsyncClient) -> bool | None:
+    """False only when the trending candidates could not be fetched, so the
+    caller does not record a failed cycle as the last one."""
     logger.info("Starting scheduled trending fetch cycle")
     if not _cfg.SERVER_TMDB_KEY:
         logger.info("Trending fetch: skipped - no server TMDB key configured")
@@ -4143,7 +4151,7 @@ async def _run_trending_fetch_cycle(client: httpx.AsyncClient) -> None:
         )
     except Exception as exc:
         logger.error(f"Trending fetch: failed to fetch candidates: {exc}")
-        return
+        return False
 
     # Build the set of trending (tmdb_id, type) pairs. TV titles are cached under
     # both "tv" and "series" (Stremio uses "series"), so include both variants.
@@ -4214,11 +4222,24 @@ async def _trending_fetch_loop() -> None:
             lease_token = None
         return lease_token is not None
 
-    # First run immediately on startup
+    # First run shortly after startup, unless a cycle already finished within
+    # the last day (ElfHosted fork): a pod that restarts, or sleeps between
+    # requests, would otherwise re-render the whole trending set on every start.
     await asyncio.sleep(10)
     try:
-        if _HTTP_CLIENT is not None and await _lead():
-            await _run_trending_fetch_cycle(_HTTP_CLIENT)
+        _last_raw = get_app_state(_TRENDING_LAST_RUN_KEY)
+        try:
+            _last = float(_last_raw) if _last_raw is not None else None
+        except ValueError:
+            _last = None
+        if _last is not None and time.time() - _last < 86400:
+            logger.info(
+                f"Trending fetch: last cycle {(time.time() - _last) / 3600:.1f}h ago, "
+                "skipping the startup cycle"
+            )
+        elif _HTTP_CLIENT is not None and await _lead():
+            if await _run_trending_fetch_cycle(_HTTP_CLIENT) is not False:
+                set_app_state(_TRENDING_LAST_RUN_KEY, str(time.time()))
     except Exception as exc:
         logger.error(f"Trending fetch: startup cycle failed: {exc}")
 
@@ -4250,7 +4271,8 @@ async def _trending_fetch_loop() -> None:
                 if _HTTP_CLIENT is None:
                     pass
                 elif await _lead():
-                    await _run_trending_fetch_cycle(_HTTP_CLIENT)
+                    if await _run_trending_fetch_cycle(_HTTP_CLIENT) is not False:
+                        set_app_state(_TRENDING_LAST_RUN_KEY, str(time.time()))
                 else:
                     logger.debug("Trending fetch skipped — another replica holds the lease")
             except Exception as exc:
@@ -4366,6 +4388,7 @@ async def _cache_warm_loop(digital_release_ready: asyncio.Event | None = None) -
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _HTTP_CLIENT, _configurator_html, _render_assets_signature
+    global _digital_release_ready
     global _background_detection_queue, _background_detection_task
     init_db()
     await blobstore.init()
@@ -8348,12 +8371,20 @@ async def get_poster(
         #                            throttle or a blip rather than a real absence.
         #                            Caching the fallback would pin TMDB art for
         #                            the whole composite TTL, so let it re-render.
+        #   _digital_release_pending — a catch-up sync of the digital-release set
+        #                            is still running (the pod slept through the
+        #                            daily one), so the new-release sash may be
+        #                            decided from an old set.
         #
         # The same flag decides what the *client* is told: a render we won't
         # keep must not be handed an ETag either (see _apply_poster_cache_headers).
+        _digital_release_pending = (
+            _digital_release_ready is not None and not _digital_release_ready.is_set()
+        )
         _render_provisional = bool(
             quality_pending or _detection_deferred or rating_failed
             or _rating_backoff_active or _anime_art_missing
+            or _digital_release_pending
         )
         _composite_expires_at: int | None = None
         if final_cache_key is not None and not _render_provisional:
