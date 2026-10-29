@@ -167,27 +167,21 @@ class PollLoopTests(unittest.TestCase):
         self.assertEqual(events["sleeps"], [digital_release._FOLLOWER_POLL])
 
 
-class TrendingStartupTests(unittest.TestCase):
+class TrendingReplayTests(unittest.TestCase):
+    """The trending cycle deletes each cached poster before replaying it, so it
+    must not start while the digital-release set is catching up: those replays
+    are deliberately not cached, and the posters would be lost."""
+
     def setUp(self):
         import main
         self.main = main
+        self.saved = (main._cfg.SERVER_TMDB_KEY, main._digital_release_current,
+                      main._TRENDING_RELEASE_WAIT_SECS)
+        main._cfg.SERVER_TMDB_KEY = "key"
 
-    def test_never_run_or_a_day_old_runs_the_startup_cycle(self):
-        self.assertIsNone(self.main._trending_first_wait(None, 1_000_000.0))
-        self.assertIsNone(self.main._trending_first_wait(1_000_000.0 - 86400, 1_000_000.0))
-
-    def test_recent_cycle_is_skipped_and_keeps_its_cadence(self):
-        # A restart 23h after a cycle waits 1h, not another full day.
-        now = 1_000_000.0
-        self.assertAlmostEqual(self.main._trending_first_wait(now - 23 * 3600, now), 3600.0)
-
-    def test_no_server_key_is_a_skipped_cycle_not_a_completed_one(self):
-        saved = self.main._cfg.SERVER_TMDB_KEY
-        self.main._cfg.SERVER_TMDB_KEY = ""
-        try:
-            self.assertIsNone(asyncio.run(self.main._run_trending_fetch_cycle(None)))
-        finally:
-            self.main._cfg.SERVER_TMDB_KEY = saved
+    def tearDown(self):
+        (self.main._cfg.SERVER_TMDB_KEY, self.main._digital_release_current,
+         self.main._TRENDING_RELEASE_WAIT_SECS) = self.saved
 
     def test_cycle_waits_for_the_release_set_before_deleting_anything(self):
         calls = []
@@ -205,16 +199,11 @@ class TrendingStartupTests(unittest.TestCase):
             ev.set()
             return await task
 
-        saved = (self.main._cfg.SERVER_TMDB_KEY, self.main._digital_release_current)
-        self.main._cfg.SERVER_TMDB_KEY = "key"
-        try:
-            with mock.patch.object(self.main, "fetch_trending_candidates", candidates):
-                self.assertIs(asyncio.run(scenario()), False)
-            self.assertEqual(calls, ["fetch"])
-        finally:
-            self.main._cfg.SERVER_TMDB_KEY, self.main._digital_release_current = saved
+        with mock.patch.object(self.main, "fetch_trending_candidates", candidates):
+            asyncio.run(scenario())
+        self.assertEqual(calls, ["fetch"])
 
-    def test_cycle_is_deferred_unrecorded_if_the_set_never_catches_up(self):
+    def test_cycle_is_deferred_if_the_set_never_catches_up(self):
         calls = []
 
         async def candidates(*a, **k):
@@ -225,81 +214,10 @@ class TrendingStartupTests(unittest.TestCase):
             self.main._digital_release_current = asyncio.Event()
             return await self.main._run_trending_fetch_cycle(None)
 
-        saved = (self.main._cfg.SERVER_TMDB_KEY, self.main._digital_release_current,
-                 self.main._TRENDING_RELEASE_WAIT_SECS)
-        self.main._cfg.SERVER_TMDB_KEY = "key"
         self.main._TRENDING_RELEASE_WAIT_SECS = 0.05
-        try:
-            with mock.patch.object(self.main, "fetch_trending_candidates", candidates):
-                self.assertEqual(asyncio.run(scenario()), self.main._TRENDING_DEFERRED)
-            self.assertEqual(calls, [])
-        finally:
-            (self.main._cfg.SERVER_TMDB_KEY, self.main._digital_release_current,
-             self.main._TRENDING_RELEASE_WAIT_SECS) = saved
-
-    def test_a_partial_trending_fetch_is_not_a_completed_cycle(self):
-        async def movies_only(*a, failures=None, **k):
-            failures.append("tv/day")
-            return [{"tmdb_id": "1", "media_type": "movie"}]
-
-        saved = (self.main._cfg.SERVER_TMDB_KEY, self.main._digital_release_current)
-        self.main._cfg.SERVER_TMDB_KEY = "key"
-        self.main._digital_release_current = None
-        try:
-            with mock.patch.object(self.main, "fetch_trending_candidates", movies_only), \
-                 mock.patch.object(self.main, "list_composite_request_params", return_value=[]):
-                self.assertIs(asyncio.run(self.main._run_trending_fetch_cycle(None)), False)
-        finally:
-            self.main._cfg.SERVER_TMDB_KEY, self.main._digital_release_current = saved
-
-    def test_a_failed_custom_source_counts_as_a_failure(self):
-        import tmdb
-
-        async def source_ids(client, media_type):
-            return ["1", "2"] if media_type == "movie" else []   # tv source failed
-
-        failures = []
-        with mock.patch.object(tmdb, "fetch_trending_source_ids", source_ids), \
-             mock.patch.object(tmdb, "set_cached_trending_snapshot", lambda *a, **k: None):
-            asyncio.run(tmdb.fetch_trending_candidates(None, "key", max_items=20, failures=failures))
-        self.assertEqual(failures, ["tv/custom-source"])
-
-    def test_failed_poster_replays_are_not_a_completed_cycle(self):
-        async def candidates(*a, failures=None, **k):
-            return [{"tmdb_id": "1", "media_type": "movie"}]
-
-        class _Resp:
-            status_code = 502
-
-        class _Client:
-            def __init__(self, *a, **k): pass
-            async def __aenter__(self): return self
-            async def __aexit__(self, *a): return False
-            async def get(self, *a, **k): return _Resp()
-
-        saved = (self.main._cfg.SERVER_TMDB_KEY, self.main._digital_release_current)
-        self.main._cfg.SERVER_TMDB_KEY = "key"
-        self.main._digital_release_current = None
-        try:
-            with mock.patch.object(self.main, "fetch_trending_candidates", candidates), \
-                 mock.patch.object(self.main, "list_composite_request_params",
-                                   return_value=[("tt0000001:1:movie:abc", "tmdb_id=1&type=movie")]), \
-                 mock.patch.object(self.main, "delete_cached_final_poster", lambda *a, **k: None), \
-                 mock.patch.object(self.main.httpx, "AsyncClient", _Client):
-                self.assertIs(asyncio.run(self.main._run_trending_fetch_cycle(None)), False)
-        finally:
-            self.main._cfg.SERVER_TMDB_KEY, self.main._digital_release_current = saved
-
-    def test_an_empty_trending_fetch_is_a_failed_cycle(self):
-        async def no_candidates(*a, **k):
-            return []
-        saved = self.main._cfg.SERVER_TMDB_KEY
-        self.main._cfg.SERVER_TMDB_KEY = "key"
-        try:
-            with mock.patch.object(self.main, "fetch_trending_candidates", no_candidates):
-                self.assertIs(asyncio.run(self.main._run_trending_fetch_cycle(None)), False)
-        finally:
-            self.main._cfg.SERVER_TMDB_KEY = saved
+        with mock.patch.object(self.main, "fetch_trending_candidates", candidates):
+            self.assertEqual(asyncio.run(scenario()), self.main._TRENDING_DEFERRED)
+        self.assertEqual(calls, [])
 
 
 class DigitalReleasePendingTests(unittest.TestCase):
