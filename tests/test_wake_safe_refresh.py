@@ -189,6 +189,54 @@ class TrendingStartupTests(unittest.TestCase):
         finally:
             self.main._cfg.SERVER_TMDB_KEY = saved
 
+    def test_cycle_waits_for_the_release_set_before_deleting_anything(self):
+        calls = []
+
+        async def candidates(*a, **k):
+            calls.append("fetch")
+            return []
+
+        async def scenario():
+            ev = asyncio.Event()
+            self.main._digital_release_current = ev
+            task = asyncio.create_task(self.main._run_trending_fetch_cycle(None))
+            await asyncio.sleep(0.05)
+            self.assertEqual(calls, [])          # held while catching up
+            ev.set()
+            return await task
+
+        saved = (self.main._cfg.SERVER_TMDB_KEY, self.main._digital_release_current)
+        self.main._cfg.SERVER_TMDB_KEY = "key"
+        try:
+            with mock.patch.object(self.main, "fetch_trending_candidates", candidates):
+                self.assertIs(asyncio.run(scenario()), False)
+            self.assertEqual(calls, ["fetch"])
+        finally:
+            self.main._cfg.SERVER_TMDB_KEY, self.main._digital_release_current = saved
+
+    def test_cycle_is_skipped_unrecorded_if_the_set_never_catches_up(self):
+        calls = []
+
+        async def candidates(*a, **k):
+            calls.append("fetch")
+            return []
+
+        async def scenario():
+            self.main._digital_release_current = asyncio.Event()
+            return await self.main._run_trending_fetch_cycle(None)
+
+        saved = (self.main._cfg.SERVER_TMDB_KEY, self.main._digital_release_current,
+                 self.main._TRENDING_RELEASE_WAIT_SECS)
+        self.main._cfg.SERVER_TMDB_KEY = "key"
+        self.main._TRENDING_RELEASE_WAIT_SECS = 0.05
+        try:
+            with mock.patch.object(self.main, "fetch_trending_candidates", candidates):
+                self.assertIsNone(asyncio.run(scenario()))
+            self.assertEqual(calls, [])
+        finally:
+            (self.main._cfg.SERVER_TMDB_KEY, self.main._digital_release_current,
+             self.main._TRENDING_RELEASE_WAIT_SECS) = saved
+
     def test_an_empty_trending_fetch_is_a_failed_cycle(self):
         async def no_candidates(*a, **k):
             return []

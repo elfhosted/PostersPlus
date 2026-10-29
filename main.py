@@ -4089,6 +4089,7 @@ async def _run_cache_warm_cycle(client: httpx.AsyncClient) -> None:
 
 _CACHE_WARM_LAST_RUN_KEY = "cache_warm_last_run"
 _TRENDING_LAST_RUN_KEY = "trending_fetch_last_run"
+_TRENDING_RELEASE_WAIT_SECS = 600
 
 
 def _trending_first_wait(last_run: float | None, now: float) -> float | None:
@@ -4166,6 +4167,21 @@ async def _run_trending_fetch_cycle(client: httpx.AsyncClient) -> bool | None:
     if not _cfg.SERVER_TMDB_KEY:
         logger.info("Trending fetch: skipped - no server TMDB key configured")
         return
+    # The cycle deletes each cached poster before replaying it, and a replay
+    # rendered while the digital-release set is catching up is deliberately not
+    # cached: running now would delete posters without replacing them. Wait for
+    # the set, and skip the cycle (not recorded, so it runs again) if it takes
+    # too long.
+    _current = _digital_release_current
+    if _current is not None and not _current.is_set():
+        try:
+            await asyncio.wait_for(_current.wait(), timeout=_TRENDING_RELEASE_WAIT_SECS)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Trending fetch: digital-release set still catching up after "
+                f"{_TRENDING_RELEASE_WAIT_SECS}s; skipping this cycle"
+            )
+            return None
 
     try:
         trending = await fetch_trending_candidates(
