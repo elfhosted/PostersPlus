@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.1-elf.5](https://github.com/elfhosted/PostersPlus/compare/v1.2.0-elf.5...v1.2.1-elf.5) (2026-10-29)
+
+
+### Bug Fixes
+
+* keep posters current when the service restarts or sleeps between requests ([#63](https://github.com/elfhosted/PostersPlus/issues/63)) ([0028976](https://github.com/elfhosted/PostersPlus/commit/0028976285fa8f6561448d747e4121f3436ceaee))
+
 ## [1.2.0-elf.5](https://github.com/elfhosted/PostersPlus/compare/v1.2.0-elf.4...v1.2.0-elf.5) (2026-09-22)
 
 
