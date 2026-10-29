@@ -4260,6 +4260,14 @@ async def _trending_fetch_loop() -> None:
         if _HTTP_CLIENT is not None and await _lead():
             if await _run_trending_fetch_cycle(_HTTP_CLIENT) == _TRENDING_DEFERRED:
                 _retry_in = float(_TRENDING_DEFER_RETRY_SECS)
+    except asyncio.CancelledError:
+        # ElfHosted fork: the startup cycle can now spend minutes waiting for
+        # the digital-release set, so a shutdown can land here; hand the lease
+        # back as the periodic loop does, or the next pod waits out its TTL.
+        if lease_token is not None:
+            with suppress(Exception):
+                await coord.release_lease(coord.LEASE_TRENDING_FETCH, lease_token)
+        raise
     except Exception as exc:
         logger.error(f"Trending fetch: startup cycle failed: {exc}")
 

@@ -203,6 +203,39 @@ class TrendingReplayTests(unittest.TestCase):
             asyncio.run(scenario())
         self.assertEqual(calls, ["fetch"])
 
+    def test_shutdown_during_the_startup_wait_releases_the_lease(self):
+        released = []
+
+        async def lease(*a, **k):
+            return "token"
+
+        async def release(key, token):
+            released.append((key, token))
+
+        async def scenario():
+            self.main._digital_release_current = asyncio.Event()   # never set
+            real_sleep = asyncio.sleep
+
+            async def quick_sleep(seconds):
+                await real_sleep(0)
+
+            with mock.patch.object(self.main.asyncio, "sleep", quick_sleep):
+                task = asyncio.create_task(self.main._trending_fetch_loop())
+                await real_sleep(0.05)          # parked in the release wait
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+        saved_client = self.main._HTTP_CLIENT
+        self.main._HTTP_CLIENT = object()
+        try:
+            with mock.patch.object(self.main, "_with_lease", lease), \
+                 mock.patch.object(self.main.coord, "release_lease", release):
+                asyncio.run(scenario())
+        finally:
+            self.main._HTTP_CLIENT = saved_client
+        self.assertEqual(released, [(self.main.coord.LEASE_TRENDING_FETCH, "token")])
+
     def test_cycle_is_deferred_if_the_set_never_catches_up(self):
         calls = []
 
