@@ -214,7 +214,7 @@ class TrendingStartupTests(unittest.TestCase):
         finally:
             self.main._cfg.SERVER_TMDB_KEY, self.main._digital_release_current = saved
 
-    def test_cycle_is_skipped_unrecorded_if_the_set_never_catches_up(self):
+    def test_cycle_is_deferred_unrecorded_if_the_set_never_catches_up(self):
         calls = []
 
         async def candidates(*a, **k):
@@ -231,11 +231,26 @@ class TrendingStartupTests(unittest.TestCase):
         self.main._TRENDING_RELEASE_WAIT_SECS = 0.05
         try:
             with mock.patch.object(self.main, "fetch_trending_candidates", candidates):
-                self.assertIsNone(asyncio.run(scenario()))
+                self.assertEqual(asyncio.run(scenario()), self.main._TRENDING_DEFERRED)
             self.assertEqual(calls, [])
         finally:
             (self.main._cfg.SERVER_TMDB_KEY, self.main._digital_release_current,
              self.main._TRENDING_RELEASE_WAIT_SECS) = saved
+
+    def test_a_partial_trending_fetch_is_not_a_completed_cycle(self):
+        async def movies_only(*a, failures=None, **k):
+            failures.append("tv/day")
+            return [{"tmdb_id": "1", "media_type": "movie"}]
+
+        saved = (self.main._cfg.SERVER_TMDB_KEY, self.main._digital_release_current)
+        self.main._cfg.SERVER_TMDB_KEY = "key"
+        self.main._digital_release_current = None
+        try:
+            with mock.patch.object(self.main, "fetch_trending_candidates", movies_only), \
+                 mock.patch.object(self.main, "list_composite_request_params", return_value=[]):
+                self.assertIs(asyncio.run(self.main._run_trending_fetch_cycle(None)), False)
+        finally:
+            self.main._cfg.SERVER_TMDB_KEY, self.main._digital_release_current = saved
 
     def test_an_empty_trending_fetch_is_a_failed_cycle(self):
         async def no_candidates(*a, **k):

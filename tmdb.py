@@ -1581,6 +1581,7 @@ async def fetch_trending_candidates(
     client: httpx.AsyncClient,
     tmdb_key: str,
     max_items: int = 500,
+    failures: list[str] | None = None,
 ) -> list[dict]:
     """
     Build a deduped, ranked list of currently-trending titles for cache
@@ -1591,6 +1592,10 @@ async def fetch_trending_candidates(
     ordered with the hottest (day-trending) titles first. Each (media_type,
     tmdb_id) pair appears at most once. May return fewer than *max_items* if
     TMDB's trending lists are exhausted first.
+
+    ElfHosted fork: a page that fails is logged and its list cut short, as
+    upstream; if *failures* is given, each such list is also appended to it,
+    so a caller can tell a complete fetch from a partial one.
     """
     pages_per_list = max(1, (max_items + 19) // 20)  # 20 results per page
 
@@ -1606,6 +1611,8 @@ async def fetch_trending_candidates(
                 page_results = resp.json().get("results", [])
             except Exception as exc:
                 logger.warning(f"Cache warm: trending fetch failed ({media_type}/{window} p{page}): {exc}")
+                if failures is not None:
+                    failures.append(f"{media_type}/{window}")
                 break
             if not page_results:
                 break

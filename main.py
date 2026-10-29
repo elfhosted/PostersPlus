@@ -4090,6 +4090,10 @@ async def _run_cache_warm_cycle(client: httpx.AsyncClient) -> None:
 _CACHE_WARM_LAST_RUN_KEY = "cache_warm_last_run"
 _TRENDING_LAST_RUN_KEY = "trending_fetch_last_run"
 _TRENDING_RELEASE_WAIT_SECS = 600
+# Returned by a cycle that waited out _TRENDING_RELEASE_WAIT_SECS: the loop
+# retries it after _TRENDING_DEFER_RETRY_SECS instead of a day later.
+_TRENDING_DEFERRED = "deferred"
+_TRENDING_DEFER_RETRY_SECS = 900
 
 
 def _trending_first_wait(last_run: float | None, now: float) -> float | None:
@@ -4161,8 +4165,10 @@ def _sanitize_request_params(query: str) -> str:
 
 async def _run_trending_fetch_cycle(client: httpx.AsyncClient) -> bool | None:
     """True for a completed cycle, False when the trending candidates could
-    not be fetched, None when it was skipped (no server TMDB key). Only True is
-    recorded as the last run, so neither of the others delays the next one."""
+    not all be fetched, None when it was skipped (no server TMDB key), and
+    _TRENDING_DEFERRED when the digital-release set was still catching up.
+    Only True is recorded as the last run, so none of the others delays the
+    next one."""
     logger.info("Starting scheduled trending fetch cycle")
     if not _cfg.SERVER_TMDB_KEY:
         logger.info("Trending fetch: skipped - no server TMDB key configured")
@@ -4179,13 +4185,16 @@ async def _run_trending_fetch_cycle(client: httpx.AsyncClient) -> bool | None:
         except asyncio.TimeoutError:
             logger.warning(
                 "Trending fetch: digital-release set still catching up after "
-                f"{_TRENDING_RELEASE_WAIT_SECS}s; skipping this cycle"
+                f"{_TRENDING_RELEASE_WAIT_SECS}s; deferring this cycle"
             )
-            return None
+            return _TRENDING_DEFERRED
 
+    _fetch_failures: list[str] = []
     try:
         trending = await fetch_trending_candidates(
-            client, _cfg.SERVER_TMDB_KEY, max_items=max(_cfg.TRENDING_FETCH_COUNT, _cfg.TRENDING_BROAD_FETCH_COUNT)
+            client, _cfg.SERVER_TMDB_KEY,
+            max_items=max(_cfg.TRENDING_FETCH_COUNT, _cfg.TRENDING_BROAD_FETCH_COUNT),
+            failures=_fetch_failures,
         )
     except Exception as exc:
         logger.error(f"Trending fetch: failed to fetch candidates: {exc}")
@@ -4241,6 +4250,11 @@ async def _run_trending_fetch_cycle(client: httpx.AsyncClient) -> bool | None:
                 logger.error(f"Trending fetch: failed to regenerate poster {cache_key}: {exc}")
                     
     logger.info(f"Trending fetch cycle completed. Regenerated {regenerated_count} posters.")
+    if _fetch_failures:
+        # What was fetched has been refreshed, but the lists in _fetch_failures
+        # were not, so this cycle must not suppress the next one.
+        logger.warning(f"Trending fetch: incomplete, failed lists: {', '.join(_fetch_failures)}")
+        return False
     return True
 
 
@@ -4280,16 +4294,18 @@ async def _trending_fetch_loop() -> None:
                 "skipping the startup cycle"
             )
         elif _HTTP_CLIENT is not None and await _lead():
-            if await _run_trending_fetch_cycle(_HTTP_CLIENT) is True:
+            _result = await _run_trending_fetch_cycle(_HTTP_CLIENT)
+            if _result is True:
                 set_app_state(_TRENDING_LAST_RUN_KEY, str(time.time()))
+            elif _result == _TRENDING_DEFERRED:
+                _first_wait = float(_TRENDING_DEFER_RETRY_SECS)
     except Exception as exc:
         _first_wait = None
         logger.error(f"Trending fetch: startup cycle failed: {exc}")
 
     while True:
         if not _cfg.TRENDING_FETCH_TIME:
-            wait = 86400.0 if _first_wait is None else max(0.0, _first_wait)
-            _first_wait = None
+            wait = 86400.0
         else:
             try:
                 tz = zoneinfo.ZoneInfo(_cfg.TRENDING_FETCH_TIMEZONE)
@@ -4308,6 +4324,11 @@ async def _trending_fetch_loop() -> None:
                 target_dt += timedelta(days=1)
             wait = (target_dt - now_dt).total_seconds()
             
+        # A skipped startup cycle keeps its 24-hour cadence, and a deferred
+        # one retries soon; neither waits longer than the schedule would.
+        if _first_wait is not None:
+            wait = min(wait, max(0.0, _first_wait))
+            _first_wait = None
         logger.info(f"Trending fetch: next cycle scheduled in {wait / 3600:.1f} hours")
         try:
             await asyncio.sleep(wait)
@@ -4315,8 +4336,11 @@ async def _trending_fetch_loop() -> None:
                 if _HTTP_CLIENT is None:
                     pass
                 elif await _lead():
-                    if await _run_trending_fetch_cycle(_HTTP_CLIENT) is True:
+                    _result = await _run_trending_fetch_cycle(_HTTP_CLIENT)
+                    if _result is True:
                         set_app_state(_TRENDING_LAST_RUN_KEY, str(time.time()))
+                    elif _result == _TRENDING_DEFERRED:
+                        _first_wait = float(_TRENDING_DEFER_RETRY_SECS)
                 else:
                     logger.debug("Trending fetch skipped — another replica holds the lease")
             except Exception as exc:
