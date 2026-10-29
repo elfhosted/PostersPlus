@@ -37,6 +37,8 @@ _PAGE_PAUSE       = 1.0    # seconds between paginated requests
 _LAST_SYNC_KEY    = "digital_release_last_sync"
 _STARTUP_GRACE    = 60     # seconds; first-ever sync only
 _RETRY_INTERVAL   = 3600   # seconds; after a failed sync
+_FOLLOWER_POLL    = 30     # seconds; a follower re-reading the leader's last sync
+_FOLLOWER_WAIT    = 900    # seconds; then it stops holding renders for the leader
 
 
 async def _fetch_page(
@@ -161,6 +163,7 @@ def _initial_wait(now: float, last_sync: float | None) -> tuple[float, bool]:
 async def digital_release_poll_loop(
     client: httpx.AsyncClient,
     initial_sync_done: asyncio.Event | None = None,
+    set_current: asyncio.Event | None = None,
 ) -> None:
     """
     Background task: initial sync shortly after startup, then every 24 h.
@@ -173,13 +176,25 @@ async def digital_release_poll_loop(
     deployments only have one replica polling the source. With the default
     in-process coordinator each worker leads its own iteration (matches
     upstream).
+
+    *set_current* (ElfHosted fork) is the renders' signal, separate from the
+    warmer's: it is set once the stored set is as current as it can be. That
+    is at start if the last sync is under a day old, after a successful sync,
+    or after a failed one, because a feed outage means no newer set exists and
+    holding every poster uncached for its duration would cost far more than a
+    stale "new release" sash (upstream caches in that case too). A follower
+    sets it once the leader's sync shows up in app_state, or after
+    _FOLLOWER_WAIT.
     """
     lease_ttl = float(_POLL_INTERVAL + 3600)  # one polling cycle + headroom
     lease_token: str | None = None
 
-    wait, current = _initial_wait(time.time(), _last_sync())
+    started = time.time()
+    wait, current = _initial_wait(started, _last_sync())
     if current and initial_sync_done is not None:
         initial_sync_done.set()
+    if current and set_current is not None:
+        set_current.set()
     if wait:
         logger.info(
             f"Digital release: next sync in {wait / 3600:.1f}h"
@@ -201,6 +216,7 @@ async def digital_release_poll_loop(
                 lease_token = None
 
             failed = False
+            waiting_for_leader = False
             try:
                 if lease_token is not None:
                     try:
@@ -209,10 +225,18 @@ async def digital_release_poll_loop(
                     except Exception as exc:
                         failed = True
                         logger.error(f"Digital release poll loop error: {exc}")
+                    if set_current is not None:
+                        set_current.set()
                 else:
                     logger.debug(
                         "Digital release poll skipped — another replica holds the lease"
                     )
+                    if set_current is not None and not set_current.is_set():
+                        wait_now, fresh = _initial_wait(time.time(), _last_sync())
+                        if fresh or time.time() - started >= _FOLLOWER_WAIT:
+                            set_current.set()
+                        else:
+                            waiting_for_leader = True
             finally:
                 # Set on EVERY path, including the one where this replica never
                 # held the lease. Whoever waits on this event is waiting for
@@ -225,7 +249,11 @@ async def digital_release_poll_loop(
 
             # A failed sync is retried within the hour rather than a day later,
             # so an outage at the moment a pod wakes doesn't pin the old set.
-            await asyncio.sleep(_RETRY_INTERVAL if failed else _POLL_INTERVAL)
+            await asyncio.sleep(
+                _RETRY_INTERVAL if failed
+                else _FOLLOWER_POLL if waiting_for_leader
+                else _POLL_INTERVAL
+            )
     finally:
         if lease_token is not None:
             with suppress(Exception):

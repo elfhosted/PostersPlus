@@ -4098,11 +4098,15 @@ def _trending_first_wait(last_run: float | None, now: float) -> float | None:
     if last_run is None or now - last_run >= 86400:
         return None
     return last_run + 86400 - now
-# ElfHosted fork: set once the digital-release set is current (see
-# digital_release_poll_loop). Until then a render may carry a "new release"
-# sash decided from an old set, so it is served but not cached. None outside
-# the app lifespan (tests), which never treats a render as pending.
+# ElfHosted fork: set once the first digital-release sync attempt has finished,
+# whatever its outcome; the cache warmer waits on it so the two startup jobs
+# don't hit external APIs together. None outside the app lifespan.
 _digital_release_ready: asyncio.Event | None = None
+# Set once the stored set is as current as it can be (see
+# digital_release_poll_loop). Distinct from _digital_release_ready above, which
+# the cache warmer waits on and which is also set after a failed or skipped
+# attempt.
+_digital_release_current: asyncio.Event | None = None
 
 
 def _digital_release_pending() -> bool:
@@ -4110,7 +4114,7 @@ def _digital_release_pending() -> bool:
     handler reads this once, before it looks anything up in that set, and keeps
     the answer for the whole render: the sync finishing mid-render does not make
     lookups it already did current."""
-    return _digital_release_ready is not None and not _digital_release_ready.is_set()
+    return _digital_release_current is not None and not _digital_release_current.is_set()
 # Wait this long after startup before the very first-ever cycle, so it
 # doesn't compete with other startup warm-up work (text detection model,
 # genre backgrounds, etc.).
@@ -4155,8 +4159,9 @@ def _sanitize_request_params(query: str) -> str:
 
 
 async def _run_trending_fetch_cycle(client: httpx.AsyncClient) -> bool | None:
-    """False only when the trending candidates could not be fetched, so the
-    caller does not record a failed cycle as the last one."""
+    """True for a completed cycle, False when the trending candidates could
+    not be fetched, None when it was skipped (no server TMDB key). Only True is
+    recorded as the last run, so neither of the others delays the next one."""
     logger.info("Starting scheduled trending fetch cycle")
     if not _cfg.SERVER_TMDB_KEY:
         logger.info("Trending fetch: skipped - no server TMDB key configured")
@@ -4220,6 +4225,7 @@ async def _run_trending_fetch_cycle(client: httpx.AsyncClient) -> bool | None:
                 logger.error(f"Trending fetch: failed to regenerate poster {cache_key}: {exc}")
                     
     logger.info(f"Trending fetch cycle completed. Regenerated {regenerated_count} posters.")
+    return True
 
 
 async def _trending_fetch_loop() -> None:
@@ -4258,7 +4264,7 @@ async def _trending_fetch_loop() -> None:
                 "skipping the startup cycle"
             )
         elif _HTTP_CLIENT is not None and await _lead():
-            if await _run_trending_fetch_cycle(_HTTP_CLIENT) is not False:
+            if await _run_trending_fetch_cycle(_HTTP_CLIENT) is True:
                 set_app_state(_TRENDING_LAST_RUN_KEY, str(time.time()))
     except Exception as exc:
         _first_wait = None
@@ -4293,7 +4299,7 @@ async def _trending_fetch_loop() -> None:
                 if _HTTP_CLIENT is None:
                     pass
                 elif await _lead():
-                    if await _run_trending_fetch_cycle(_HTTP_CLIENT) is not False:
+                    if await _run_trending_fetch_cycle(_HTTP_CLIENT) is True:
                         set_app_state(_TRENDING_LAST_RUN_KEY, str(time.time()))
                 else:
                     logger.debug("Trending fetch skipped — another replica holds the lease")
@@ -4410,7 +4416,7 @@ async def _cache_warm_loop(digital_release_ready: asyncio.Event | None = None) -
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _HTTP_CLIENT, _configurator_html, _render_assets_signature
-    global _digital_release_ready
+    global _digital_release_ready, _digital_release_current
     global _background_detection_queue, _background_detection_task
     init_db()
     await blobstore.init()
@@ -4520,12 +4526,20 @@ async def lifespan(app: FastAPI):
         logger.warning(f"TVDB status check failed: {exc}")
 
     _digital_release_ready = asyncio.Event()
+    _digital_release_current = asyncio.Event()
     prune_task   = asyncio.create_task(_cache_prune_loop())
-    digital_task = asyncio.create_task(digital_release_poll_loop(_HTTP_CLIENT, _digital_release_ready))
+    digital_task = asyncio.create_task(
+        digital_release_poll_loop(_HTTP_CLIENT, _digital_release_ready, _digital_release_current)
+    )
     cache_warm_task = asyncio.create_task(_cache_warm_loop(_digital_release_ready))
     trending_task = asyncio.create_task(_trending_fetch_loop())
     imdb_dataset_task = asyncio.create_task(imdb_dataset_refresh_loop(_HTTP_CLIENT))
     yield
+    # Module globals outlive the lifespan: a later app instance (or a test
+    # calling a route without one) must not inherit an unset event and treat
+    # every render as pending.
+    _digital_release_ready = None
+    _digital_release_current = None
     prune_task.cancel()
     digital_task.cancel()
     cache_warm_task.cancel()
