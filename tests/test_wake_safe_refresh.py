@@ -142,5 +142,52 @@ class PollLoopTests(unittest.TestCase):
         self.assertEqual(events["sleeps"], [digital_release._RETRY_INTERVAL])
 
 
+class TrendingStartupTests(unittest.TestCase):
+    def setUp(self):
+        import main
+        self.main = main
+
+    def test_never_run_or_a_day_old_runs_the_startup_cycle(self):
+        self.assertIsNone(self.main._trending_first_wait(None, 1_000_000.0))
+        self.assertIsNone(self.main._trending_first_wait(1_000_000.0 - 86400, 1_000_000.0))
+
+    def test_recent_cycle_is_skipped_and_keeps_its_cadence(self):
+        # A restart 23h after a cycle waits 1h, not another full day.
+        now = 1_000_000.0
+        self.assertAlmostEqual(self.main._trending_first_wait(now - 23 * 3600, now), 3600.0)
+
+    def test_an_empty_trending_fetch_is_a_failed_cycle(self):
+        async def no_candidates(*a, **k):
+            return []
+        saved = self.main._cfg.SERVER_TMDB_KEY
+        self.main._cfg.SERVER_TMDB_KEY = "key"
+        try:
+            with mock.patch.object(self.main, "fetch_trending_candidates", no_candidates):
+                self.assertIs(asyncio.run(self.main._run_trending_fetch_cycle(None)), False)
+        finally:
+            self.main._cfg.SERVER_TMDB_KEY = saved
+
+
+class DigitalReleasePendingTests(unittest.TestCase):
+    def setUp(self):
+        import main
+        self.main = main
+        self.saved = main._digital_release_ready
+
+    def tearDown(self):
+        self.main._digital_release_ready = self.saved
+
+    def test_outside_the_lifespan_nothing_is_pending(self):
+        self.main._digital_release_ready = None
+        self.assertFalse(self.main._digital_release_pending())
+
+    def test_pending_until_the_set_is_current(self):
+        ev = asyncio.Event()
+        self.main._digital_release_ready = ev
+        self.assertTrue(self.main._digital_release_pending())
+        ev.set()
+        self.assertFalse(self.main._digital_release_pending())
+
+
 if __name__ == "__main__":
     unittest.main()

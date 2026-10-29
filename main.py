@@ -4089,11 +4089,28 @@ async def _run_cache_warm_cycle(client: httpx.AsyncClient) -> None:
 
 _CACHE_WARM_LAST_RUN_KEY = "cache_warm_last_run"
 _TRENDING_LAST_RUN_KEY = "trending_fetch_last_run"
+
+
+def _trending_first_wait(last_run: float | None, now: float) -> float | None:
+    """None: run the startup cycle. Otherwise a cycle finished within the last
+    day, so skip it and wait this long for the next, keeping the 24-hour
+    cadence from that cycle instead of restarting the clock."""
+    if last_run is None or now - last_run >= 86400:
+        return None
+    return last_run + 86400 - now
 # ElfHosted fork: set once the digital-release set is current (see
 # digital_release_poll_loop). Until then a render may carry a "new release"
 # sash decided from an old set, so it is served but not cached. None outside
 # the app lifespan (tests), which never treats a render as pending.
 _digital_release_ready: asyncio.Event | None = None
+
+
+def _digital_release_pending() -> bool:
+    """True while a catch-up sync of the digital-release set is running. A
+    handler reads this once, before it looks anything up in that set, and keeps
+    the answer for the whole render: the sync finishing mid-render does not make
+    lookups it already did current."""
+    return _digital_release_ready is not None and not _digital_release_ready.is_set()
 # Wait this long after startup before the very first-ever cycle, so it
 # doesn't compete with other startup warm-up work (text detection model,
 # genre backgrounds, etc.).
@@ -4170,7 +4187,9 @@ async def _run_trending_fetch_cycle(client: httpx.AsyncClient) -> bool | None:
         elif mt:
             trending_pairs.add((tid, mt))
     if not trending_pairs:
-        return
+        # fetch_trending_candidates swallows HTTP failures and returns nothing,
+        # and TMDB trending is never genuinely empty: count it as a failed cycle.
+        return False
 
     rows = list_composite_request_params()
 
@@ -4232,7 +4251,8 @@ async def _trending_fetch_loop() -> None:
             _last = float(_last_raw) if _last_raw is not None else None
         except ValueError:
             _last = None
-        if _last is not None and time.time() - _last < 86400:
+        _first_wait = _trending_first_wait(_last, time.time())
+        if _first_wait is not None:
             logger.info(
                 f"Trending fetch: last cycle {(time.time() - _last) / 3600:.1f}h ago, "
                 "skipping the startup cycle"
@@ -4241,11 +4261,13 @@ async def _trending_fetch_loop() -> None:
             if await _run_trending_fetch_cycle(_HTTP_CLIENT) is not False:
                 set_app_state(_TRENDING_LAST_RUN_KEY, str(time.time()))
     except Exception as exc:
+        _first_wait = None
         logger.error(f"Trending fetch: startup cycle failed: {exc}")
 
     while True:
         if not _cfg.TRENDING_FETCH_TIME:
-            wait = 86400.0
+            wait = 86400.0 if _first_wait is None else max(0.0, _first_wait)
+            _first_wait = None
         else:
             try:
                 tz = zoneinfo.ZoneInfo(_cfg.TRENDING_FETCH_TIMEZONE)
@@ -5650,6 +5672,8 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str, shape: str = "
     catalogues alike. ``shape=landscape`` renders the 16:9 layout; ``poster``,
     ``square`` or nothing renders the portrait one.
     """
+    # Captured before any digital-release lookup; see _digital_release_pending.
+    _dr_pending = _digital_release_pending()
     if not _cfg.PRESET_ENABLED:
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -6202,6 +6226,8 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str, shape: str = "
             and not _ocr_undetermined
             and not _release_undetermined
             and not _art_undetermined
+            # The digital-release set was mid catch-up when this request began.
+            and not _dr_pending
         )
 
         # Publish this render for others to coalesce onto — only on the
@@ -6547,6 +6573,8 @@ async def get_poster(
     nocache: str | None = None,
 ):
     # ElfHosted fork: fail-closed operator gate — see _require_operator.
+    # Captured before any digital-release lookup; see _digital_release_pending.
+    _dr_pending = _digital_release_pending()
     _require_operator(
         access_key,
         public_detail=(
@@ -8371,20 +8399,17 @@ async def get_poster(
         #                            throttle or a blip rather than a real absence.
         #                            Caching the fallback would pin TMDB art for
         #                            the whole composite TTL, so let it re-render.
-        #   _digital_release_pending — a catch-up sync of the digital-release set
+        #   _dr_pending            — a catch-up sync of the digital-release set
         #                            is still running (the pod slept through the
         #                            daily one), so the new-release sash may be
         #                            decided from an old set.
         #
         # The same flag decides what the *client* is told: a render we won't
         # keep must not be handed an ETag either (see _apply_poster_cache_headers).
-        _digital_release_pending = (
-            _digital_release_ready is not None and not _digital_release_ready.is_set()
-        )
         _render_provisional = bool(
             quality_pending or _detection_deferred or rating_failed
             or _rating_backoff_active or _anime_art_missing
-            or _digital_release_pending
+            or _dr_pending
         )
         _composite_expires_at: int | None = None
         if final_cache_key is not None and not _render_provisional:
