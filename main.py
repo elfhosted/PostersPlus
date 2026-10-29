@@ -4088,6 +4088,31 @@ async def _run_cache_warm_cycle(client: httpx.AsyncClient) -> None:
 
 
 _CACHE_WARM_LAST_RUN_KEY = "cache_warm_last_run"
+_TRENDING_RELEASE_WAIT_SECS = 600
+# ElfHosted fork: returned by a trending cycle that waited out
+# _TRENDING_RELEASE_WAIT_SECS; the loop retries it after
+# _TRENDING_DEFER_RETRY_SECS instead of a day later.
+_TRENDING_DEFERRED = "deferred"
+_TRENDING_DEFER_RETRY_SECS = 900
+
+
+# ElfHosted fork: set once the first digital-release sync attempt has finished,
+# whatever its outcome; the cache warmer waits on it so the two startup jobs
+# don't hit external APIs together. None outside the app lifespan.
+_digital_release_ready: asyncio.Event | None = None
+# Set once the stored set is as current as it can be (see
+# digital_release_poll_loop). Distinct from _digital_release_ready above, which
+# the cache warmer waits on and which is also set after a failed or skipped
+# attempt.
+_digital_release_current: asyncio.Event | None = None
+
+
+def _digital_release_pending() -> bool:
+    """True while a catch-up sync of the digital-release set is running. A
+    handler reads this once, before it looks anything up in that set, and keeps
+    the answer for the whole render: the sync finishing mid-render does not make
+    lookups it already did current."""
+    return _digital_release_current is not None and not _digital_release_current.is_set()
 # Wait this long after startup before the very first-ever cycle, so it
 # doesn't compete with other startup warm-up work (text detection model,
 # genre backgrounds, etc.).
@@ -4136,6 +4161,20 @@ async def _run_trending_fetch_cycle(client: httpx.AsyncClient) -> None:
     if not _cfg.SERVER_TMDB_KEY:
         logger.info("Trending fetch: skipped - no server TMDB key configured")
         return
+    # ElfHosted fork: the cycle deletes each cached poster before replaying it,
+    # and a replay rendered while the digital-release set is catching up is
+    # deliberately not cached, so running now would delete posters without
+    # replacing them. Wait for the set; if it takes too long, defer the cycle.
+    _current = _digital_release_current
+    if _current is not None and not _current.is_set():
+        try:
+            await asyncio.wait_for(_current.wait(), timeout=_TRENDING_RELEASE_WAIT_SECS)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Trending fetch: digital-release set still catching up after "
+                f"{_TRENDING_RELEASE_WAIT_SECS}s; deferring this cycle"
+            )
+            return _TRENDING_DEFERRED
 
     try:
         trending = await fetch_trending_candidates(
@@ -4216,9 +4255,19 @@ async def _trending_fetch_loop() -> None:
 
     # First run immediately on startup
     await asyncio.sleep(10)
+    _retry_in: float | None = None   # ElfHosted fork: a deferred cycle retries soon
     try:
         if _HTTP_CLIENT is not None and await _lead():
-            await _run_trending_fetch_cycle(_HTTP_CLIENT)
+            if await _run_trending_fetch_cycle(_HTTP_CLIENT) == _TRENDING_DEFERRED:
+                _retry_in = float(_TRENDING_DEFER_RETRY_SECS)
+    except asyncio.CancelledError:
+        # ElfHosted fork: the startup cycle can now spend minutes waiting for
+        # the digital-release set, so a shutdown can land here; hand the lease
+        # back as the periodic loop does, or the next pod waits out its TTL.
+        if lease_token is not None:
+            with suppress(Exception):
+                await coord.release_lease(coord.LEASE_TRENDING_FETCH, lease_token)
+        raise
     except Exception as exc:
         logger.error(f"Trending fetch: startup cycle failed: {exc}")
 
@@ -4243,6 +4292,8 @@ async def _trending_fetch_loop() -> None:
                 target_dt += timedelta(days=1)
             wait = (target_dt - now_dt).total_seconds()
             
+        if _retry_in is not None:
+            wait, _retry_in = min(wait, _retry_in), None
         logger.info(f"Trending fetch: next cycle scheduled in {wait / 3600:.1f} hours")
         try:
             await asyncio.sleep(wait)
@@ -4250,7 +4301,8 @@ async def _trending_fetch_loop() -> None:
                 if _HTTP_CLIENT is None:
                     pass
                 elif await _lead():
-                    await _run_trending_fetch_cycle(_HTTP_CLIENT)
+                    if await _run_trending_fetch_cycle(_HTTP_CLIENT) == _TRENDING_DEFERRED:
+                        _retry_in = float(_TRENDING_DEFER_RETRY_SECS)
                 else:
                     logger.debug("Trending fetch skipped — another replica holds the lease")
             except Exception as exc:
@@ -4366,6 +4418,7 @@ async def _cache_warm_loop(digital_release_ready: asyncio.Event | None = None) -
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _HTTP_CLIENT, _configurator_html, _render_assets_signature
+    global _digital_release_ready, _digital_release_current
     global _background_detection_queue, _background_detection_task
     init_db()
     await blobstore.init()
@@ -4475,12 +4528,20 @@ async def lifespan(app: FastAPI):
         logger.warning(f"TVDB status check failed: {exc}")
 
     _digital_release_ready = asyncio.Event()
+    _digital_release_current = asyncio.Event()
     prune_task   = asyncio.create_task(_cache_prune_loop())
-    digital_task = asyncio.create_task(digital_release_poll_loop(_HTTP_CLIENT, _digital_release_ready))
+    digital_task = asyncio.create_task(
+        digital_release_poll_loop(_HTTP_CLIENT, _digital_release_ready, _digital_release_current)
+    )
     cache_warm_task = asyncio.create_task(_cache_warm_loop(_digital_release_ready))
     trending_task = asyncio.create_task(_trending_fetch_loop())
     imdb_dataset_task = asyncio.create_task(imdb_dataset_refresh_loop(_HTTP_CLIENT))
     yield
+    # Module globals outlive the lifespan: a later app instance (or a test
+    # calling a route without one) must not inherit an unset event and treat
+    # every render as pending.
+    _digital_release_ready = None
+    _digital_release_current = None
     prune_task.cancel()
     digital_task.cancel()
     cache_warm_task.cancel()
@@ -5627,6 +5688,8 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str, shape: str = "
     catalogues alike. ``shape=landscape`` renders the 16:9 layout; ``poster``,
     ``square`` or nothing renders the portrait one.
     """
+    # Captured before any digital-release lookup; see _digital_release_pending.
+    _dr_pending = _digital_release_pending()
     if not _cfg.PRESET_ENABLED:
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -6179,6 +6242,8 @@ async def get_preset_poster(preset: str, type: str, imdb_id: str, shape: str = "
             and not _ocr_undetermined
             and not _release_undetermined
             and not _art_undetermined
+            # The digital-release set was mid catch-up when this request began.
+            and not _dr_pending
         )
 
         # Publish this render for others to coalesce onto — only on the
@@ -6524,6 +6589,8 @@ async def get_poster(
     nocache: str | None = None,
 ):
     # ElfHosted fork: fail-closed operator gate — see _require_operator.
+    # Captured before any digital-release lookup; see _digital_release_pending.
+    _dr_pending = _digital_release_pending()
     _require_operator(
         access_key,
         public_detail=(
@@ -8348,12 +8415,17 @@ async def get_poster(
         #                            throttle or a blip rather than a real absence.
         #                            Caching the fallback would pin TMDB art for
         #                            the whole composite TTL, so let it re-render.
+        #   _dr_pending            — a catch-up sync of the digital-release set
+        #                            is still running (the pod slept through the
+        #                            daily one), so the new-release sash may be
+        #                            decided from an old set.
         #
         # The same flag decides what the *client* is told: a render we won't
         # keep must not be handed an ETag either (see _apply_poster_cache_headers).
         _render_provisional = bool(
             quality_pending or _detection_deferred or rating_failed
             or _rating_backoff_active or _anime_art_missing
+            or _dr_pending
         )
         _composite_expires_at: int | None = None
         if final_cache_key is not None and not _render_provisional:

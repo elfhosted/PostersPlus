@@ -18,7 +18,7 @@ from contextlib import suppress
 
 import httpx
 
-from cache import add_digital_releases
+from cache import add_digital_releases, get_app_state, set_app_state
 import coordination as coord
 from config import DIGITAL_RELEASE_MAX_AGE_DAYS, DIGITAL_RELEASE_MIN_AGE_DAYS
 
@@ -32,16 +32,24 @@ _LIMIT            = 100   # posts per page
 _MAX_PAGES        = 10    # hard cap — 1 000 posts covers 30 days of sub activity
 _POLL_INTERVAL    = 86400  # seconds (24 h)
 _PAGE_PAUSE       = 1.0    # seconds between paginated requests
+# ElfHosted fork: when the last successful sync finished, so a restart (or a
+# pod that sleeps between requests) knows whether the stored set is current.
+_LAST_SYNC_KEY    = "digital_release_last_sync"
+_STARTUP_GRACE    = 60     # seconds; first-ever sync only
+_RETRY_INTERVAL   = 3600   # seconds; after a failed sync
+_FOLLOWER_POLL    = 30     # seconds; a follower re-reading the leader's last sync
+_FOLLOWER_WAIT    = 900    # seconds; then it stops holding renders for the leader
 
 
 async def _fetch_page(
     client: httpx.AsyncClient,
     after_ts: int,
     before_ts: int,
-) -> list[dict]:
+) -> list[dict] | None:
     """
     Fetch one page of posts from Arctic Shift between after_ts and before_ts
-    (both Unix timestamps), newest first.
+    (both Unix timestamps), newest first. None means the fetch failed, as
+    distinct from an empty page.
     """
     try:
         resp = await client.get(
@@ -58,7 +66,7 @@ async def _fetch_page(
         return resp.json().get("data", [])
     except Exception as exc:
         logger.warning(f"Digital release: Arctic Shift fetch failed: {exc}")
-        return []
+        return None
 
 
 async def sync_digital_releases(client: httpx.AsyncClient) -> int:
@@ -76,9 +84,13 @@ async def sync_digital_releases(client: httpx.AsyncClient) -> int:
 
     entries: list[tuple[str, int]] = []
     cursor     = before_ts   # walk backwards through time
+    failed     = False
 
     for page_num in range(_MAX_PAGES):
         posts = await _fetch_page(client, after_ts=after_ts, before_ts=cursor)
+        if posts is None:
+            failed = True
+            break
         if not posts:
             break
 
@@ -113,12 +125,45 @@ async def sync_digital_releases(client: httpx.AsyncClient) -> int:
         f"Digital release sync: {added} new entries added "
         f"({len(entries)} valid posts scanned)"
     )
+    if failed:
+        # Whatever was fetched is kept, but the sync did not cover the window,
+        # so it must not be recorded as the last successful one.
+        raise RuntimeError("Arctic Shift fetch failed; sync incomplete")
     return added
+
+
+def _last_sync() -> float | None:
+    raw = get_app_state(_LAST_SYNC_KEY)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _initial_wait(now: float, last_sync: float | None) -> tuple[float, bool]:
+    """How long to wait before the first sync, and whether the stored set is
+    already current (so nothing needs to wait for that sync).
+
+    - never synced: upstream's short grace, so startup settles first.
+    - synced within the last interval: the stored set is current; sleep until
+      the next sync is due instead of re-querying the feed on every start.
+    - older than that: sync straight away. A pod that slept through its daily
+      sync must catch up before posters rendered with the old set get cached.
+    """
+    if last_sync is None:
+        return float(_STARTUP_GRACE), False
+    due = last_sync + _POLL_INTERVAL
+    if due > now:
+        return due - now, True
+    return 0.0, False
 
 
 async def digital_release_poll_loop(
     client: httpx.AsyncClient,
     initial_sync_done: asyncio.Event | None = None,
+    set_current: asyncio.Event | None = None,
 ) -> None:
     """
     Background task: initial sync shortly after startup, then every 24 h.
@@ -131,11 +176,31 @@ async def digital_release_poll_loop(
     deployments only have one replica polling the source. With the default
     in-process coordinator each worker leads its own iteration (matches
     upstream).
+
+    *set_current* (ElfHosted fork) is the renders' signal, separate from the
+    warmer's: it is set once the stored set is as current as it can be. That
+    is at start if the last sync is under a day old, after a successful sync,
+    or after a failed one, because a feed outage means no newer set exists and
+    holding every poster uncached for its duration would cost far more than a
+    stale "new release" sash (upstream caches in that case too). A follower
+    sets it once the leader's sync shows up in app_state, or after
+    _FOLLOWER_WAIT.
     """
     lease_ttl = float(_POLL_INTERVAL + 3600)  # one polling cycle + headroom
     lease_token: str | None = None
 
-    await asyncio.sleep(60)   # let the service finish warming up first
+    started = time.time()
+    wait, current = _initial_wait(started, _last_sync())
+    if current and initial_sync_done is not None:
+        initial_sync_done.set()
+    if current and set_current is not None:
+        set_current.set()
+    if wait:
+        logger.info(
+            f"Digital release: next sync in {wait / 3600:.1f}h"
+            + (" (stored set is current)" if current else "")
+        )
+        await asyncio.sleep(wait)
     try:
         while True:
             if lease_token is None:
@@ -150,16 +215,28 @@ async def digital_release_poll_loop(
                 logger.info("Digital-release-poll lease lost")
                 lease_token = None
 
+            failed = False
+            waiting_for_leader = False
             try:
                 if lease_token is not None:
                     try:
                         await sync_digital_releases(client)
+                        set_app_state(_LAST_SYNC_KEY, str(time.time()))
                     except Exception as exc:
+                        failed = True
                         logger.error(f"Digital release poll loop error: {exc}")
+                    if set_current is not None:
+                        set_current.set()
                 else:
                     logger.debug(
                         "Digital release poll skipped — another replica holds the lease"
                     )
+                    if set_current is not None and not set_current.is_set():
+                        wait_now, fresh = _initial_wait(time.time(), _last_sync())
+                        if fresh or time.time() - started >= _FOLLOWER_WAIT:
+                            set_current.set()
+                        else:
+                            waiting_for_leader = True
             finally:
                 # Set on EVERY path, including the one where this replica never
                 # held the lease. Whoever waits on this event is waiting for
@@ -170,7 +247,13 @@ async def digital_release_poll_loop(
                 if initial_sync_done is not None and not initial_sync_done.is_set():
                     initial_sync_done.set()
 
-            await asyncio.sleep(_POLL_INTERVAL)
+            # A failed sync is retried within the hour rather than a day later,
+            # so an outage at the moment a pod wakes doesn't pin the old set.
+            await asyncio.sleep(
+                _RETRY_INTERVAL if failed
+                else _FOLLOWER_POLL if waiting_for_leader
+                else _POLL_INTERVAL
+            )
     finally:
         if lease_token is not None:
             with suppress(Exception):

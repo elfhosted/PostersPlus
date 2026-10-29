@@ -1908,6 +1908,9 @@ def add_digital_releases(entries: list[tuple[str, int]]) -> int:
             get_db().commit()
     except Exception as exc:
         logger.error(f"Digital release cache write error: {exc}")
+        # The sync records a success only if this returns, so a failed write
+        # must not look like "nothing new" (ElfHosted fork).
+        raise
     return inserted
 
 
